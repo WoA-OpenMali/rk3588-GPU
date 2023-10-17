@@ -1,0 +1,6 @@
+panfork implementation of mesa:
+https://gitlab.com/panfork/mesa
+
+
+Mainline VOP2 and VOP1 driver
+https://github.com/torvalds/linux/tree/master/drivers/gpu/drm/rockchip

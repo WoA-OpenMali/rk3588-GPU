@@ -272,7 +272,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\stubs.cpp" />
+    <ClCompile Include="..\Utils.cpp" />
+    <ClCompile Include="..\vop2.cpp" />
+    <ClCompile Include="..\Vop2ddi.cpp" />
     <ClCompile Include="..\vop2kmd.cpp" />
+    <ClCompile Include="..\vop2vidpn.cpp" />
   </ItemGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" Condition="'$(ConfigurationType)'=='Driver' or '$(ConfigurationType)'=='DynamicLibrary'" />
@@ -284,6 +288,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Exclude="@(ClInclude)" Include="*.h;*.hpp;*.hxx;*.hm;*.inl;*.xsd" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="Vop2Kmd.inf" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

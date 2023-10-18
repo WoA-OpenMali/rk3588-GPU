@@ -1,0 +1,17 @@
+/*
+ * PURPOSE:     Vop2Kmd resource file
+ * COPYRIGHT:   Copyright 2023 WoA-OpenMali Project
+ */
+
+#include <windows.h>
+
+#include <ntverp.h>
+
+#define VER_FILETYPE                VFT_DRV
+#define VER_FILESUBTYPE             VFT2_DRV_DISPLAY
+#define VER_FILEDESCRIPTION_STR     "Video Output Processor 2 KMD"
+#define VER_INTERNALNAME_STR        "Vop2Kmd.sys"
+#define VER_ORIGINALFILENAME_STR    "Vop2Kmd.sys"
+
+#define VER_LANGNEUTRAL
+#include "common.ver"

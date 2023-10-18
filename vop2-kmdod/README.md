@@ -1,0 +1,16 @@
+Video Output Processor 2 KMD Driver for the RK3588
+
+the VOP2 is a rockchip specific processor it seems to support a decent set of SoCs though.
+
+rk3288
+rk3368
+rk3366
+rk3328
+rk3036
+rk3588
+rk3066
+px30
+maybe more..
+
+This driver targets rk3588 however it can be easily made to work with the SoCs above...
+Not that others are worth porting WoA to but someone could be insane enough to try.

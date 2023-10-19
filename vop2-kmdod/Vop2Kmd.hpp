@@ -41,8 +41,6 @@ extern "C"
     #include <dispmprt.h>
 };
 
-#include "vop2.hpp"
-
 /* If we have a video mode that doens't meet these requirements it violates the windows license (Seriously) */
 #define WIN_MIN_WIDTH                    640
 #define WIN_MIN_HEIGHT                   480
@@ -53,6 +51,19 @@ extern "C"
 #define VOP2TAG 'POVT'
 
 #define RK3588_MAX_VIEW 6
+
+typedef struct _VOP2_ACTIVE_DISPLAY_MODE
+{
+    DXGK_DISPLAY_INFORMATION             DxgkDispInfo;
+    D3DKMDT_VIDPN_PRESENT_PATH_ROTATION  Rotation;
+    D3DKMDT_VIDPN_PRESENT_PATH_SCALING Scaling;
+    UINT32 HwModeWidth;
+    UINT32 HwModeHeight;
+    ULONG_PTR FramebufferPtr;
+} VOP2_ACTIVE_DISPLAY_MODE, *PVOP2_ACTIVE_DISPLAY_MODE;
+
+#include "vop2.hpp"
+
 
 extern "C"
 DRIVER_INITIALIZE DriverEntry;
@@ -206,6 +217,9 @@ NTSTATUS
 Vop2DdiDispatchIoRequest(_In_  VOID*                 pDeviceContext,
                          _In_  ULONG                 VidPnSourceId,
                          _In_  VIDEO_REQUEST_PACKET* pVideoRequestPacket);
+
+void Vop2DebugPrint(CONST char *format, ...);
+
 _When_((PoolType & NonPagedPoolMustSucceed) != 0,
     __drv_reportError("Must succeed pool allocations are forbidden. "
             "Allocation failures cause a system crash"))
@@ -217,3 +231,5 @@ void* __cdecl operator new[](size_t Size, POOL_TYPE PoolType = PagedPool);
 void  __cdecl operator delete(void* pObject);
 void  __cdecl operator delete(void* pObject, size_t s);
 void  __cdecl operator delete[](void* pObject);
+#include "debug.h"
+#include "vop2hardware/Vop2Hw.hpp"

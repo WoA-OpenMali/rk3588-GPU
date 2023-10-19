@@ -245,6 +245,7 @@
       <WarningLevel>Level4</WarningLevel>
       <ExceptionHandling>
       </ExceptionHandling>
+      <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -275,6 +276,7 @@
     <ClCompile Include="..\Utils.cpp" />
     <ClCompile Include="..\vop2.cpp" />
     <ClCompile Include="..\Vop2ddi.cpp" />
+    <ClCompile Include="..\vop2hardware\Vop2Hw.cpp" />
     <ClCompile Include="..\vop2kmd.cpp" />
     <ClCompile Include="..\vop2vidpn.cpp" />
   </ItemGroup>

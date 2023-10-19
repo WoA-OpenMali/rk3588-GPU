@@ -4,6 +4,7 @@ NTSTATUS
 Vop2DdiAddDevice(_In_ DEVICE_OBJECT* pPhysicalDeviceObject,
                  _Outptr_ PVOID*  ppDeviceContext)
 {
+    DbgPrint("Vop2DdiAddDevice: Add Device\n");
     if ((!pPhysicalDeviceObject) ||
         (!ppDeviceContext))
     {
@@ -12,14 +13,17 @@ Vop2DdiAddDevice(_In_ DEVICE_OBJECT* pPhysicalDeviceObject,
     *ppDeviceContext = NULL;
 
     /* Initialize an instance of the hardware component of driver */
-    VOP2* pVOP2 = new(NonPagedPool) VOP2(pPhysicalDeviceObject);
+    VOP2* pVOP2 = new(PagedPool) VOP2(pPhysicalDeviceObject);
 
     if (!pVOP2)
+    {
+        DbgPrint("Vop2DdiAddDevice: failed to add memory\n");
         return STATUS_NO_MEMORY;
+    }
 
 
     *ppDeviceContext = pVOP2;
-
+    DbgPrint("Vop2DdiAddDevice: Exit\n");
     return STATUS_SUCCESS;
 }
 
@@ -30,6 +34,7 @@ Vop2DdiStartDevice(_In_  VOID*              pDeviceContext,
                    _Out_ ULONG*             pNumberOfViews,
                    _Out_ ULONG*             pNumberOfChildren)
 {
+    DbgPrint("Vop2DdiStartDevice: Enter\n");
     VOP2* pVOP2 = reinterpret_cast<VOP2*>(pDeviceContext);
     return pVOP2->StartDevice(pDxgkStartInfo, pDxgkInterface, pNumberOfViews, pNumberOfChildren);
 }
@@ -37,6 +42,7 @@ Vop2DdiStartDevice(_In_  VOID*              pDeviceContext,
 NTSTATUS
 Vop2DdiRemoveDevice(_In_  VOID* pDeviceContext)
 {
+    DbgPrint("Vop2DdiRemoveDevice: Enter\n");
     VOP2* pVOP2 = reinterpret_cast<VOP2*>(pDeviceContext);
     pVOP2->~VOP2();
     return STATUS_SUCCESS;
@@ -45,6 +51,7 @@ Vop2DdiRemoveDevice(_In_  VOID* pDeviceContext)
 NTSTATUS
 Vop2DdiStopDevice(_In_  VOID* pDeviceContext)
 {
+    DbgPrint("Vop2DdiStopDevice: Enter\n");
     VOP2* pVOP2 = reinterpret_cast<VOP2*>(pDeviceContext);
     pVOP2->IsActive = FALSE;
     //TODO: this needs to do more soon.
@@ -54,6 +61,7 @@ Vop2DdiStopDevice(_In_  VOID* pDeviceContext)
 VOID
 Vop2DdiResetDevice(_In_  VOID* pDeviceContext)
 {
+    DbgPrint("Vop2DdiResetDevice: Enter\n");
     VOP2* pVOP2 = reinterpret_cast<VOP2*>(pDeviceContext);
     pVOP2->IsActive = FALSE;
     //TODO: this needs to do more soon.
@@ -74,6 +82,7 @@ Vop2DdiStopDeviceAndReleasePostDisplayOwnership(_In_  VOID*                     
                                                 _In_  D3DDDI_VIDEO_PRESENT_TARGET_ID TargetId,
                                                 _Out_ DXGK_DISPLAY_INFORMATION*      DisplayInfo)
 {
+    DbgPrint("Vop2DdiStopDeviceAndReleasePostDisplayOwnership: Enter\n");
     VOP2* pVOP2 = reinterpret_cast<VOP2*>(pDeviceContext);
     pVOP2->IsActive = FALSE;
     UNREFERENCED_PARAMETER(TargetId);

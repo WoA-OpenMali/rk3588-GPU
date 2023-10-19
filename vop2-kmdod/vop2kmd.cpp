@@ -8,10 +8,11 @@ DriverEntry(
     _In_  DRIVER_OBJECT*  pDriverObject,
     _In_  UNICODE_STRING* pRegistryPath)
 {
+    Vop2DebugPrint("DriverEntry: Entry\n");
     KMDDOD_INITIALIZATION_DATA InitialData = {0};
 
     InitialData.Version = DXGKDDI_INTERFACE_VERSION_WDDM1_3;
-
+    Vop2DebugPrint("Video Output Processor 2 Kernel Mode Display Only Driver\n");
     /* First let's fillout the needed DDI callbacks for a KMDOD */
     InitialData.DxgkDdiAddDevice                    = Vop2DdiAddDevice;
     InitialData.DxgkDdiStartDevice                  = Vop2DdiStartDevice;
@@ -44,7 +45,7 @@ DriverEntry(
     InitialData.DxgkDdiStopDeviceAndReleasePostDisplayOwnership = Vop2DdiStopDeviceAndReleasePostDisplayOwnership;
 
     DxgkInitializeDisplayOnlyDriver(pDriverObject, pRegistryPath, &InitialData);
-
+    Vop2DebugPrint("Successfully setup KMDOD\n");
     return STATUS_SUCCESS;
 }
 
@@ -54,6 +55,7 @@ APIENTRY
 Vop2DdiQueryAdapterInfo(_In_ CONST HANDLE                         hAdapter,
                         _In_ CONST DXGKARG_QUERYADAPTERINFO*      pQueryAdapterInfo)
 {
+    Vop2DebugPrint("Vop2DdiQueryAdapterInfo:Entry\n");
     UNREFERENCED_PARAMETER(hAdapter);
     switch (pQueryAdapterInfo->Type)
     {

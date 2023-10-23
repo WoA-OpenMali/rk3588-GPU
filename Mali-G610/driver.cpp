@@ -4,9 +4,15 @@ NTSTATUS
 G610AddDevice(_In_ DEVICE_OBJECT* pPhysicalDeviceObject,
               _Outptr_ PVOID*  ppDeviceContext)
 {
+    PVOID VirtualAddress;
     PAGED_CODE();
+    PHYSICAL_ADDRESS    PhysicalAddressOfRegisters;
+    PhysicalAddressOfRegisters.QuadPart = 0xfb000000;
     DPRINT1("--> %s\n", __FUNCTION__);
     UNIMPLEMENTED;
+    VirtualAddress = MmMapIoSpace(PhysicalAddressOfRegisters, 0x20000, MmNonCached);
+    DPRINT1("Checking GPU %X\n", READ_REGISTER_ULONG((PULONG)VirtualAddress));
+    DbgBreakPoint();
     DPRINT1("<-- %s: ppDeviceContext = %p\n", __FUNCTION__, ppDeviceContext);
     return STATUS_SUCCESS;
 }
@@ -18,7 +24,7 @@ DriverEntry(_In_  DRIVER_OBJECT*  DriverObject,
             _In_  UNICODE_STRING* RegistryPath)
 {
     PAGED_CODE();
-    DPRINT1("--> Mali G610 Render only display driver");
+    DPRINT1("--> WoA-OpenMali Project - Mali-G610 WDDM Driver <--\n");
     DRIVER_INITIALIZATION_DATA InitialData = { 0 };
 
     /*

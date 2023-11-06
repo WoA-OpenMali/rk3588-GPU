@@ -1,0 +1,76 @@
+﻿;++
+;
+; Copyright (c) 2023 WoA-OpenMali Project
+;
+;--
+
+[Version]
+Signature = "$Windows NT$"
+Class=Display
+ClassGuid={4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+CatalogFile=WoAOpenMali.cat
+
+[DestinationDirs]
+OpenMaliServ.Files = 12
+
+[SourceDisksNames]
+0=%OpenMaliDisk%
+
+[SourceDisksFiles]
+WoAOpenMali.sys=0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTarm64
+
+[Standard.NTarm64]
+%G610% = OpenMaliServ_Inst, ACPI\VEN_ARMH&DEV_5655
+
+[OpenMaliServ_Inst]
+FeatureScore=F9
+CopyFiles = OpenMaliServ.Files
+
+[OpenMaliServ_Inst.Services]
+AddService = OpenMaliServ,0x00000002,OpenMaliServ_Service_Inst,OpenMaliServ_EventLog_Inst
+
+[OpenMaliServ_Service_Inst]
+ServiceType = %SERVICE_KERNEL_DRIVER%
+StartType = %SERVICE_DEMAND_START%
+ErrorControl = %SERVICE_ERROR_IGNORE%
+ServiceBinary = %12%\WoAOpenMali.sys
+
+[OpenMaliServ.Files]
+WoAOpenMali.sys
+
+[OpenMaliServ_EventLog_Inst]
+AddReg = OpenMaliServ_EventLog_Inst.AddReg
+
+[OpenMaliServ_EventLog_Inst.AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[Strings]
+
+;  *******Localizable Strings*******
+ProviderString="WoA-OpenMali Project"
+ManufacturerName="ARM"
+OpenMaliDisk = "OpenMaliDisk"
+G610 = "ARM Mali-G610 MP4"
+
+;  *******Non Localizable Strings*******
+
+SERVICE_BOOT_START = 0x0
+SERVICE_SYSTEM_START = 0x1
+SERVICE_AUTO_START = 0x2
+SERVICE_DEMAND_START = 0x3
+SERVICE_DISABLED = 0x4
+
+SERVICE_KERNEL_DRIVER = 0x1
+SERVICE_ERROR_IGNORE = 0x0
+SERVICE_ERROR_NORMAL = 0x1
+SERVICE_ERROR_SEVERE = 0x2
+SERVICE_ERROR_CRITICAL = 0x3
+
+REG_MULTI_SZ   = 0x00010000
+REG_EXPAND_SZ = 0x00020000
+REG_DWORD = 0x00010001

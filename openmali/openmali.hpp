@@ -30,9 +30,80 @@ extern "C"
     #include <dispmprt.h>
 };
 
+#include "hw/device/csf/regs.h"
 #include "debug.h"
 #include "mali.hpp"
 #define MALITAG 'ILAM'
+
+#define DRM_PANTHOR_ARCH_MAJOR(x)              ((x) >> 28)
+#define DRM_PANTHOR_ARCH_MINOR(x)              (((x) >> 24) & 0xf)
+#define DRM_PANTHOR_ARCH_REV(x)                        (((x) >> 20) & 0xf)
+#define DRM_PANTHOR_PRODUCT_MAJOR(x)           (((x) >> 16) & 0xf)
+#define DRM_PANTHOR_VERSION_MAJOR(x)           (((x) >> 12) & 0xf)
+#define DRM_PANTHOR_VERSION_MINOR(x)           (((x) >> 4) & 0xff)
+#define DRM_PANTHOR_VERSION_STATUS(x)          ((x) & 0xf)
+#define DRM_PANTHOR_CSHW_MAJOR(x)              (((x) >> 26) & 0x3f)
+#define DRM_PANTHOR_CSHW_MINOR(x)              (((x) >> 20) & 0x3f)
+#define DRM_PANTHOR_CSHW_REV(x)                        (((x) >> 16) & 0xf)
+#define DRM_PANTHOR_MCU_MAJOR(x)               (((x) >> 10) & 0x3f)
+#define DRM_PANTHOR_MCU_MINOR(x)               (((x) >> 4) & 0x3f)
+#define DRM_PANTHOR_MCU_REV(x)                 ((x) & 0xf)
+#define DRM_PANTHOR_MMU_VA_BITS(x)             ((x) & 0xff)
+
+typedef struct _HW_GPU_INFO {
+       /* GPU ID. */
+       UINT32 gpu_id;
+
+       /* GPU revision. */
+       UINT32 gpu_rev;
+
+       /* Command stream frontend ID. */
+       UINT32 csf_id;
+
+       /* L2-cache features. */
+       UINT32 l2_features;
+
+       /* Tiler features. */
+       UINT32 tiler_features;
+
+       /* Memory features. */
+       UINT32 mem_features;
+
+       /* MMU features. */
+       UINT32 mmu_features;
+
+       /* Thread features. */
+       UINT32 thread_features;
+       UINT32 max_threads;
+       UINT32 thread_max_workgroup_size;
+
+       /**
+        * Maximum number of threads that can wait
+        * simultaneously on a barrier.
+        */
+       UINT32 thread_max_barrier_size;
+
+       /* Coherency features. */
+       UINT32 coherency_features;
+
+       /* Texture features. */
+       UINT32 texture_features[4];
+
+       /*  Bitmask encoding the number of address-space exposed by the MMU. */
+       UINT32 as_present;
+       UINT32 core_group_count;
+
+       /* Zero on return. */
+       UINT32 pad;
+
+       /* @shader_present: Bitmask encoding the shader cores exposed by the
+GPU */
+       UINT64 shader_present;
+
+      /** @l2_present: Bitmask encoding the L2 caches exposed by the GPU. */
+       UINT64 l2_present;
+       UINT64 tiler_present;
+} HW_GPU_INFO, *PHW_GPU_INFO;
 
 /* Dxgkrnl Callbacks */
 

@@ -1,0 +1,28 @@
+## Visual Studio + MSBuild
+*.user
+*.suo
+.vs/
+x64/
+ARM64/
+Debug/
+Release/
+ARM64/Debug/
+ARM64/Release/
+*.log
+*.tlog
+*.pdb
+*.ilk
+*.lastbuildstate
+*.exp
+*.lib
+*.obj
+*.res
+
+## Driver build output
+*.sys
+*.dll
+*.cat
+*.inf
+*.pnf
+WinMaliKmd/
+WinMaliUmd/

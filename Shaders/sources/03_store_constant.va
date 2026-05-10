@@ -1,0 +1,2 @@
+IADD.u32 r4, r1, 0x7060504
+STORE.i32.slot0.end @r4, r0^, offset:0

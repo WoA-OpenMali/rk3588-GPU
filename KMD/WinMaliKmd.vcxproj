@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <!-- x64 is a dev-box compile-test target ONLY. The driver never runs
+         on x64 hardware (RK3588 is aarch64). Kept here so CI and local
+         smoke tests work even on ARM64-lib-less SDK installs. -->
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A1B2C3D4-0001-4E5F-9A0B-001122334455}</ProjectGuid>
+    <TemplateGuid>{497e31cb-056b-4f31-abb8-447fd55ee5a5}</TemplateGuid>
+    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
+    <Configuration>Debug</Configuration>
+    <Platform Condition="'$(Platform)' == ''">ARM64</Platform>
+    <RootNamespace>WinMaliKmd</RootNamespace>
+    <ProjectName>WinMaliKmd</ProjectName>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>WinMaliKmd</TargetName>
+    <!-- InfVerif.dll frequently isn't installed on desktop-SDK-only boxes
+         (it ships with the full WDK workload). Skip the task by default;
+         pass /p:SkipPackageVerification=false to re-enable. -->
+    <SkipPackageVerification Condition="'$(SkipPackageVerification)' == ''">true</SkipPackageVerification>
+    <!-- ApiValidator / Inf2Cat: WDK Shared.Props defaults these to true when
+         empty, so the effective defaults are forced again at the end of this
+         file after all Imports. -->
+    <ApiValidator_Enable Condition="'$(ApiValidator_Enable)' == ''">false</ApiValidator_Enable>
+    <!-- Inf2Cat (catalog generation) requires a fully laid-out package
+         directory; for a compile-only smoke build we skip it. It's also
+         the biggest source of false positives on desktop-SDK-only
+         installs (missing tools, wrong bitness, etc.). -->
+    <EnableInf2cat Condition="'$(EnableInf2cat)' == ''">false</EnableInf2cat>
+    <!-- SignMode=Off keeps the .sys unsigned at build time. The WDK
+         test-signs with a dev cert otherwise, which is handy but not
+         required for local iteration. Flip back to TestSign (or pass
+         /p:SignMode=TestSign) when you want to load the driver. -->
+    <SignMode Condition="'$(SignMode)' == ''">Off</SignMode>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <PreprocessorDefinitions>_WIN64;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)hw;$(ProjectDir)diag;$(ProjectDir)..\Shared;$(ProjectDir)..\Shaders;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <SpectreMitigation>false</SpectreMitigation>
+    </ClCompile>
+    <Link>
+      <!-- WDDM miniports link against displib.lib (which exports
+           DxgkInitialize / DxgkCb*). The dxgkrnl.lib / dxapi.lib combo
+           used by some legacy XDDM samples isn't shipped in the WDK
+           anymore. $(DDK_LIB_PATH) expands to the right km\<arch>\ dir. -->
+      <AdditionalDependencies>$(DDK_LIB_PATH)displib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+    <Inf>
+      <TimeStamp>04/20/2026,0.0.1.0</TimeStamp>
+    </Inf>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="WinMaliDxgkInitFill.h" />
+    <ClInclude Include="WinMaliKmd.h" />
+    <ClInclude Include="WinMaliTrace.h" />
+    <ClInclude Include="WinMaliMmu.h" />
+    <ClInclude Include="hw\WinMaliHw.h" />
+    <ClInclude Include="diag\WinMaliDiag.h" />
+    <ClInclude Include="..\Shared\WinMaliCommon.h" />
+    <ClInclude Include="..\Shaders\winmali_shader_programs.h" />
+    <ClInclude Include="vop2\Vop2ConnectorsShared.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="WinMaliDxgkInitFill.c" />
+    <ClCompile Include="WinMaliDriver.c" />
+    <ClCompile Include="WinMaliTrace.c" />
+    <ClCompile Include="WinMaliBringup.c" />
+    <ClCompile Include="WinMaliMmu.c" />
+    <ClCompile Include="WinMaliFw.c" />
+    <ClCompile Include="hw\WinMaliHw.c" />
+    <ClCompile Include="diag\WinMaliDiag.c" />
+    <ClCompile Include="vop2\Vop2Connectors.c" />
+    <ClCompile Include="vop2\Vop2Gop.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <Inf Include="WinMaliKmd.inx" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+  <!-- After WDK props: Shared.Props defaults ApiValidator_Enable and EnableInf2cat to
+       true when empty, undoing the early PropertyGroup. Force local defaults; use
+       /p:ApiValidator_Enable=true or /p:EnableInf2cat=true from the command line when needed. -->
+  <PropertyGroup>
+    <ApiValidator_Enable>false</ApiValidator_Enable>
+    <EnableInf2cat>false</EnableInf2cat>
+  </PropertyGroup>
+</Project>

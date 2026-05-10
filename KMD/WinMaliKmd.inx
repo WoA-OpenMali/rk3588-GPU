@@ -1,0 +1,115 @@
+;
+; WinMaliKmd.inx
+;
+; Installs the WinMali full-graphics WDDM miniport for the Mali-G610 GPU
+; on RK3588 (ACPI HID ARMH5655 as exported by edk2-rk3588's gpu.asl).
+;
+; This is the unified Mali-render + VOP2-display "Full Graphics" driver:
+; Windows 11 client refuses to use a render-only adapter as the primary
+; DWM target, so we publish a single adapter that owns both pieces.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGUID   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 04/20/2026,0.0.1.0
+CatalogFile = WinMaliKmd.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir       = 13
+WinMaliKmd.Drivers   = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+WinMaliKmd.sys = 1
+
+[Manufacturer]
+%ProviderName% = WinMali, NTARM64
+
+[ControlFlags]
+ExcludeFromSelect = *
+
+[WinMali.NTARM64]
+%WinMaliKmd.DeviceDesc% = WinMaliKmd_Install, ACPI\ARMH5655
+
+[WinMaliKmd_Install]
+FeatureScore = FE
+CopyFiles    = WinMaliKmd.Drivers
+AddReg       = WinMaliKmd.SoftwareSettings
+AddReg       = WinMaliKmd.GraphicsDrivers.AddReg
+
+[WinMaliKmd_Install.Services]
+AddService = WinMaliKmd, 0x00000002, WinMaliKmd.Service, WinMaliKmd.EventLog
+
+;
+; Service installation. LoadOrderGroup = Video is REQUIRED for a full
+; graphics driver: it places us in the boot phase where dxgkrnl/dxgmms2
+; are already initialized and can construct the per-adapter PnP registry
+; path that VIDMM_GLOBAL::ReadPhysicalAdapterConfiguration walks. Without
+; it, VIDMM tried to look us up before our PnP registry node existed and
+; bugchecked at DpiGetPnpRegistryKeyName.
+;
+[WinMaliKmd.Service]
+ServiceType    = 1            ; SERVICE_KERNEL_DRIVER
+StartType      = 3            ; SERVICE_DEMAND_START
+ErrorControl   = 0            ; SERVICE_ERROR_IGNORE
+LoadOrderGroup = Video
+ServiceBinary  = %13%\WinMaliKmd.sys
+
+;
+; EventLog wiring - dxgkrnl pokes at this even for non-DOD drivers.
+;
+[WinMaliKmd.EventLog]
+AddReg = WinMaliKmd.EventLog.AddReg
+
+[WinMaliKmd.EventLog.AddReg]
+HKR,, EventMessageFile, %REG_EXPAND_SZ%, "%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,, TypesSupported,   %REG_DWORD%,     7
+
+[WinMaliKmd.Drivers]
+WinMaliKmd.sys
+
+;
+; HKR (per-device) software settings.
+;
+; WDDMVersion MUST match what we report in DXGK_DRIVERCAPS / WDDMDEVICECAPS /
+; UMDRIVERPRIVATE at QueryAdapterInfo time. Bumped from 0x2000 to 0x2400 to
+; reflect that we publish the WDDM 2.4 surface (DRIVERCAPS.WDDMVersion =
+; DXGKDDI_WDDMv2_4 in WinMaliDriver.c).
+;
+; UserModeDriverName is repeated four times: dxgkrnl indexes by D3D feature
+; level, and historically asks for indices [0..3]. Pointing all four at the
+; same DLL is the standard render-only / OpenGL ICD pattern; it lets the
+; OS load the UMD even before we ship per-FL variants.
+;
+[WinMaliKmd.SoftwareSettings]
+HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll"
+HKR,, UserModeDriverNameWOW, %REG_MULTI_SZ%, "WinMaliUmd.dll"
+HKR,, InstalledDisplayDrivers,%REG_MULTI_SZ%, "WinMaliKmd"
+HKR,, VgaCompatible,         %REG_DWORD%, 0
+HKR,, WDDMVersion,           %REG_DWORD%, 0x2400  ; WDDM 2.4
+
+;
+; HKLM (machine-wide) graphics-driver knobs. Every WDDM full graphics
+; driver I've cribbed from sets these. Without them, dxgmms2's TDR /
+; preemption / direct-flip code paths read uninitialized values out of
+; the registry and either misbehave or crash. The values mirror the
+; render-only sample (malicsf) from windows-driver-samples.
+;
+[WinMaliKmd.GraphicsDrivers.AddReg]
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",       EnablePreemption,            %REG_DWORD%, 0
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers",                 TdrDebugMode,                %REG_DWORD%, 0
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager",   DirectFlipMemoryRequirement, %REG_DWORD%, 0
+
+[Strings]
+ProviderName           = "WinMali Project"
+DiskName               = "WinMali Driver Disk"
+WinMaliKmd.DeviceDesc  = "Mali-G610 GPU + RK3588 Display (WinMali)"
+REG_MULTI_SZ           = 0x00010000
+REG_EXPAND_SZ          = 0x00020000
+REG_DWORD              = 0x00010001

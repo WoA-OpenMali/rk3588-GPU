@@ -26,7 +26,11 @@ WinMaliKmd.Drivers   = 13
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-WinMaliKmd.sys = 1
+WinMaliKmd.sys  = 1
+; Required: dxgkrnl resolves UserModeDriverName against this driver package
+; (Driver Store). Listing only the .sys leaves no WinMaliUmd.dll beside it,
+; so the OS never successfully loads the UMD.
+WinMaliUmd.dll = 1
 
 [Manufacturer]
 %ProviderName% = WinMali, NTARM64
@@ -73,6 +77,7 @@ HKR,, TypesSupported,   %REG_DWORD%,     7
 
 [WinMaliKmd.Drivers]
 WinMaliKmd.sys
+WinMaliUmd.dll
 
 ;
 ; HKR (per-device) software settings.

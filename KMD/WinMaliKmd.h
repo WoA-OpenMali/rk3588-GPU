@@ -159,6 +159,12 @@ EXTERN_C DRIVER_UNLOAD    WinMaliKmdDriverUnload;
 // null-check the result before dereferencing.
 PWINMALI_ADAPTER WinMaliAdapterFromContext(_In_ const VOID* Context);
 
+// Same adapter as above, but keyed by what dxgk passes as hAdapter on most
+// DDIs: DXGKRNL_INTERFACE::DeviceHandle after StartDevice. QueryAdapterInfo
+// sometimes passes the miniport context pointer instead; this helper accepts
+// either (singleton adapter).
+PWINMALI_ADAPTER WinMaliAdapterFromDxgkHandle(_In_opt_ const VOID* hAdapter);
+
 // Device lifecycle
 // NOTE: AddDevice takes IN_CONST_PDEVICE_OBJECT which is typedef'd as
 // "CONST PDEVICE_OBJECT" (pointer-is-const, object is not), not

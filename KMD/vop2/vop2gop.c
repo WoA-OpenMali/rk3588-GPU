@@ -2,10 +2,6 @@
 #include "../WinMaliKmd.h"
 #include "Vop2ConnectorsShared.h"
 
-PWINMALI_ADAPTER
-WinMaliAdapterFromContext(_In_ const VOID* Context);
-
-
 VOID
 Rk3588DispCaptureGopFb(_Inout_ PWINMALI_ADAPTER Adapter)
 {
@@ -124,7 +120,7 @@ Rk3588DispRecommendFunctionalVidPn(
     _In_ const HANDLE                                     hAdapter,
     _In_ const DXGKARG_RECOMMENDFUNCTIONALVIDPN*          pRecommendFunctionalVidPn)
 {
-    PWINMALI_ADAPTER a = WinMaliAdapterFromContext(hAdapter);
+    PWINMALI_ADAPTER a = WinMaliAdapterFromDxgkHandle(hAdapter);
     const RK3588_DISP_GOP_FB*          gop = &a->Gop;
     const DXGK_VIDPN_INTERFACE*        vidPnIf = NULL;
     const DXGK_VIDPNTOPOLOGY_INTERFACE* topoIf = NULL;
@@ -262,7 +258,7 @@ Rk3588DispEnumVidPnCofuncModality(
     _In_ const HANDLE                              hAdapter,
     _In_ const DXGKARG_ENUMVIDPNCOFUNCMODALITY*    pEnumCofuncModality)
 {
-    PWINMALI_ADAPTER a = WinMaliAdapterFromContext(hAdapter);
+    PWINMALI_ADAPTER a = WinMaliAdapterFromDxgkHandle(hAdapter);
     const RK3588_DISP_GOP_FB*          gop = &a->Gop;
     const DXGK_VIDPN_INTERFACE*        vidPnIf = NULL;
     const DXGK_VIDPNTOPOLOGY_INTERFACE* topoIf = NULL;
@@ -271,6 +267,7 @@ Rk3588DispEnumVidPnCofuncModality(
     NTSTATUS                           status;
 
     UNREFERENCED_PARAMETER(hAdapter);
+    WINMALI_ENTER();
     if (a == NULL || pEnumCofuncModality == NULL || gop == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
@@ -396,7 +393,7 @@ Rk3588DispCommitVidPn(
     _In_ const HANDLE                  hAdapter,
     _In_ const DXGKARG_COMMITVIDPN*    pCommitVidPn)
 {
-    PWINMALI_ADAPTER a = WinMaliAdapterFromContext(hAdapter);
+    PWINMALI_ADAPTER a = WinMaliAdapterFromDxgkHandle(hAdapter);
     const DXGK_VIDPN_INTERFACE*         vidPnIf = NULL;
     const DXGK_VIDPNTOPOLOGY_INTERFACE* topoIf = NULL;
     D3DKMDT_HVIDPNTOPOLOGY              hTopo = 0;
@@ -407,7 +404,13 @@ Rk3588DispCommitVidPn(
     UNREFERENCED_PARAMETER(hAdapter);   
 
     WINMALI_ENTER();
-    if (a == NULL || pCommitVidPn == NULL) return STATUS_INVALID_PARAMETER;
+    if (a == NULL || pCommitVidPn == NULL) {
+        WINMALI_WARN(
+            "CommitVidPn: invalid args (a=%p hAdapter=%p)",
+            a,
+            hAdapter);
+        return STATUS_INVALID_PARAMETER;
+    }
 
     // is whatever UEFI set up. But we must validate the topology and
     // reject a commit whose primary path targets a connector we can't
@@ -462,8 +465,9 @@ Rk3588DispUpdateActiveVidPnPresentPath(
     _In_ const DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH*  pUpdateActive)
 {
     UNREFERENCED_PARAMETER(hAdapter);
-    
-    PWINMALI_ADAPTER a = WinMaliAdapterFromContext(hAdapter);
+    WINMALI_ENTER();
+
+    PWINMALI_ADAPTER a = WinMaliAdapterFromDxgkHandle(hAdapter);
     if (a == NULL || pUpdateActive == NULL) return STATUS_INVALID_PARAMETER;
     a->ActivePath    = pUpdateActive->VidPnPresentPathInfo;
     a->HasActivePath = TRUE;
@@ -478,7 +482,8 @@ Rk3588DispSetVidPnSourceVisibility(
     _In_ const DXGKARG_SETVIDPNSOURCEVISIBILITY*  pSetVidPnSourceVisibility)
 {
     UNREFERENCED_PARAMETER(hAdapter);
-    PWINMALI_ADAPTER a = WinMaliAdapterFromContext(hAdapter);
+    WINMALI_ENTER();
+    PWINMALI_ADAPTER a = WinMaliAdapterFromDxgkHandle(hAdapter);
     if (a == NULL || pSetVidPnSourceVisibility == NULL) return STATUS_INVALID_PARAMETER;
     a->SourceVisible = pSetVidPnSourceVisibility->Visible;
     WINMALI_TRACE("SetSourceVisibility src=%u visible=%u",
@@ -496,7 +501,7 @@ Rk3588DispRecommendMonitorModes(
     _In_ const HANDLE                           hAdapter,
     _In_ const DXGKARG_RECOMMENDMONITORMODES*   pRecommendMonitorModes)
 {
-    PWINMALI_ADAPTER a = WinMaliAdapterFromContext(hAdapter);
+    PWINMALI_ADAPTER a = WinMaliAdapterFromDxgkHandle(hAdapter);
     const RK3588_DISP_GOP_FB*                gop = &a->Gop;
     const DXGK_MONITORSOURCEMODESET_INTERFACE* setIf = NULL;
     D3DKMDT_MONITOR_SOURCE_MODE*             mode = NULL;
@@ -556,7 +561,7 @@ NTSTATUS APIENTRY Rk3588DispSetVidPnSourceAddress(
     IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESS     pSetVidPnSourceAddress)
 {
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetVidPnSourceAddress);
+    WINMALI_ENTER();
     WINMALI_TRACE("SetVidPnSourceAddress src=%u addr=0x%llx",
                       pSetVidPnSourceAddress->VidPnSourceId,
                       pSetVidPnSourceAddress->PrimaryAddress.QuadPart);

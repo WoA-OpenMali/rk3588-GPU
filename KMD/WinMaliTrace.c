@@ -1,5 +1,8 @@
 #include "WinMaliKmd.h"
 
+// Compile-time identity for DbgPrint mirror lines (when WinMaliTrace.c was built).
+#define WINMALI_TRACE_COMPILE_STAMP __DATE__ " " __TIME__
+
 // -------------------------------------------------------------------------
 // Provider definition. GUID MUST match WinMaliTrace.h.
 // -------------------------------------------------------------------------
@@ -104,6 +107,9 @@ WinMaliTraceFormatted_(
         break;
     }
 
-    DbgPrint("[WinMali/%s] %s: %s\n",
-             WinMaliTraceLevelTag_(Level), Function, buffer);
+    DbgPrint("[WinMali/%s] [%s] %s: %s\n",
+             WinMaliTraceLevelTag_(Level),
+             WINMALI_TRACE_COMPILE_STAMP,
+             Function,
+             buffer);
 }

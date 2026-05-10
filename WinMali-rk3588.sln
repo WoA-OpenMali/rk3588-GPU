@@ -3,6 +3,9 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 17.0.0.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WinMaliKmd", "KMD\WinMaliKmd.vcxproj", "{A1B2C3D4-0001-4E5F-9A0B-001122334455}"
+	ProjectSection(ProjectDependencies) = postProject
+		{A1B2C3D4-0002-4E5F-9A0B-001122334455} = {A1B2C3D4-0002-4E5F-9A0B-001122334455}
+	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WinMaliUmd", "UMD\WinMaliUmd.vcxproj", "{A1B2C3D4-0002-4E5F-9A0B-001122334455}"
 EndProject

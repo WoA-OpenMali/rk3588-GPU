@@ -144,6 +144,17 @@ WinMaliKmdAddDevice(
     adapter->PhysicalDeviceObject = PhysicalDeviceObject;
     *MiniportDeviceContext        = adapter;
 
+    //
+    // Process list + AS-slot allocator are touched from PASSIVE (CreateProcess
+    // / DestroyProcess / DxgkDdiSetRootPageTable) but the spinlocks let us run
+    // safely at DISPATCH if dxgk ever escalates. Initialised here so QAI calls
+    // (which can arrive before StartDevice on some PnP races) see a sane state.
+    //
+    KeInitializeSpinLock(&adapter->ProcessListLock);
+    InitializeListHead(&adapter->ProcessList);
+    adapter->ActiveProcessCount = 0;
+    WinMaliMmuInitAsAllocator(adapter);
+
     // Publish the singleton so handle-based callbacks (Escape,
     // CreateDevice) can find the miniport context from an opaque
     // DXGK adapter handle.
@@ -197,6 +208,13 @@ WinMaliKmdStartDevice(
     } else {
         adapter->AdapterFlags |= WINMALI_ADAPTER_FLAG_DIAG_PASSED;
     }
+
+    //
+    // BringupHardware probed `GPU_AS_PRESENT`. Re-seed the allocator so
+    // dynamic AS slots are picked from the real HW bitmap (G610 reports 0xFF
+    // = 8 slots) instead of the placeholder we set up in AddDevice.
+    //
+    WinMaliMmuInitAsAllocator(adapter);
 
     // Linux: panthor_mmu_init -> panthor_fw_init. MMU scratch heap + AS1,
     // then WinMaliFwInit (firmware + AS0 + MCU) after IRQ connect.
@@ -279,12 +297,42 @@ WinMaliKmdRemoveDevice(_In_ const PVOID MiniportDeviceContext)
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
     WINMALI_ENTER();
     if (adapter != NULL) {
+        KIRQL irql;
+        ULONG leaked = 0;
+
         if (!adapter->StartDeviceEverSucceeded) {
             WINMALI_WARN(
                 "RemoveDevice: StartDevice never reached success (ctx=%p) -- "
                 "dxgk/PnP failed before or during start",
                 adapter);
         }
+
+        //
+        // Drain the KMD process list. Normally DxgkDdiDestroyProcess clears
+        // every entry; if dxgk teardown skipped any (surprise remove, failed
+        // init), we free them here so RemoveDevice doesn't leak pool. AS-slot
+        // teardown is implicit via WinMaliMmuTeardown below.
+        //
+        KeAcquireSpinLock(&adapter->ProcessListLock, &irql);
+        while (!IsListEmpty(&adapter->ProcessList)) {
+            PLIST_ENTRY entry = RemoveHeadList(&adapter->ProcessList);
+            PWINMALI_KMD_PROCESS proc = CONTAINING_RECORD(
+                entry, WINMALI_KMD_PROCESS, AdapterLink);
+            KeReleaseSpinLock(&adapter->ProcessListLock, irql);
+            WINMALI_WARN(
+                "RemoveDevice: leaked KmdProcess=%p hDxgk=%p flags=0x%x",
+                proc, proc->hDxgkProcess, proc->Flags);
+            proc->Magic = 0;
+            ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
+            ++leaked;
+            KeAcquireSpinLock(&adapter->ProcessListLock, &irql);
+        }
+        adapter->ActiveProcessCount = 0;
+        KeReleaseSpinLock(&adapter->ProcessListLock, irql);
+        if (leaked != 0) {
+            WINMALI_WARN("RemoveDevice: freed %u leaked KmdProcess struct(s)", leaked);
+        }
+
         // Defensive - StopDevice should already have run, but be
         // idempotent so surprise removal still unmaps MMIO.
         Rk3588DispReleaseGopFb(adapter);
@@ -339,70 +387,195 @@ WinMaliKmdQueryAdapterInfo(
 
     case DXGKQAITYPE_DRIVERCAPS: {
         DXGK_DRIVERCAPS* caps = (DXGK_DRIVERCAPS*)pQueryAdapterInfo->pOutputData;
-        if (caps == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*caps)) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        RtlZeroMemory(caps, sizeof(*caps));
+        SIZE_T           outSz = pQueryAdapterInfo->OutputDataSize;
 
         //
-        // Full-graphics caps. Two things matter most for "Win11 will leave
-        // me loaded as the primary adapter":
-        //   1. SupportNonVGA + SectionBackedPrimary together tell dxgkrnl
-        //      we participate in the modern (WDDM 2.x section-backed)
-        //      primary-surface model. Without these, dxgkrnl assumes
-        //      we're a legacy adapter that can't host the desktop.
-        //   2. Non-zero MaxAllocationListSlotId + ApertureSegmentCommitLimit
-        //      flag us as having allocatable GPU memory.
-        // The render-only sample I cribbed earlier had these zeroed which is
-        // exactly what was provoking dxgkrnl to fall back to MS Basic Display.
+        // Buffer sizing follows the negotiated DDI surface in
+        // DRIVER_INITIALIZATION_DATA.Version (WinMaliDxgkInitFill.c pins
+        // DXGKDDI_INTERFACE_VERSION_WDDM2_4). On Win11 26100 dxgk passes
+        // OutputDataSize = 584 for DRIVERCAPS — the layout through MiscCaps
+        // only. Our WDK still compiles DXGK_DRIVERCAPS with the WDDM2_9 tail
+        // (MaxHwQueuedFlips + HwQueuedFlipCaps), so sizeof(*caps) == 592.
+        //
+        // Requiring sizeof(*caps) caused STATUS_BUFFER_TOO_SMALL / invalid
+        // reject; RtlZeroMemory(caps, sizeof(*caps)) also scribbled 8 bytes
+        // past the end of dxgk's 584-byte buffer (undefined behaviour).
+        //
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_9)
+        CONST SIZE_T kDriverCapsMinOut = FIELD_OFFSET(DXGK_DRIVERCAPS, MaxHwQueuedFlips);
+#else
+        CONST SIZE_T kDriverCapsMinOut = sizeof(DXGK_DRIVERCAPS);
+#endif
+        if (caps == NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (outSz < kDriverCapsMinOut) {
+            WINMALI_WARN(
+                "DRIVERCAPS: buffer too small have=%Iu need>=%Iu fullStruct=%Iu",
+                outSz,
+                kDriverCapsMinOut,
+                (SIZE_T)sizeof(DXGK_DRIVERCAPS));
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        RtlZeroMemory(caps, outSz);
+
+        //
+        // DRIVERCAPS payload mirrored from render-only-sample
+        // (roskmd\RosKmdAdapter.cpp DXGKQAITYPE_DRIVERCAPS) with the
+        // "display" sub-block from its !IsRenderOnly() branch, because
+        // our WinMali KMD is the unified Mali render + RK3588 VOP2
+        // display "Full Graphics" adapter.
+        //
+        // Most-important consistency invariants dxgk validates here on
+        // Win11 26200:
+        //   * SchedulingCaps.PreemptionAware = 1 REQUIRES non-zero
+        //     PreemptionCaps.Graphics/ComputePreemptionGranularity.
+        //     Leaving those at zero contradicts PreemptionAware and is
+        //     enough by itself to make dxgk decide we're malformed
+        //     after the cap walk and surprise-remove us.
+        //   * SupportNonVGA = 1 implies SupportSmoothRotation = 1
+        //     (render-only-sample comment: "Must support updating path
+        //     rotation in DxgkDdiUpdateActiveVidPnPresentPath").
+        //   * SupportDirectFlip = 1 implies FlipCaps.FlipIndependent = 1
+        //     and FlipCaps.FlipOnVSyncWithNoWait = 1; otherwise the
+        //     DWM independent-flip path has nowhere to land.
+        //   * Either set MemoryManagementCaps.SectionBackedPrimary = 1
+        //     AND publish a DirectFlip-capable segment, or set neither.
+        //     We are setting neither for now; primary lives in our
+        //     normal segment once we add real VRAM.
         //
         caps->WDDMVersion = DXGKDDI_WDDMv2_4;
         caps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
 
-        caps->SchedulingCaps.VSyncPowerSaveAware = 1;
-        caps->SchedulingCaps.MultiEngineAware    = 1;
-        caps->SchedulingCaps.PreemptionAware     = 1;
+        //
+        // PresentationCaps: copy the render-only-sample defaults so the
+        // GDI/redirection bitmap path has sane numbers (DWM-off case
+        // does screen-to-screen blit by default; we disable that).
+        //
+        caps->PresentationCaps.SupportKernelModeCommandBuffer = FALSE;
+        caps->PresentationCaps.SupportSoftwareDeviceBitmaps   = TRUE;
+        caps->PresentationCaps.NoScreenToScreenBlt            = TRUE;
+        caps->PresentationCaps.NoOverlapScreenBlt             = TRUE;
+        caps->PresentationCaps.MaxTextureWidthShift           = 3;   // 16K
+        caps->PresentationCaps.MaxTextureHeightShift          = 3;   // 16K
 
         //
-        // SectionBackedPrimary: we expose primary surfaces as section objects.
-        // PagingNode=0: node 0 also handles paging (we only have one node).
-        // IoMmuSupported=0: we don't go through the system IOMMU; the GPU has
-        // its own MMU which we'll plumb later.
+        // FlipCaps: full-graphics adapter, so we copy the !IsRenderOnly()
+        // arm of the sample. MaxQueuedFlipOnVSync = 1 says the hardware
+        // can store one pending flip; FlipOnVSyncMmIo + FlipOnVSyncWithNoWait
+        // says "I program the new source address immediately and it
+        // latches at the next VSync". FlipIndependent is required by
+        // DirectFlip / DWM independent flip.
         //
-        caps->MemoryManagementCaps.SectionBackedPrimary = 1;
-        caps->MemoryManagementCaps.PagingNode           = 0;
-        caps->MemoryManagementCaps.IoMmuSupported       = 0;
-
-        caps->MaxAllocationListSlotId       = 7;
-        caps->ApertureSegmentCommitLimit    = 64 * 1024 * 1024;
-
         caps->MaxQueuedFlipOnVSync           = 1;
-        caps->FlipCaps.FlipOnVSyncMmIo       = 1;
-        caps->FlipCaps.FlipOnVSyncWithNoWait = 0;
-        caps->FlipCaps.FlipIndependent       = 0;
+        caps->FlipCaps.FlipOnVSyncMmIo       = TRUE;
+        caps->FlipCaps.FlipOnVSyncWithNoWait = TRUE;
+        caps->FlipCaps.FlipInterval          = FALSE;
+        caps->FlipCaps.FlipImmediateMmIo     = FALSE;
+        caps->FlipCaps.FlipIndependent       = TRUE;
 
         //
-        // SupportNonVGA tells dxgkrnl "I am NOT a VGA-compatible adapter",
-        // i.e. don't try to talk to me through legacy 0x3D4 VGA registers.
-        // SupportDirectFlip enables modern flip-model presentation (no copy).
-        // SupportSmoothRotation: false until we wire the rotation path.
+        // SchedulingCaps: render-only-sample sets MultiEngineAware,
+        // CancelCommandAware, and PreemptionAware. We additionally keep
+        // VSyncPowerSaveAware so dxgk's VSync power-save logic knows we
+        // honor its requests.
         //
-        caps->SupportNonVGA          = TRUE;
-        caps->SupportSmoothRotation  = FALSE;
-        caps->SupportDirectFlip      = 1;
+        caps->SchedulingCaps.MultiEngineAware    = 1;
+        caps->SchedulingCaps.CancelCommandAware  = 1;
+        caps->SchedulingCaps.PreemptionAware     = 1;
+        caps->SchedulingCaps.VSyncPowerSaveAware = 1;
 
+        //
+        // MemoryManagementCaps:
+        //   * CrossAdapterResource = 1 (sample): we allow allocations
+        //     to be shared across adapters via the cross-adapter
+        //     resource model.
+        //   * SectionBackedPrimary = 0 for now (was 1, but we have no
+        //     DirectFlip-capable segment to host the primary; that
+        //     inconsistency is what dxgk dislikes). Re-enable when
+        //     QUERYSEGMENT* publishes a CpuVisible + DirectFlip segment
+        //     backed by real contiguous memory.
+        //
+        // GpuMmuSupported + VirtualAddressingSupported MUST agree with
+        // DXGK_PHYSICALADAPTERCAPS.Flags.GpuMmuSupported and
+        // DXGK_NODEMETADATA.GpuMmuSupported on every node. Leaving these
+        // at zero while PHYSICALADAPTERCAPS claims GpuMmu=1 caused Win11
+        // 26100 dxgk to abort the post-Start cap walk right after
+        // GetNodeMetadata (no GPUMMUCAPS / QUERYSEGMENT* / display-ext
+        // queries) and PnP-stop the device.
+        //
+        // DedicatedPagingEngine stays 0: PHYSICALADAPTERCAPS.PagingNodeIndex
+        // == NumExecutionNodes (no dedicated paging DMA engine).
+        //
+        caps->MemoryManagementCaps.CrossAdapterResource        = 1;
+        caps->MemoryManagementCaps.SectionBackedPrimary         = 0;
+        caps->MemoryManagementCaps.VirtualAddressingSupported = 1;
+        caps->MemoryManagementCaps.GpuMmuSupported            = 1;
+        caps->MemoryManagementCaps.PagingNode                  = 0;
+        caps->MemoryManagementCaps.IoMmuSupported              = 0;
+
+        caps->MaxAllocationListSlotId    = 7;
+        caps->ApertureSegmentCommitLimit = 64 * 1024 * 1024;
+
+        //
+        // PreemptionCaps: REQUIRED whenever SchedulingCaps.PreemptionAware
+        // is set (see invariants above). Render-only-sample reports
+        // primitive-boundary graphics preemption and dispatch-boundary
+        // compute preemption; those are the smallest claims that match a
+        // modern WDDM context-scheduling driver. We can tighten later
+        // once we wire real Mali pre-emption (mid-primitive / mid-triangle).
+        //
+        caps->PreemptionCaps.GraphicsPreemptionGranularity =
+            D3DKMDT_GRAPHICS_PREEMPTION_PRIMITIVE_BOUNDARY;
+        caps->PreemptionCaps.ComputePreemptionGranularity  =
+            D3DKMDT_COMPUTE_PREEMPTION_DISPATCH_BOUNDARY;
+
+        //
+        // SupportNonVGA tells dxgkrnl we're not a VGA-compatible
+        // adapter; per the sample comment, this requires
+        // DxgkDdiStopDeviceAndReleasePostDisplayOwnership AND
+        // SupportSmoothRotation = TRUE. SupportDirectFlip enables
+        // modern flip-model presentation; combined with the FlipCaps
+        // block above, we expose the DWM independent flip path.
+        // SupportPerEngineTDR matches our SchedulingCaps.MultiEngineAware
+        // claim (TDR is reported per node).
+        //
+        caps->SupportNonVGA                = TRUE;
+        caps->SupportSmoothRotation        = TRUE;
+        caps->SupportPerEngineTDR          = 1;
+        caps->SupportDirectFlip            = 1;
+        caps->SupportRuntimePowerManagement = FALSE;
+
+        //
+        // WDDM 2.0+: GPU VA span managed by VIDMM. Must cover the VA space
+        // implied by DXGKQAITYPE_GPUMMUCAPS (we report 48-bit VA there).
+        // Zero,zero left dxgk with no span after we turned GpuMmuSupported on
+        // in MemoryManagementCaps.
+        //
+        caps->InternalGpuVirtualAddressRangeStart = (D3DGPU_VIRTUAL_ADDRESS)0x10000ULL;
+        caps->InternalGpuVirtualAddressRangeEnd   =
+            (D3DGPU_VIRTUAL_ADDRESS)0x0000FFFFFFFFFFFFULL;
+
+        //
         // One 3-D node is the usual minimum for a render adapter. Zero
         // nodes plus a stub GetNodeMetadata can prevent dxgk from ever
         // calling DxgkDdiStartDevice on recent builds.
+        //
         caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
 
-        WINMALI_TRACE("DRIVERCAPS: WDDM=0x%x slots=%u apertureLimit=%llu "
-                      "maxFlips=%u nodes=%u nonvga=1 sectionBacked=1 directFlip=1",
-                      caps->WDDMVersion,
-                      caps->MaxAllocationListSlotId,
-                      (ULONGLONG)caps->ApertureSegmentCommitLimit,
-                      caps->MaxQueuedFlipOnVSync,
-                      caps->GpuEngineTopology.NbAsymetricProcessingNodes);
+        WINMALI_TRACE(
+            "DRIVERCAPS: WDDM=0x%x preempt=gfx:Prim/cmp:Disp sched=ME+Cnl+Pmt+VSps "
+            "flip=Mmio+NoWait+Indep maxQ=%u nonvga=1 smooth=1 dirFlip=1 pTDR=1 "
+            "memMgr=XAdpt+GpuMmu+VirtAddr gpuVA=[0x%llx,0x%llx] slots=%u "
+            "apertureLimit=%llu nodes=%u",
+            caps->WDDMVersion,
+            caps->MaxQueuedFlipOnVSync,
+            (ULONGLONG)caps->InternalGpuVirtualAddressRangeStart,
+            (ULONGLONG)caps->InternalGpuVirtualAddressRangeEnd,
+            caps->MaxAllocationListSlotId,
+            (ULONGLONG)caps->ApertureSegmentCommitLimit,
+            caps->GpuEngineTopology.NbAsymetricProcessingNodes);
         return STATUS_SUCCESS;
     }
 
@@ -451,11 +624,38 @@ WinMaliKmdQueryAdapterInfo(
         // pInputData can be DXGK_QUERYPHYSICALADAPTERCAPSIN (physical adapter
         // index in an LDA chain). Single-GPU: only index 0 is valid.
         //
+        // Buffer sizing: with init.Version pinned to WDDM 2.4, dxgk passes
+        // OutputDataSize = 24 — the layout through VPRPagingNode only. Our
+        // WDK's DXGK_PHYSICALADAPTERCAPS also includes VirtualCopyNodeIndex
+        // (WDDM 2.7), so sizeof(*phys) is 28. Requiring sizeof(*phys) or
+        // RtlZeroMemory(phys, sizeof(*phys)) scribbled 4 bytes past the end
+        // of dxgk's buffer and/or skipped returning valid caps, which showed
+        // up as PnP-stop right after GetNodeMetadata despite GPUMMUCAPS
+        // succeeding (dxgk had a corrupted / incomplete physical-adapter
+        // snapshot).
+        //
         DXGK_PHYSICALADAPTERCAPS* phys = (DXGK_PHYSICALADAPTERCAPS*)pQueryAdapterInfo->pOutputData;
         PWINMALI_ADAPTER          adapter;
         const DXGK_QUERYPHYSICALADAPTERCAPSIN* physIn;
+        SIZE_T                    outSz = pQueryAdapterInfo->OutputDataSize;
 
-        if (phys == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*phys)) {
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_7)
+        CONST SIZE_T kPhysCapsMinOut = FIELD_OFFSET(DXGK_PHYSICALADAPTERCAPS, VirtualCopyNodeIndex);
+#elif (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_1)
+        CONST SIZE_T kPhysCapsMinOut = sizeof(DXGK_PHYSICALADAPTERCAPS);
+#else
+        CONST SIZE_T kPhysCapsMinOut = sizeof(DXGK_PHYSICALADAPTERCAPS);
+#endif
+
+        if (phys == NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (outSz < kPhysCapsMinOut) {
+            WINMALI_WARN(
+                "PHYSICALADAPTERCAPS: buffer too small have=%Iu need>=%Iu fullStruct=%Iu",
+                outSz,
+                kPhysCapsMinOut,
+                (SIZE_T)sizeof(DXGK_PHYSICALADAPTERCAPS));
             return STATUS_BUFFER_TOO_SMALL;
         }
 
@@ -480,9 +680,31 @@ WinMaliKmdQueryAdapterInfo(
             return STATUS_DEVICE_NOT_READY;
         }
 
-        RtlZeroMemory(phys, sizeof(*phys));
+        RtlZeroMemory(phys, outSz);
         phys->NumExecutionNodes        = 1;
-        phys->PagingNodeIndex          = 0;
+        //
+        // PagingNodeIndex semantics per MSDN DXGK_PHYSICALADAPTERCAPS:
+        //   * value < NumExecutionNodes: "node at this index is a DEDICATED
+        //                                  paging engine" (EngineType must be
+        //                                  DXGK_ENGINE_TYPE_PAGING in the
+        //                                  matching DxgkDdiGetNodeMetadata).
+        //   * value == NumExecutionNodes: "no dedicated paging node; paging
+        //                                  buffers are dispatched on regular
+        //                                  execution engines".
+        //
+        // Previously we wrote PagingNodeIndex=0 with NumExecutionNodes=1 AND
+        // GetNodeMetadata(node 0) reported DXGK_ENGINE_TYPE_3D. Win11 26100
+        // dxgk detected the contradiction (dedicated paging node also claims
+        // to be a 3D execution engine), skipped the rest of the cap walk
+        // (no GPUMMUCAPS, PAGETABLELEVELDESC, QUERYSEGMENT*, or DISPLAY
+        // extension queries), and issued IRP_MN_STOP_DEVICE - exactly what
+        // we were seeing right after GetNodeMetadata.
+        //
+        // Mali-G610 has no separate paging DMA engine; the CSF firmware
+        // shares the JCS slot with rendering work, so paging happens on the
+        // same node as 3D. Use the "no dedicated paging node" encoding.
+        //
+        phys->PagingNodeIndex          = phys->NumExecutionNodes;
         phys->DxgkPhysicalAdapterHandle = adapter->DxgkHandle;
         //
         // GpuMmuSupported is REQUIRED whenever DRIVERCAPS reports
@@ -493,23 +715,41 @@ WinMaliKmdQueryAdapterInfo(
         // is still NULL when a follow-up helper tries to dereference it.
         //
         // We do have a real GPU MMU (the Mali AS array). The matching DDIs
-        // are wired in WinMaliDxgkInitFill.c:
-        //   - SetRootPageTable     : VOID, no-op stub (safe even if dxgk calls)
-        //   - GetRootPageTableSize : returns PAGE_SIZE so dxgk allocates a
-        //                            minimal root-PT backing object on 26100+
-        //                            (returning 0 tripped VIDMM init paths).
-        //   - {Map,Unmap}CpuHostAperture : NOT_SUPPORTED (we don't expose a
-        //                            CPU-visible GPU aperture yet).
+        // are wired in WinMaliDxgkInitFill.c, backed by the AS-slot allocator
+        // in WinMaliMmu.c (AsSlotInUseMask + AsBindings[]):
+        //   - SetRootPageTable     : binds dxgk's root-PT PA to a free Mali
+        //                            AS slot (AS2..AS7 dynamic; AS0/AS1 are
+        //                            reserved for CSF MCU + bring-up).
+        //                            Calls WinMaliMmuAsEnable for real.
+        //   - GetRootPageTableSize : PAGE_SIZE (mandatory for LPAE-4-level/9
+        //                            idx-bits as we publish in PT_LEVEL_DESC).
+        //   - {Map,Unmap}CpuHostAperture : success no-op; we don't expose a
+        //                            host-visible aperture yet, and
+        //                            NOT_SUPPORTED here was tripping caps
+        //                            walks on some 26100 paths.
         //
         phys->Flags.Value              = 0;
         phys->Flags.GpuMmuSupported    = 1;
 
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_1)
+        phys->VPRPagingNode            = phys->NumExecutionNodes;
+#endif
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_7)
+        if (outSz >= sizeof(DXGK_PHYSICALADAPTERCAPS)) {
+            phys->VirtualCopyNodeIndex = phys->NumExecutionNodes;
+        }
+#endif
+
         WINMALI_TRACE(
-            "PHYSICALADAPTERCAPS: stamp=%u hAdapter=%p DeviceHandle=%p ctx=%p flags=0x%x (GpuMmu=1)",
+            "PHYSICALADAPTERCAPS: stamp=%u outSz=%Iu hAdapter=%p DeviceHandle=%p ctx=%p "
+            "execNodes=%u pagingIdx=%u(no-dedicated) flags=0x%x (GpuMmu=1)",
             WINMALI_KMD_CAP_STAMP,
+            outSz,
             hAdapter,
             phys->DxgkPhysicalAdapterHandle,
             adapter,
+            phys->NumExecutionNodes,
+            phys->PagingNodeIndex,
             phys->Flags.Value);
         return STATUS_SUCCESS;
     }
@@ -556,6 +796,43 @@ WinMaliKmdQueryAdapterInfo(
                                sizeof(ver->GpuArchitecture),
                                L"Mali-G610 (Valhall)");
         WINMALI_TRACE("GPUVERSION: arch='Mali-G610 (Valhall)' bios='WinMali UEFI'");
+        return STATUS_SUCCESS;
+    }
+#endif
+
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN8)
+    //
+    // Queried after QUERYSEGMENT4 when preemption / history-buffer formatting
+    // is enabled. NOT_SUPPORTED makes dxgkrnl bail before paging-process
+    // setup (see user trace: type=10 size=4 then CreateProcess then Stop).
+    //
+    case DXGKQAITYPE_HISTORYBUFFERPRECISION: {
+        DXGKARG_HISTORYBUFFERPRECISION* p;
+        UINT                            n;
+
+        if (pQueryAdapterInfo->pOutputData == NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (pQueryAdapterInfo->OutputDataSize < sizeof(DXGKARG_HISTORYBUFFERPRECISION)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        if (pQueryAdapterInfo->pInputData != NULL
+            && pQueryAdapterInfo->InputDataSize >= sizeof(DXGK_QUERYHISTORYBUFFERPRECISIONIN))
+        {
+            const DXGK_QUERYHISTORYBUFFERPRECISIONIN* in =
+                (const DXGK_QUERYHISTORYBUFFERPRECISIONIN*)pQueryAdapterInfo->pInputData;
+
+            if (in->PhysicalAdapterIndex != 0) {
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+        n = (UINT)(pQueryAdapterInfo->OutputDataSize / sizeof(DXGKARG_HISTORYBUFFERPRECISION));
+        p = (DXGKARG_HISTORYBUFFERPRECISION*)pQueryAdapterInfo->pOutputData;
+        RtlZeroMemory(p, (SIZE_T)n * sizeof(DXGKARG_HISTORYBUFFERPRECISION));
+        for (UINT i = 0; i < n; i++) {
+            p[i].PrecisionBits = 64;
+        }
+        WINMALI_TRACE("HISTORYBUFFERPRECISION: count=%u bits=64", n);
         return STATUS_SUCCESS;
     }
 #endif
@@ -1189,11 +1466,15 @@ WinMaliKmdGetNodeMetadata(
         L"WinMali");
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_2)
     //
-    // Learn: "KMD sets the bits for every feature that the specified GPU node
-    // supports." Our 3D node participates in dxgk context scheduling (see
-    // DRIVERCAPS.SchedulingCaps); advertise at least that much.
+    // ContextSchedulingSupported = 1 advertises WDDM 2.5+ hardware-queue
+    // scheduling, which requires functional DxgkDdiCreateHwContext /
+    // CreateHwQueue / SubmitCommandToHwQueue DDIs. Those are still stubs in
+    // this driver, so claiming the feature makes dxgk abort init right after
+    // GetNodeMetadata when it validates the HW scheduler entry points.
+    // Leave the flag clear until the HW-queue DDIs are real (matches what
+    // render-only-sample/RosKmAdapter::GetNodeMetadata does).
     //
-    pGetNodeMetadata->Flags.ContextSchedulingSupported = 1;
+    pGetNodeMetadata->Flags.Value = 0;
 #endif
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_0)
     //
@@ -1309,24 +1590,171 @@ WinMaliKmdQueryChildStatus(
     }
 }
 
+//
+// Synthesized VESA EDID 1.3 base block for a 1920x1080@60 sink.
+//
+// Why we synthesize: WinMaliKmdQueryChildRelations declares the HDMI child
+// with HpdAwareness = HpdAwarenessAlwaysConnected. Per dispmprt.h that is a
+// HARD CONTRACT that the monitor is always present AND the driver delivers
+// a valid descriptor through DxgkDdiQueryDeviceDescriptor. Returning
+// STATUS_MONITOR_NO_DESCRIPTOR caused dxgk to synthesize a placeholder
+// monitor ("MSNILNOEDID_1414_008D_FFFFFFFF_FFFFFFFF_0"); DispBroker then
+// flagged that target as removed ("SessionHandlerBase::EvaluateTargets
+// found removed target") and issued IRP_MN_STOP_DEVICE on us. Hence the
+// regular DxgkDdiStopDevice we saw after GetNodeMetadata.
+//
+// Until vop2connectors.c grows real DDC/I2C-over-AUX EDID reads, we hand
+// the OS a hand-built block describing exactly what the UEFI GOP gave us
+// (1920x1080@60Hz, 8bpc, digital separate sync, sRGB). The math (DTD,
+// chromaticity, checksum) is pre-computed: the final byte (offset 127) is
+// 0xE2 so that the unsigned 8-bit sum of all 128 bytes is zero, which is
+// what VESA mandates. Don't edit individual bytes without re-running the
+// checksum or dxgk will reject the EDID.
+//
+// Detailed timing #1 is the canonical CEA 861 mode 16 (1920x1080@60Hz,
+// 148.5 MHz pixel clock, +/+ sync, H-active 1920 / H-blank 280 / H-front
+// 88 / H-sync 44, V-active 1080 / V-blank 45 / V-front 4 / V-sync 5).
+// "WinMali" is in monitor descriptor FC. Range descriptor FD says
+// 56-75 Hz V, 30-70 kHz H, 200 MHz max pixel clock.
+//
+static const UCHAR s_WinMaliEdid_1920x1080_60[128] = {
+    // Header
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+    // Manufacturer "WMI", product 0x0001, serial 0x00000001
+    0x5D, 0xA9, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+    // Week 1, year 2026 (=36), EDID 1.3, digital input, 53x30 cm, gamma 2.2,
+    // features (RGB color, preferred timing in DTD#1)
+    0x01, 0x24, 0x01, 0x03, 0x80, 0x35, 0x1E, 0x78,
+    // Chromaticity (standard sRGB primaries)
+    0x0A, 0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26,
+    0x0F, 0x50, 0x54,
+    // Established timings I/II/manufacturer: none claimed (DTD is preferred)
+                      0x00, 0x00, 0x00,
+    // Standard timings: 8x unused (0x01 0x01)
+                                        0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    // DTD #1: 1920x1080@60 @ 148.5 MHz (CEA 861 mode 16)
+                                        0x02, 0x3A,
+    0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C,
+    0x45, 0x00, 0x14, 0x2B, 0x21, 0x00, 0x00, 0x1E,
+    // Monitor descriptor FC: monitor name "WinMali\n     "
+    0x00, 0x00, 0x00, 0xFC, 0x00, 0x57, 0x69, 0x6E,
+    0x4D, 0x61, 0x6C, 0x69, 0x0A, 0x20, 0x20, 0x20,
+    0x20, 0x20,
+    // Monitor descriptor FD: monitor range limits (V 56-75, H 30-70, 200 MHz)
+              0x00, 0x00, 0x00, 0xFD, 0x00, 0x38,
+    0x4B, 0x1E, 0x46, 0x14, 0x00, 0x0A, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20,
+    // Monitor descriptor 0x10: dummy padding
+                            0x00, 0x00, 0x00, 0x10,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Extension flag = 0 (no CEA extension block this round)
+    // Checksum 0xE2 so unsigned 8-bit sum across [0..127] == 0
+                                        0x00, 0xE2,
+};
+
 NTSTATUS APIENTRY
 WinMaliKmdQueryDeviceDescriptor(
     _In_    const PVOID             MiniportDeviceContext,
     _In_    ULONG                   ChildUid,
     _Inout_ PDXGK_DEVICE_DESCRIPTOR DeviceDescriptor)
 {
-    UNREFERENCED_PARAMETER(MiniportDeviceContext);
-    UNREFERENCED_PARAMETER(DeviceDescriptor);
+    PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
+    ULONG            primaryUid;
+    ULONG            offset;
+    ULONG            length;
+    ULONG            remaining;
+    ULONG            toCopy;
+
     WINMALI_ENTER();
+
+    if (adapter == NULL || DeviceDescriptor == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    primaryUid = (ULONG)adapter->PrimaryConnector;
+
     //
-    // No DDC/EDID on this bring-up path; OS uses synthetic modes (MSNIL*).
-    // Log at WARN so a silent STATUS_MONITOR_NO_DESCRIPTOR is never mistaken
-    // for "no callback ran".
+    // We only own one child (the GOP-backed connector enumerated in
+    // QueryChildRelations). Anything else means dxgk asked about a uid we
+    // never advertised - return STATUS_INVALID_PARAMETER. There is no
+    // STATUS_MONITOR_INVALID_DESCRIPTOR in ntstatus.h on this WDK, only
+    // checksum / detailed-timing / standard-timing variants which would
+    // misleadingly imply our EDID itself is malformed.
     //
-    WINMALI_WARN(
-        "QueryDeviceDescriptor: STATUS_MONITOR_NO_DESCRIPTOR (ChildUid=%lu)",
-        ChildUid);
-    return STATUS_MONITOR_NO_DESCRIPTOR;
+    if (ChildUid != primaryUid) {
+        WINMALI_WARN(
+            "QueryDeviceDescriptor: unknown ChildUid=%lu (primary=%lu)",
+            ChildUid,
+            primaryUid);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    offset = DeviceDescriptor->DescriptorOffset;
+    length = DeviceDescriptor->DescriptorLength;
+
+    //
+    // dxgk paginates the descriptor read. First call is offset=0,
+    // length>=128; subsequent calls walk forward looking for extension
+    // blocks. Once we're past the base EDID we hand back the documented
+    // STATUS_MONITOR_NO_MORE_DESCRIPTOR_DATA to terminate the walk; that
+    // is NOT an error - dxgk treats it as "done".
+    //
+    if (offset >= sizeof(s_WinMaliEdid_1920x1080_60)) {
+        WINMALI_TRACE(
+            "QueryDeviceDescriptor: end of descriptors at offset=%lu",
+            offset);
+        return STATUS_MONITOR_NO_MORE_DESCRIPTOR_DATA;
+    }
+
+    if (DeviceDescriptor->DescriptorBuffer == NULL || length == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    remaining = sizeof(s_WinMaliEdid_1920x1080_60) - offset;
+    toCopy    = (length < remaining) ? length : remaining;
+
+    RtlCopyMemory(
+        DeviceDescriptor->DescriptorBuffer,
+        s_WinMaliEdid_1920x1080_60 + offset,
+        toCopy);
+
+    //
+    // Per dispmprt.h, the miniport must write back the byte count it
+    // actually filled so dxgk can advance its read cursor correctly.
+    //
+    DeviceDescriptor->DescriptorLength = toCopy;
+
+    if (!adapter->Gop.Valid
+        || adapter->Gop.Width  != 1920
+        || adapter->Gop.Height != 1080)
+    {
+        //
+        // The synthesized EDID claims 1920x1080@60 unconditionally. If
+        // UEFI handed us a different GOP (e.g. 4K), the EDID lies and
+        // the OS will pick a mode that mismatches what GOP is currently
+        // showing. Surface this with a single warning per call so it is
+        // obvious in the logs once we wire vop2connectors.c for real
+        // EDID reads.
+        //
+        WINMALI_WARN(
+            "QueryDeviceDescriptor: GOP %ux%u valid=%u doesn't match "
+            "canned 1920x1080 EDID; expect mode mismatch",
+            (UINT)adapter->Gop.Width,
+            (UINT)adapter->Gop.Height,
+            (UINT)adapter->Gop.Valid);
+    }
+
+    WINMALI_TRACE(
+        "QueryDeviceDescriptor: child=%lu offset=%lu req=%lu copied=%lu",
+        ChildUid,
+        offset,
+        length,
+        toCopy);
+
+    return STATUS_SUCCESS;
 }
 
 // Same values as DEFINE_GUID in dispmprt.h; local constants avoid INITGUID
@@ -1508,6 +1936,11 @@ WinMaliKmdResetDevice(_In_ const PVOID MiniportDeviceContext)
 // ISR: sample GPU/JOB/MMU INT_STAT, clear latched bits, bump counters.
 // With per-block MASK at reset (all masked), this rarely runs until
 // firmware unmasks sources; never claim a shared line without status.
+//
+// DPC also fires when WinMaliKmdSubmitCommand / WinMaliKmdPreemptCommand
+// queue a fake DMA_COMPLETED / DMA_PREEMPTED notification (no real GPU
+// fence machinery yet); both paths set adapter->NotifyDpcPending so the
+// DPC body calls DxgkCbNotifyDpc once and clears the flag.
 // ---------------------------------------------------------------------------
 
 BOOLEAN
@@ -1568,8 +2001,9 @@ WinMaliKmdInterruptRoutine(_In_ const PVOID MiniportDeviceContext, _In_ ULONG Me
 VOID
 WinMaliKmdDpcRoutine(_In_ const PVOID MiniportDeviceContext)
 {
-    WINMALI_ENTER();
     PWINMALI_ADAPTER adapter = WinMaliAdapterFromContext(MiniportDeviceContext);
+    LONG pending;
+
     if (adapter == NULL) return;
 
     // Read-only snapshot at DPC level. We print the first few events
@@ -1579,6 +2013,20 @@ WinMaliKmdDpcRoutine(_In_ const PVOID MiniportDeviceContext)
                       adapter->InterruptsHandled,
                       adapter->InterruptsTotal,
                       adapter->InterruptsSpurious);
+    }
+
+    //
+    // Drain any pending DMA_COMPLETED / DMA_PREEMPTED notifications that
+    // SubmitCommand / PreemptCommand filed via DxgkCbNotifyInterrupt. The
+    // count is opportunistic — dxgk re-collates internally, so it's safe to
+    // call NotifyDpc once per DPC even if multiple interrupts were filed.
+    //
+    pending = InterlockedExchange(&adapter->NotifyDpcPending, 0);
+    if (pending != 0
+        && adapter->DxgkInterface.DxgkCbNotifyDpc != NULL
+        && adapter->DxgkHandle != NULL)
+    {
+        adapter->DxgkInterface.DxgkCbNotifyDpc(adapter->DxgkHandle);
     }
 }
 
@@ -1599,8 +2047,21 @@ WinMaliKmdControlInterrupt(
 }
 
 // ---------------------------------------------------------------------------
-// Render pipeline — stubs until CSF / paging are real. Several of these
-// pointers must be non-NULL for DxgkInitialize on current Windows builds.
+// Render / allocation pipeline.
+//
+// These DDIs are the bridge between the runtime (D3D, OpenGL, Vulkan via
+// translation layers) and the Mali GPU. Real GPU command-stream emission
+// will land in WinMaliKmdRender + WinMaliKmdSubmitCommand once Valhall
+// command-stream assembly is wired (see Compiler/ + render-only-sample/
+// for the eventual shape). Until then SubmitCommand / PreemptCommand
+// fake-complete every submission via DxgkCbNotifyInterrupt so the dxgkrnl
+// scheduler doesn't time-out waiting for a fence we will never raise.
+//
+// CreateAllocation / DestroyAllocation / Open / Close / Describe are real:
+// they allocate WINMALI_KMD_ALLOCATION pool blobs and publish sensible
+// DXGK_ALLOCATIONINFO so VIDMM can place allocations in our single system-
+// memory segment. The Mali AS-slot programming still happens via
+// SetRootPageTable, which is independent of these DDIs.
 // ---------------------------------------------------------------------------
 
 NTSTATUS APIENTRY
@@ -1635,35 +2096,348 @@ WinMaliKmdDestroyDevice(_In_ const HANDLE hDevice)
     return STATUS_SUCCESS;
 }
 
+//
+// Helper: page-align a 64-bit size, capping at MAXSIZE_T - PAGE_SIZE so the
+// downstream SIZE_T cast can't overflow. dxgk-supplied sizes are always
+// well within this bound, but a malicious UMD blob could try to wrap us.
+//
+static SIZE_T
+WinMaliPageAlignSize_(_In_ ULONGLONG bytes)
+{
+    const ULONGLONG mask = (ULONGLONG)(PAGE_SIZE - 1);
+    ULONGLONG aligned;
+
+    if (bytes == 0) {
+        return PAGE_SIZE;   // one-page minimum so we always have a valid alloc
+    }
+    if (bytes > (ULONGLONG)MAXSIZE_T - PAGE_SIZE) {
+        return (SIZE_T)(((ULONGLONG)MAXSIZE_T - PAGE_SIZE) & ~mask);
+    }
+    aligned = (bytes + mask) & ~mask;
+    return (SIZE_T)aligned;
+}
+
+//
+// Helper: synthesize a default WINMALI_ALLOC_PRIVATE when the UMD didn't
+// provide one (legacy / external callers like the Mesa pan_kmod bridge).
+// We use it as the source of truth for size / format / dim, then the
+// caller fills the same fields into the WINMALI_KMD_ALLOCATION struct.
+//
+static VOID
+WinMaliBuildDefaultAllocPrivate_(_Out_ WINMALI_ALLOC_PRIVATE* out, _In_ ULONGLONG sizeBytes)
+{
+    RtlZeroMemory(out, sizeof(*out));
+    out->Magic     = WINMALI_ALLOC_PRIVATE_MAGIC;
+    out->Version   = WINMALI_ALLOC_PRIVATE_VERSION;
+    out->Flags     = WINMALI_ALLOC_FLAG_CPU_VISIBLE | WINMALI_ALLOC_FLAG_CMDBUFFER;
+    out->SizeBytes = (sizeBytes != 0) ? sizeBytes : (ULONGLONG)PAGE_SIZE;
+    out->Alignment = PAGE_SIZE;
+    // Width/Height/Pitch/Bpp/Format/RefreshRate left at zero — only primaries
+    // populate those; buffer-typed allocations should answer 0 to Describe.
+}
+
+//
+// Fill DXGK_ALLOCATIONINFO from a freshly-created WINMALI_KMD_ALLOCATION.
+// Segment-id arithmetic note: VIDMM uses 1-based segment ids in
+// DXGK_SEGMENTPREFERENCE (0 == "unused slot"), and the SupportedSet masks
+// are bit i == segment (i + 1). Our QUERYSEGMENT* reports a single segment
+// (system memory, CPU visible), so SegmentId0 = 1 / SupportedSet = 0x1.
+//
+static VOID
+WinMaliPublishAllocationInfo_(
+    _In_  PWINMALI_KMD_ALLOCATION alloc,
+    _Inout_ DXGK_ALLOCATIONINFO*  info)
+{
+    info->hAllocation               = (HANDLE)alloc;
+    info->Size                      = alloc->Size;
+    info->PitchAlignedSize          = 0;
+    // Alignment is a packed union of MinimumPageSize/RecommendedPageSize
+    // enum values (DXGK_PAGESIZE_4KB = 0) on WDDMv2; setting to 0 selects
+    // the default 4KB pages on both axes, which is exactly what our single
+    // system-memory segment supplies.
+    info->Alignment                 = 0;
+    info->AllocationPriority        = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
+    info->PhysicalAdapterIndex      = 0;
+
+    info->PreferredSegment.Value    = 0;
+    info->PreferredSegment.SegmentId0 = 1;     // our single segment (1-based)
+    info->SupportedReadSegmentSet   = 1u << 0;
+    info->SupportedWriteSegmentSet  = 1u << 0;
+    info->EvictionSegmentSet        = 0;
+
+    info->HintedBank.Value          = 0;
+    info->pAllocationUsageHint      = NULL;
+
+    info->FlagsWddm2.Value          = 0;
+    info->FlagsWddm2.CpuVisible     = (alloc->Flags & WINMALI_ALLOC_FLAG_CPU_VISIBLE) ? 1u : 0u;
+    info->FlagsWddm2.Cached         = 0;
+    info->FlagsWddm2.PermanentSysMem= (alloc->Flags & WINMALI_ALLOC_FLAG_PRIMARY) ? 1u : 0u;
+}
+
 NTSTATUS APIENTRY
 WinMaliKmdCreateAllocation(_In_ const HANDLE hAdapter, _Inout_ DXGKARG_CREATEALLOCATION* p)
 {
-    PWINMALI_ADAPTER adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    PWINMALI_ADAPTER       adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    PWINMALI_KMD_RESOURCE  resource = NULL;
+    UINT                   i;
+    WINMALI_ALLOC_PRIVATE  scratchPriv;
+    NTSTATUS               status = STATUS_SUCCESS;
 
     WINMALI_ENTER();
-    WINMALI_TRACE(
-        "CreateAllocation: MmuScratchHeap=%p (VIDMM CreateAllocation not wired yet)",
-        (adapter != NULL) ? adapter->MmuScratchHeapVa : NULL);
-    UNREFERENCED_PARAMETER(p);
-    return STATUS_NOT_IMPLEMENTED;
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (adapter == NULL) {
+        WINMALI_WARN("CreateAllocation: bad hAdapter=%p", hAdapter);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (p->NumAllocations == 0 || p->pAllocationInfo == NULL) {
+        WINMALI_WARN("CreateAllocation: n=%u pInfo=%p", p->NumAllocations, p->pAllocationInfo);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Resource-mode: the runtime is creating a logical grouping (swapchain,
+    // mip-chain, ...) and dxgk fills hResource with our pointer on return.
+    // The same hResource flows into DestroyAllocation so we can free both
+    // halves in one shot when the runtime tears down the resource.
+    //
+    if (p->Flags.Resource) {
+        resource = (PWINMALI_KMD_RESOURCE)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(*resource), WINMALI_POOL_TAG);
+        if (resource == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        resource->Magic          = WINMALI_KMD_RESOURCE_MAGIC;
+        resource->Adapter        = adapter;
+        resource->NumAllocations = 0;
+        resource->Flags          = 0;
+        InitializeListHead(&resource->AllocationListHead);
+    }
+
+    for (i = 0; i < p->NumAllocations; ++i) {
+        DXGK_ALLOCATIONINFO*       info = &p->pAllocationInfo[i];
+        const WINMALI_ALLOC_PRIVATE* priv;
+        PWINMALI_KMD_ALLOCATION    alloc;
+
+        // Prefer the per-allocation private blob; fall back to a synthetic
+        // default (CPU-visible buffer, one page) so external callers can
+        // open a device against us without porting their UMD yet.
+        if (info->pPrivateDriverData != NULL
+            && info->PrivateDriverDataSize >= sizeof(WINMALI_ALLOC_PRIVATE)
+            && ((const WINMALI_ALLOC_PRIVATE*)info->pPrivateDriverData)->Magic
+                  == WINMALI_ALLOC_PRIVATE_MAGIC)
+        {
+            priv = (const WINMALI_ALLOC_PRIVATE*)info->pPrivateDriverData;
+        } else {
+            WinMaliBuildDefaultAllocPrivate_(
+                &scratchPriv,
+                (info->PrivateDriverDataSize != 0) ? PAGE_SIZE : PAGE_SIZE);
+            priv = &scratchPriv;
+            WINMALI_TRACE(
+                "CreateAllocation[%u]: synthetic priv (UMD blob: ptr=%p size=%u)",
+                i, info->pPrivateDriverData, info->PrivateDriverDataSize);
+        }
+
+        alloc = (PWINMALI_KMD_ALLOCATION)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(*alloc), WINMALI_POOL_TAG);
+        if (alloc == NULL) {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        alloc->Magic              = WINMALI_KMD_ALLOC_MAGIC;
+        alloc->Adapter            = adapter;
+        alloc->Size               = WinMaliPageAlignSize_(priv->SizeBytes);
+        alloc->Alignment          = (priv->Alignment != 0) ? priv->Alignment : PAGE_SIZE;
+        alloc->Flags              = priv->Flags;
+        alloc->Format             = priv->Format;
+        alloc->Width              = priv->Width;
+        alloc->Height             = priv->Height;
+        alloc->Pitch              = priv->Pitch;
+        alloc->BytesPerPixel      = priv->BytesPerPixel;
+        alloc->RefreshNumerator   = priv->RefreshNumerator;
+        alloc->RefreshDenominator = priv->RefreshDenominator;
+        alloc->MultisampleMethod  = priv->MultisampleMethod;
+        alloc->Rotation           = priv->Rotation;
+        alloc->OwnerResource      = resource;
+        InitializeListHead(&alloc->ResourceLink);
+
+        if (resource != NULL) {
+            InsertTailList(&resource->AllocationListHead, &alloc->ResourceLink);
+            resource->NumAllocations++;
+        }
+
+        WinMaliPublishAllocationInfo_(alloc, info);
+
+        WINMALI_TRACE(
+            "CreateAllocation[%u]: alloc=%p size=0x%llx fmt=%u %ux%u flags=0x%x res=%p",
+            i, alloc, (ULONGLONG)alloc->Size,
+            alloc->Format, alloc->Width, alloc->Height, alloc->Flags, resource);
+    }
+
+    //
+    // Bail-out cleanup: if any allocation failed mid-loop, walk what we
+    // already created and free it so we don't leak. dxgk WILL NOT call
+    // DestroyAllocation on this batch when CreateAllocation returns failure.
+    //
+    if (!NT_SUCCESS(status)) {
+        for (UINT j = 0; j < i; ++j) {
+            DXGK_ALLOCATIONINFO*    info = &p->pAllocationInfo[j];
+            PWINMALI_KMD_ALLOCATION a    = (PWINMALI_KMD_ALLOCATION)info->hAllocation;
+            if (a != NULL && a->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+                if (!IsListEmpty(&a->ResourceLink)) {
+                    RemoveEntryList(&a->ResourceLink);
+                }
+                a->Magic = 0;
+                ExFreePoolWithTag(a, WINMALI_POOL_TAG);
+            }
+            info->hAllocation = NULL;
+        }
+        if (resource != NULL) {
+            resource->Magic = 0;
+            ExFreePoolWithTag(resource, WINMALI_POOL_TAG);
+        }
+        return status;
+    }
+
+    if (resource != NULL) {
+        p->hResource = (HANDLE)resource;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdDestroyAllocation(_In_ const HANDLE hAdapter, _In_ const DXGKARG_DESTROYALLOCATION* p)
 {
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(p);
+    PWINMALI_ADAPTER       adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    PWINMALI_KMD_RESOURCE  resource;
+    UINT                   i;
+
     WINMALI_ENTER();
+    UNREFERENCED_PARAMETER(adapter);
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for (i = 0; i < p->NumAllocations; ++i) {
+        PWINMALI_KMD_ALLOCATION a;
+
+        if (p->pAllocationList == NULL) {
+            break;
+        }
+        a = (PWINMALI_KMD_ALLOCATION)p->pAllocationList[i];
+        if (a == NULL) {
+            continue;
+        }
+        if (a->Magic != WINMALI_KMD_ALLOC_MAGIC) {
+            WINMALI_WARN("DestroyAllocation: bad magic on alloc=%p val=0x%x", a, a->Magic);
+            continue;
+        }
+        if (!IsListEmpty(&a->ResourceLink)) {
+            RemoveEntryList(&a->ResourceLink);
+        }
+        if (a->OwnerResource != NULL && a->OwnerResource->Magic == WINMALI_KMD_RESOURCE_MAGIC) {
+            if (a->OwnerResource->NumAllocations > 0) {
+                a->OwnerResource->NumAllocations--;
+            }
+        }
+        a->Magic = 0;
+        ExFreePoolWithTag(a, WINMALI_POOL_TAG);
+    }
+
+    resource = (PWINMALI_KMD_RESOURCE)p->hResource;
+    if (resource != NULL && p->Flags.DestroyResource) {
+        if (resource->Magic != WINMALI_KMD_RESOURCE_MAGIC) {
+            WINMALI_WARN("DestroyAllocation: bad resource magic res=%p val=0x%x",
+                         resource, resource->Magic);
+            return STATUS_SUCCESS;
+        }
+        if (!IsListEmpty(&resource->AllocationListHead)) {
+            WINMALI_WARN(
+                "DestroyAllocation: resource=%p still has %u allocations, reaping",
+                resource, resource->NumAllocations);
+            // Defensive: free leaked allocations. dxgk shouldn't leak, but
+            // if it does we don't want to leak pool either.
+            while (!IsListEmpty(&resource->AllocationListHead)) {
+                PLIST_ENTRY e = RemoveHeadList(&resource->AllocationListHead);
+                PWINMALI_KMD_ALLOCATION a =
+                    CONTAINING_RECORD(e, WINMALI_KMD_ALLOCATION, ResourceLink);
+                a->Magic = 0;
+                ExFreePoolWithTag(a, WINMALI_POOL_TAG);
+            }
+        }
+        resource->Magic = 0;
+        ExFreePoolWithTag(resource, WINMALI_POOL_TAG);
+    }
+
     return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdOpenAllocation(_In_ const HANDLE hDevice, _In_ const DXGKARG_OPENALLOCATION* p)
 {
-    UNREFERENCED_PARAMETER(hDevice);
-    UNREFERENCED_PARAMETER(p);
+    UINT i;
+
     WINMALI_ENTER();
-    return STATUS_NOT_IMPLEMENTED;
+    UNREFERENCED_PARAMETER(hDevice);
+
+    if (p == NULL || p->pOpenAllocation == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // dxgk gives us an array of {hAllocation, pPrivateDriverData} pairs that
+    // it wants to "open" against a device. For a UMA, no-aperture driver
+    // there's no per-device transformation to do — the runtime sees the
+    // same physical buffer regardless of which device opens it. We echo
+    // the driver allocation handle as hDeviceSpecificAllocation so Patch /
+    // SubmitCommand can recover the underlying WINMALI_KMD_ALLOCATION.
+    //
+    for (i = 0; i < p->NumAllocations; ++i) {
+        DXGK_OPENALLOCATIONINFO* info = &p->pOpenAllocation[i];
+        PWINMALI_KMD_ALLOCATION  a;
+
+        // Sanity-check the per-allocation private blob if the runtime sent
+        // one; mismatched / missing data is logged but non-fatal.
+        if (info->pPrivateDriverData != NULL
+            && info->PrivateDriverDataSize >= sizeof(WINMALI_ALLOC_PRIVATE))
+        {
+            const WINMALI_ALLOC_PRIVATE* priv =
+                (const WINMALI_ALLOC_PRIVATE*)info->pPrivateDriverData;
+            if (priv->Magic != WINMALI_ALLOC_PRIVATE_MAGIC) {
+                WINMALI_WARN(
+                    "OpenAllocation[%u]: priv magic mismatch 0x%x", i, priv->Magic);
+            }
+        }
+
+        a = (PWINMALI_KMD_ALLOCATION)(ULONG_PTR)info->hAllocation;
+        info->hDeviceSpecificAllocation = (HANDLE)a;
+    }
+
+    //
+    // Per-resource OUT fields on the parent (only meaningful for shared
+    // GDI-compatible allocations in an aperture segment). We don't have an
+    // aperture, so these stay at the dxgk-zeroed defaults: Pitch=0 and
+    // SubresourceOffset=0. They're conditionally compiled in WIN8+, hence
+    // the guard.
+    //
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN8)
+    if (p->NumAllocations > 0 && p->pOpenAllocation != NULL) {
+        PWINMALI_KMD_ALLOCATION first =
+            (PWINMALI_KMD_ALLOCATION)(ULONG_PTR)p->pOpenAllocation[0].hAllocation;
+        // Use mutable cast: dxgk hands us a CONST DXGKARG_OPENALLOCATION but
+        // documents these OUT fields on it.
+        DXGKARG_OPENALLOCATION* pm = (DXGKARG_OPENALLOCATION*)p;
+        pm->Pitch             = (first != NULL && first->Magic == WINMALI_KMD_ALLOC_MAGIC)
+                                  ? first->Pitch : 0;
+        pm->SubresourceOffset = 0;
+    }
+#endif
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
@@ -1672,73 +2446,471 @@ WinMaliKmdCloseAllocation(_In_ const HANDLE hDevice, _In_ const DXGKARG_CLOSEALL
     UNREFERENCED_PARAMETER(hDevice);
     UNREFERENCED_PARAMETER(p);
     WINMALI_ENTER();
+    // Nothing to undo — OpenAllocation just echoed handles back; the actual
+    // WINMALI_KMD_ALLOCATION lifetime is owned by CreateAllocation/DestroyAllocation.
     return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdDescribeAllocation(
     _In_ const HANDLE hAdapter,
-    _Inout_ DXGKARG_DESCRIBEALLOCATION* pDescribeAllocation)
+    _Inout_ DXGKARG_DESCRIBEALLOCATION* p)
 {
+    PWINMALI_KMD_ALLOCATION a;
+
     WINMALI_ENTER();
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pDescribeAllocation);
-    return STATUS_NOT_IMPLEMENTED;
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    a = (PWINMALI_KMD_ALLOCATION)p->hAllocation;
+    if (a == NULL || a->Magic != WINMALI_KMD_ALLOC_MAGIC) {
+        WINMALI_WARN("DescribeAllocation: bad hAlloc=%p", a);
+        return STATUS_INVALID_HANDLE;
+    }
+
+    //
+    // dxgk calls this for primaries (to query their scan-out parameters)
+    // and for shared-resource imports (to learn the layout of a swapchain
+    // surface that came from another adapter). Buffer-typed allocations
+    // can answer zero/D3DDDIFMT_UNKNOWN; we just echo whatever the UMD
+    // / pan_kmod publishd at CreateAllocation time.
+    //
+    p->Width                              = a->Width;
+    p->Height                             = a->Height;
+    p->Format                             = (D3DDDIFORMAT)a->Format;
+    p->MultisampleMethod.NumSamples       = a->MultisampleMethod;
+    p->MultisampleMethod.NumQualityLevels = 0;
+    p->RefreshRate.Numerator        = a->RefreshNumerator;
+    p->RefreshRate.Denominator      = a->RefreshDenominator;
+    p->PrivateDriverFormatAttribute = 0;
+    p->Rotation                     = (D3DDDI_ROTATION)a->Rotation;
+    p->Flags.Value                  = 0;
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdGetStandardAllocationDriverData(
     _In_ const HANDLE hAdapter,
-    _Inout_ DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA* pGetStandardAllocationDriverData)
+    _Inout_ DXGKARG_GETSTANDARDALLOCATIONDRIVERDATA* p)
 {
     WINMALI_ENTER();
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pGetStandardAllocationDriverData);
-    WINMALI_WARN("GetStandardAllocationDriverData: NOT_SUPPORTED (stub)");
-    return STATUS_NOT_SUPPORTED;
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // The runtime can ask the KMD to manufacture private-driver-data blobs
+    // for "standard" allocation types (primary, shadow, staging, GDI). dxgk
+    // first calls us with both buffer pointers NULL to query sizes; then
+    // re-calls with allocated buffers to fill in. We synthesize a sensible
+    // WINMALI_ALLOC_PRIVATE for every supported standard type and an empty
+    // WINMALI_RESOURCE_PRIVATE so the swapchain path round-trips cleanly.
+    //
+    // First pass (size query): just publish the buffer sizes and return.
+    //
+    if (p->pAllocationPrivateDriverData == NULL && p->pResourcePrivateDriverData == NULL) {
+        p->AllocationPrivateDriverDataSize = sizeof(WINMALI_ALLOC_PRIVATE);
+        p->ResourcePrivateDriverDataSize   = sizeof(WINMALI_RESOURCE_PRIVATE);
+        return STATUS_SUCCESS;
+    }
+
+    if (p->pAllocationPrivateDriverData != NULL) {
+        WINMALI_ALLOC_PRIVATE* priv = (WINMALI_ALLOC_PRIVATE*)p->pAllocationPrivateDriverData;
+        RtlZeroMemory(priv, sizeof(*priv));
+        priv->Magic     = WINMALI_ALLOC_PRIVATE_MAGIC;
+        priv->Version   = WINMALI_ALLOC_PRIVATE_VERSION;
+        priv->Flags     = WINMALI_ALLOC_FLAG_CPU_VISIBLE;
+        priv->Alignment = PAGE_SIZE;
+
+        switch (p->StandardAllocationType) {
+        case D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE: {
+            const D3DKMDT_SHAREDPRIMARYSURFACEDATA* d = p->pCreateSharedPrimarySurfaceData;
+            priv->Flags |= WINMALI_ALLOC_FLAG_PRIMARY | WINMALI_ALLOC_FLAG_RENDERTARGET;
+            if (d != NULL) {
+                priv->Width             = d->Width;
+                priv->Height            = d->Height;
+                priv->Format            = d->Format;
+                priv->BytesPerPixel     = 4;   // dxgk only standardises 32-bpp primaries
+                priv->Pitch             = priv->Width * priv->BytesPerPixel;
+                priv->SizeBytes         = (ULONGLONG)priv->Pitch * priv->Height;
+                priv->RefreshNumerator  = d->RefreshRate.Numerator;
+                priv->RefreshDenominator= d->RefreshRate.Denominator;
+            }
+        } break;
+
+        case D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE: {
+            const D3DKMDT_SHADOWSURFACEDATA* d = p->pCreateShadowSurfaceData;
+            priv->Flags |= WINMALI_ALLOC_FLAG_RENDERTARGET;
+            if (d != NULL) {
+                priv->Width         = d->Width;
+                priv->Height        = d->Height;
+                priv->Format        = d->Format;
+                priv->BytesPerPixel = 4;
+                priv->Pitch         = d->Pitch;
+                priv->SizeBytes     = (ULONGLONG)d->Pitch * d->Height;
+            }
+        } break;
+
+        case D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE: {
+            const D3DKMDT_STAGINGSURFACEDATA* d = p->pCreateStagingSurfaceData;
+            priv->Flags |= WINMALI_ALLOC_FLAG_TEXTURE;
+            if (d != NULL) {
+                priv->Width         = d->Width;
+                priv->Height        = d->Height;
+                priv->Pitch         = d->Pitch;
+                priv->BytesPerPixel = 4;
+                priv->SizeBytes     = (ULONGLONG)d->Pitch * d->Height;
+            }
+        } break;
+
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN7)
+        case D3DKMDT_STANDARDALLOCATION_GDISURFACE: {
+            const D3DKMDT_GDISURFACEDATA* d = p->pCreateGdiSurfaceData;
+            priv->Flags |= WINMALI_ALLOC_FLAG_TEXTURE;
+            if (d != NULL) {
+                priv->Width         = d->Width;
+                priv->Height        = d->Height;
+                priv->Format        = d->Format;
+                priv->BytesPerPixel = 4;
+                priv->Pitch         = priv->Width * priv->BytesPerPixel;
+                priv->SizeBytes     = (ULONGLONG)priv->Pitch * priv->Height;
+            }
+        } break;
+#endif
+        default:
+            WINMALI_WARN(
+                "GetStandardAllocationDriverData: unrecognised type=%u",
+                p->StandardAllocationType);
+            priv->SizeBytes = PAGE_SIZE;
+            break;
+        }
+
+        p->AllocationPrivateDriverDataSize = sizeof(WINMALI_ALLOC_PRIVATE);
+    }
+
+    if (p->pResourcePrivateDriverData != NULL) {
+        WINMALI_RESOURCE_PRIVATE* res = (WINMALI_RESOURCE_PRIVATE*)p->pResourcePrivateDriverData;
+        RtlZeroMemory(res, sizeof(*res));
+        res->Magic          = WINMALI_RESOURCE_PRIVATE_MAGIC;
+        res->Version        = WINMALI_RESOURCE_PRIVATE_VERSION;
+        res->NumAllocations = 1;
+        p->ResourcePrivateDriverDataSize = sizeof(WINMALI_RESOURCE_PRIVATE);
+    }
+
+    WINMALI_TRACE(
+        "GetStandardAllocationDriverData: type=%u alloc=%u res=%u",
+        p->StandardAllocationType,
+        p->AllocationPrivateDriverDataSize,
+        p->ResourcePrivateDriverDataSize);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
-WinMaliKmdPatch(_In_ const HANDLE hAdapter, _In_ const DXGKARG_PATCH* pPatch)
+WinMaliKmdPatch(_In_ const HANDLE hAdapter, _In_ const DXGKARG_PATCH* p)
 {
+    WINMALI_DMABUF_PRIVATE* priv;
+    UINT                    end;
+    UINT                    i;
+
     WINMALI_ENTER();
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pPatch);
-    return STATUS_NOT_IMPLEMENTED;
+
+    if (p == NULL || p->pDmaBuffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (p->pDmaBufferPrivateData == NULL
+        || p->DmaBufferPrivateDataSize < sizeof(WINMALI_DMABUF_PRIVATE))
+    {
+        WINMALI_WARN("Patch: priv buf too small (%u, need %llu)",
+                     p->DmaBufferPrivateDataSize,
+                     (ULONGLONG)sizeof(WINMALI_DMABUF_PRIVATE));
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    priv = (WINMALI_DMABUF_PRIVATE*)p->pDmaBufferPrivateData;
+
+    //
+    // Iterate the slice of patch locations dxgk wants resolved this
+    // submission. For each entry we look up the post-paging address of
+    // the referenced allocation and (eventually) splice it into the DMA
+    // buffer at PatchOffset. Until the real Valhall command-stream
+    // assembler lands we still walk the list — both to validate that the
+    // command + patch layout the runtime is sending us is well-formed
+    // and so the trace tells us what addresses Valhall will need.
+    //
+    end = p->PatchLocationListSubmissionStart + p->PatchLocationListSubmissionLength;
+    if (end > p->PatchLocationListSize) {
+        WINMALI_WARN("Patch: range [%u, %u) exceeds list size %u",
+                     p->PatchLocationListSubmissionStart, end, p->PatchLocationListSize);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for (i = p->PatchLocationListSubmissionStart; i < end; ++i) {
+        const D3DDDI_PATCHLOCATIONLIST* pl = &p->pPatchLocationList[i];
+        const DXGK_ALLOCATIONLIST*       al;
+        BYTE*                            target;
+
+        if (pl->AllocationIndex >= p->AllocationListSize) {
+            WINMALI_WARN("Patch[%u]: bad AllocationIndex=%u (n=%u)",
+                         i, pl->AllocationIndex, p->AllocationListSize);
+            continue;
+        }
+        al = &p->pAllocationList[pl->AllocationIndex];
+
+        if ((UINT64)pl->PatchOffset + sizeof(UINT64) > (UINT64)p->DmaBufferSize) {
+            // Out-of-range patch slot (likely a runtime fence-write
+            // sentinel) — skip safely. Real submission will need these
+            // once we emit CSF streams.
+            continue;
+        }
+
+        // Splice the GPU virtual address (or physical if no virtual paging
+        // is wired) at PatchOffset. dxgk always patches a 64-bit slot.
+        target = ((BYTE*)p->pDmaBuffer) + pl->PatchOffset;
+        {
+            UINT64 va = (UINT64)al->VirtualAddress;
+            if (va == 0) {
+                va = (UINT64)al->PhysicalAddress.QuadPart;
+            }
+            // Add the patch's own AllocationOffset so the runtime can patch
+            // arbitrary sub-allocation slices.
+            va += pl->AllocationOffset;
+            RtlCopyMemory(target, &va, sizeof(va));
+        }
+    }
+
+    priv->Flags          |= WINMALI_DMABUF_FLAG_PATCHED;
+    priv->NumPatches      = p->PatchLocationListSubmissionLength;
+    priv->PatchedAtOffset = p->DmaBufferSubmissionEndOffset;
+    priv->DmaBufferPhys   = (UINT64)p->DmaBufferPhysicalAddress.QuadPart;
+
+    WINMALI_TRACE(
+        "Patch: dma=%p priv=%p fence=%u patches=%u range=[%u,%u) flags=0x%x",
+        p->pDmaBuffer, priv, p->SubmissionFenceId,
+        p->PatchLocationListSubmissionLength,
+        p->PatchLocationListSubmissionStart, end, p->Flags.Value);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdSubmitCommand(
     _In_ const HANDLE hAdapter,
-    _In_ const DXGKARG_SUBMITCOMMAND* pSubmitCommand)
+    _In_ const DXGKARG_SUBMITCOMMAND* p)
 {
-    WINMALI_ENTER();
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSubmitCommand);
-    return STATUS_NOT_IMPLEMENTED;
+    PWINMALI_ADAPTER         adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    PWINMALI_KMD_CONTEXT     ctx;
+    WINMALI_DMABUF_PRIVATE*  priv;
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA  notify;
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (adapter == NULL || adapter->DxgkHandle == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ctx = (PWINMALI_KMD_CONTEXT)p->hContext;
+    if (ctx == NULL || ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC) {
+        WINMALI_WARN("SubmitCommand: bad hContext=%p", ctx);
+        return STATUS_INVALID_HANDLE;
+    }
+    if (p->pDmaBufferPrivateData == NULL
+        || p->DmaBufferPrivateDataSize < sizeof(WINMALI_DMABUF_PRIVATE))
+    {
+        WINMALI_WARN("SubmitCommand: priv buf too small (%u, need %llu)",
+                     p->DmaBufferPrivateDataSize,
+                     (ULONGLONG)sizeof(WINMALI_DMABUF_PRIVATE));
+        return STATUS_INVALID_PARAMETER;
+    }
+    priv = (WINMALI_DMABUF_PRIVATE*)p->pDmaBufferPrivateData;
+
+    //
+    // Record the submission against our per-context + per-adapter fence
+    // counters so QueryCurrentFence / Escape diagnostics can see progress.
+    // The "fence id" dxgk hands us is a UINT and starts >0 (dxgk skips 0).
+    //
+    priv->Flags             |= WINMALI_DMABUF_FLAG_SUBMITTED;
+    priv->SubmissionFenceId  = (UINT64)p->SubmissionFenceId;
+    priv->DmaBufferPhys      = (UINT64)p->DmaBufferPhysicalAddress.QuadPart;
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN7)
+    priv->DmaBufferGpuVa     = (UINT64)p->DmaBufferVirtualAddress;
+#endif
+    //
+    // dxgk passes NodeOrdinal in DXGKARG_SUBMITCOMMAND only "when hContext
+    // is NULL" (system submissions on WDDM 2.0+). For a context-bound
+    // submission we re-derive it from the context, which we already
+    // clamped at CreateContext-time from the 0x7FFF "any node" sentinel.
+    //
+    priv->NodeOrdinal        = ctx->NodeOrdinal;
+    priv->EngineOrdinal      = p->EngineOrdinal;
+
+    ctx->SubmittedFence      = (UINT64)p->SubmissionFenceId;
+    InterlockedExchange64(&adapter->GpuSubmittedFence, (LONG64)p->SubmissionFenceId);
+
+    //
+    // Fake-completion path. Without a working Valhall command-stream
+    // emitter the GPU never raises a real DMA_COMPLETED interrupt, so we
+    // synthesise one immediately. dxgk treats every DXGK_INTERRUPT_DMA_*
+    // notification as if it came from the ISR (queue head, fence id,
+    // engine/node), and our DPC fires NotifyDpc to flush them. When real
+    // submission lands this block will be replaced by a CSF kernel-queue
+    // submit + the ISR will raise the real interrupt.
+    //
+    priv->Flags             |= WINMALI_DMABUF_FLAG_COMPLETED;
+    priv->CompletionFenceId  = priv->SubmissionFenceId;
+    ctx->CompletedFence      = priv->SubmissionFenceId;
+    InterlockedExchange64(&adapter->GpuCompletedFence, (LONG64)p->SubmissionFenceId);
+
+    RtlZeroMemory(&notify, sizeof(notify));
+    notify.InterruptType                   = DXGK_INTERRUPT_DMA_COMPLETED;
+    notify.DmaCompleted.SubmissionFenceId  = p->SubmissionFenceId;
+    notify.DmaCompleted.NodeOrdinal        = ctx->NodeOrdinal;
+    notify.DmaCompleted.EngineOrdinal      = p->EngineOrdinal;
+
+    if (adapter->DxgkInterface.DxgkCbNotifyInterrupt != NULL) {
+        adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
+    }
+    InterlockedExchange(&adapter->NotifyDpcPending, 1);
+    if (adapter->DxgkInterface.DxgkCbQueueDpc != NULL) {
+        (VOID)adapter->DxgkInterface.DxgkCbQueueDpc(adapter->DxgkHandle);
+    }
+
+    WINMALI_TRACE(
+        "SubmitCommand: ctx=%p fence=%u node=%u eng=%u flags=0x%x dma=%llx priv=%p (fake-complete)",
+        ctx, p->SubmissionFenceId,
+        notify.DmaCompleted.NodeOrdinal, p->EngineOrdinal,
+        p->Flags.Value, priv->DmaBufferPhys, priv);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdPreemptCommand(
     _In_ const HANDLE hAdapter,
-    _In_ const DXGKARG_PREEMPTCOMMAND* pPreemptCommand)
+    _In_ const DXGKARG_PREEMPTCOMMAND* p)
 {
+    PWINMALI_ADAPTER                  adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    DXGKARGCB_NOTIFY_INTERRUPT_DATA   notify;
+
     WINMALI_ENTER();
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pPreemptCommand);
-    // No GPU preemption path yet; success avoids wedging the scheduler.
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (adapter == NULL || adapter->DxgkHandle == NULL) {
+        // Without a dxgk back-ref we can't notify; succeed quietly so the
+        // scheduler doesn't get stuck waiting for a never-arriving preempt.
+        return STATUS_SUCCESS;
+    }
+
+    //
+    // Mirror SubmitCommand's fake-completion model for preemption. Since
+    // every submission was fake-completed in-place above, by the time dxgk
+    // asks us to preempt the engine has nothing left to run; we report
+    // "preempted at fence N" where N == LastSubmittedFence to keep dxgk's
+    // accounting consistent.
+    //
+    RtlZeroMemory(&notify, sizeof(notify));
+    notify.InterruptType                          = DXGK_INTERRUPT_DMA_PREEMPTED;
+    notify.DmaPreempted.PreemptionFenceId         = p->PreemptionFenceId;
+    notify.DmaPreempted.LastCompletedFenceId      =
+        (UINT)ReadULong64Acquire((volatile ULONG64*)&adapter->GpuCompletedFence);
+    notify.DmaPreempted.NodeOrdinal               = p->NodeOrdinal;
+    notify.DmaPreempted.EngineOrdinal             = p->EngineOrdinal;
+
+    if (adapter->DxgkInterface.DxgkCbNotifyInterrupt != NULL) {
+        adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
+    }
+    InterlockedExchange(&adapter->NotifyDpcPending, 1);
+    if (adapter->DxgkInterface.DxgkCbQueueDpc != NULL) {
+        (VOID)adapter->DxgkInterface.DxgkCbQueueDpc(adapter->DxgkHandle);
+    }
+
+    WINMALI_TRACE(
+        "PreemptCommand: preemptFence=%u lastDone=%u node=%u eng=%u",
+        p->PreemptionFenceId, notify.DmaPreempted.LastCompletedFenceId,
+        p->NodeOrdinal, p->EngineOrdinal);
     return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY
 WinMaliKmdBuildPagingBuffer(
     _In_ const HANDLE hAdapter,
-    _In_ DXGKARG_BUILDPAGINGBUFFER* pBuildPagingBuffer)
+    _In_ DXGKARG_BUILDPAGINGBUFFER* p)
 {
+    PWINMALI_ADAPTER         adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    WINMALI_DMABUF_PRIVATE*  priv    = NULL;
+
     WINMALI_ENTER();
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pBuildPagingBuffer);
-    return STATUS_NOT_IMPLEMENTED;
+    UNREFERENCED_PARAMETER(adapter);
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (p->pDmaBufferPrivateData != NULL
+        && p->DmaBufferPrivateDataSize >= sizeof(WINMALI_DMABUF_PRIVATE))
+    {
+        priv = (WINMALI_DMABUF_PRIVATE*)p->pDmaBufferPrivateData;
+        priv->Flags |= WINMALI_DMABUF_FLAG_PAGING;
+    }
+
+    //
+    // PhysicalAdapterCaps publishes PageTableUpdateMode = CPU_VIRTUAL and a
+    // single non-aperture system-memory segment, so VIDMM almost never has
+    // real GPU paging work for us. We treat every operation as "already
+    // done by VIDMM at CPU level" and return success without consuming any
+    // DMA-buffer space (do not advance pDmaBuffer / pDmaBufferPrivateData).
+    //
+    // Once the Mali MMU paging path is wired in we'll handle UPDATE_PAGE_TABLE
+    // / FLUSH_TLB / TRANSFER_VIRTUAL here by emitting Valhall CSF stream ops.
+    //
+    switch (p->Operation) {
+    case DXGK_OPERATION_TRANSFER:
+    case DXGK_OPERATION_FILL:
+    case DXGK_OPERATION_DISCARD_CONTENT:
+    case DXGK_OPERATION_READ_PHYSICAL:
+    case DXGK_OPERATION_WRITE_PHYSICAL:
+    case DXGK_OPERATION_MAP_APERTURE_SEGMENT:
+    case DXGK_OPERATION_UNMAP_APERTURE_SEGMENT:
+    case DXGK_OPERATION_SPECIAL_LOCK_TRANSFER:
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN7)
+    case DXGK_OPERATION_VIRTUAL_TRANSFER:
+    case DXGK_OPERATION_VIRTUAL_FILL:
+#endif
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WIN8)
+    case DXGK_OPERATION_INIT_CONTEXT_RESOURCE:
+#endif
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_0)
+    case DXGK_OPERATION_UPDATE_PAGE_TABLE:
+    case DXGK_OPERATION_FLUSH_TLB:
+    case DXGK_OPERATION_UPDATE_CONTEXT_ALLOCATION:
+    case DXGK_OPERATION_COPY_PAGE_TABLE_ENTRIES:
+    case DXGK_OPERATION_NOTIFY_RESIDENCY:
+#endif
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_2)
+    case DXGK_OPERATION_SIGNAL_MONITORED_FENCE:
+#endif
+#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_9)
+    case DXGK_OPERATION_MAP_APERTURE_SEGMENT2:
+    case DXGK_OPERATION_NOTIFY_FENCE_RESIDENCY:
+#endif
+        if (priv != NULL && priv->Magic == 0) {
+            priv->Magic   = WINMALI_DMABUF_PRIVATE_MAGIC;
+            priv->Version = WINMALI_DMABUF_PRIVATE_VERSION;
+        }
+        WINMALI_TRACE(
+            "BuildPagingBuffer: op=%u dma=%p sz=%u priv=%p (CPU paging - no-op)",
+            p->Operation, p->pDmaBuffer, p->DmaSize, p->pDmaBufferPrivateData);
+        return STATUS_SUCCESS;
+
+    default:
+        WINMALI_WARN("BuildPagingBuffer: unsupported op=%u", p->Operation);
+        return STATUS_NOT_SUPPORTED;
+    }
 }
 
 NTSTATUS APIENTRY
@@ -1766,12 +2938,27 @@ WinMaliKmdQueryCurrentFence(
 NTSTATUS APIENTRY
 WinMaliKmdCancelCommand(
     _In_ const HANDLE hAdapter,
-    _In_ const DXGKARG_CANCELCOMMAND* pCancelCommand)
+    _In_ const DXGKARG_CANCELCOMMAND* p)
 {
     WINMALI_ENTER();
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pCancelCommand);
-    return STATUS_NOT_IMPLEMENTED;
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    //
+    // Cancellation only happens for DMA buffers we never submitted, so
+    // there's no GPU state to roll back. Mark the per-DMA private data
+    // so a stray Patch/Submit on it would assert and return success.
+    //
+    if (p->pDmaBufferPrivateData != NULL
+        && p->DmaBufferPrivateDataSize >= sizeof(WINMALI_DMABUF_PRIVATE))
+    {
+        WINMALI_DMABUF_PRIVATE* priv = (WINMALI_DMABUF_PRIVATE*)p->pDmaBufferPrivateData;
+        priv->Flags |= WINMALI_DMABUF_FLAG_COMPLETED;
+    }
+    WINMALI_TRACE("CancelCommand: dma=%p sz=%u", p->pDmaBuffer, p->DmaBufferSize);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -1829,12 +3016,100 @@ WinMaliKmdRestartFromTimeout(_In_ const HANDLE hAdapter)
 }
 
 NTSTATUS APIENTRY
-WinMaliKmdRender(_In_ const HANDLE hContext, _Inout_ DXGKARG_RENDER* pRender)
+WinMaliKmdRender(_In_ const HANDLE hContext, _Inout_ DXGKARG_RENDER* p)
 {
+    PWINMALI_KMD_CONTEXT     ctx = (PWINMALI_KMD_CONTEXT)hContext;
+    WINMALI_DMABUF_PRIVATE*  priv;
+    UINT                     patchBytes;
+
     WINMALI_ENTER();
-    UNREFERENCED_PARAMETER(hContext);
-    UNREFERENCED_PARAMETER(pRender);
-    return STATUS_NOT_IMPLEMENTED;
+
+    if (p == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (ctx == NULL || ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC) {
+        WINMALI_WARN("Render: bad hContext=%p", hContext);
+        return STATUS_INVALID_HANDLE;
+    }
+    if (p->pDmaBuffer == NULL || p->DmaSize == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (p->pDmaBufferPrivateData == NULL
+        || p->DmaBufferPrivateDataSize < sizeof(WINMALI_DMABUF_PRIVATE))
+    {
+        WINMALI_WARN("Render: priv buf too small (%u, need %llu)",
+                     p->DmaBufferPrivateDataSize,
+                     (ULONGLONG)sizeof(WINMALI_DMABUF_PRIVATE));
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // Bounds-check the UMD command buffer against the dxgk-supplied DMA
+    // buffer. If the runtime asks us to render a buffer bigger than the
+    // DMA window the context advertised, the right answer is
+    // STATUS_BUFFER_TOO_SMALL - dxgk will reallocate a larger DMA buffer
+    // and re-call us. Render-only-sample uses the same convention.
+    //
+    if (p->CommandLength > p->DmaSize) {
+        WINMALI_WARN("Render: command (%u) > DMA buf (%u), asking for bigger",
+                     p->CommandLength, p->DmaSize);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    priv = (WINMALI_DMABUF_PRIVATE*)p->pDmaBufferPrivateData;
+    RtlZeroMemory(priv, sizeof(*priv));
+    priv->Magic         = WINMALI_DMABUF_PRIVATE_MAGIC;
+    priv->Version       = WINMALI_DMABUF_PRIVATE_VERSION;
+    priv->Flags         = WINMALI_DMABUF_FLAG_RENDERED;
+    priv->CommandLength = p->CommandLength;
+    priv->NodeOrdinal   = ctx->NodeOrdinal;
+    priv->EngineOrdinal = 0;
+
+    //
+    // Copy the UMD's command stream verbatim into the DMA buffer. Once the
+    // Valhall command-stream assembler is up, this will be replaced by a
+    // proper transcode step that consumes UMD ops and emits CSF queue
+    // entries. The patch-location list-out conventionally mirrors the
+    // list-in (one entry per allocation reference); dxgk uses it as the
+    // bridge between Render (passive) and Patch (passive, post-paging).
+    //
+    if (p->CommandLength > 0 && p->pCommand != NULL) {
+        RtlCopyMemory(p->pDmaBuffer, p->pCommand, p->CommandLength);
+    }
+
+    if (p->pPatchLocationListIn != NULL
+        && p->pPatchLocationListOut != NULL
+        && p->PatchLocationListInSize > 0
+        && p->PatchLocationListOutSize >= p->PatchLocationListInSize)
+    {
+        patchBytes = p->PatchLocationListInSize * (UINT)sizeof(D3DDDI_PATCHLOCATIONLIST);
+        RtlCopyMemory(
+            p->pPatchLocationListOut,
+            p->pPatchLocationListIn,
+            patchBytes);
+        // Advance the OUT pointer past the entries we wrote so dxgk knows
+        // how many patches it should hand to WinMaliKmdPatch.
+        p->pPatchLocationListOut += p->PatchLocationListInSize;
+    } else if (p->PatchLocationListInSize > p->PatchLocationListOutSize) {
+        WINMALI_WARN("Render: patch list-out (%u) too small for list-in (%u)",
+                     p->PatchLocationListOutSize, p->PatchLocationListInSize);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    //
+    // Advance pDmaBuffer past the bytes we wrote so dxgk records the
+    // correct submission slice. pDmaBufferPrivateData is per-DMA-buffer
+    // (not per-submission), so we DO NOT advance it - dxgk hands it back
+    // unchanged to Patch and SubmitCommand.
+    //
+    p->pDmaBuffer = ((BYTE*)p->pDmaBuffer) + p->CommandLength;
+
+    WINMALI_TRACE(
+        "Render: ctx=%p cmd=%u patches=%u/%u dma=%u multipass=%u",
+        ctx, p->CommandLength,
+        p->PatchLocationListInSize, p->PatchLocationListOutSize,
+        p->DmaSize, p->MultipassOffset);
+    return STATUS_SUCCESS;
 }
 
 

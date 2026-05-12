@@ -1,6 +1,17 @@
 
 
 #include "WinMaliUmd.h"
+
+/* Must match d3dumddi.h D3DDDICB_QUERYADAPTERINFO — we avoid including d3dumddi.h
+ * here because it pulls D3D9 types in an order that breaks plain C + d3d10umddi. */
+typedef struct WINMALI_D3DDDICB_QUERYADAPTERINFO {
+    void *pPrivateDriverData;
+    UINT PrivateDriverDataSize;
+} WINMALI_D3DDDICB_QUERYADAPTERINFO;
+
+typedef HRESULT (APIENTRY *WINMALI_PFND3DDDI_QUERYADAPTERINFOCB)(
+    HANDLE hAdapter, WINMALI_D3DDDICB_QUERYADAPTERINFO *pQueryAdapterInfo);
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -59,6 +70,8 @@ static void WinMaliUmdTraceImpl(const char *fmt, ...)
 
 #define WINMALI_UMD_TRACE(fmt, ...) WinMaliUmdTraceImpl((fmt), ##__VA_ARGS__)
 
+static void WinMaliUmdPatchDeviceFuncs(D3D11DDI_DEVICEFUNCS *df);
+
 // ---------------------------------------------------------------------------
 // Adapter-level DDI stubs
 // ---------------------------------------------------------------------------
@@ -94,23 +107,35 @@ WinMaliUmdCreateDevice(
     if (adapter == NULL || adapter->Magic != WINMALI_UMD_ADAPTER_MAGIC) {
         return E_INVALIDARG;
     }
-    if (pArgs == NULL || pArgs->hRTDevice.handle == 0) {
+    if (pArgs == NULL || pArgs->hRTDevice.handle == NULL) {
         return E_INVALIDARG;
+    }
+    if (pArgs->Interface != D3D11_0_DDI_INTERFACE_VERSION) {
+        return E_NOINTERFACE;
+    }
+    if (pArgs->p11DeviceFuncs == NULL) {
+        return E_INVALIDARG;
+    }
+    if (adapter->KmdInfo.Magic != WINMALI_ADAPTER_MAGIC) {
+        WINMALI_UMD_TRACE("CreateDevice: missing/invalid KMD UMDRIVERPRIVATE (magic=0x%llx)",
+                          (unsigned long long)adapter->KmdInfo.Magic);
+        return E_FAIL;
     }
 
     device = (PWINMALI_UMD_DEVICE)pArgs->hDrvDevice.pDrvPrivate;
     if (device == NULL) {
-        return E_OUTOFMEMORY;
+        return E_INVALIDARG;
     }
+    memset(device, 0, sizeof(*device));
     device->Magic = WINMALI_UMD_DEVICE_MAGIC;
     device->Adapter = adapter;
+    device->RuntimeDevice = pArgs->hRTDevice;
 
-    WINMALI_UMD_TRACE("CreateDevice: skeletal, most DDI entries are stubs");
+    WinMaliUmdFillD3d11DeviceFuncs(pArgs->p11DeviceFuncs);
+    WinMaliUmdPatchDeviceFuncs(pArgs->p11DeviceFuncs);
 
-    // Compute: raw Valhall submit is exercised via
-    // Tools/winmali-compute-test (D3DKMTEscape). Wiring pfnDispatch +
-    // D3D11DDI_DEVICEFUNCS to call the same escape is deferred until the
-    // CSF submit path exists.
+    WINMALI_UMD_TRACE("CreateDevice: D3D11_0 device funcs installed (stubs + trace hooks)");
+
     return S_OK;
 }
 
@@ -195,6 +220,15 @@ WinMaliUmdGetCaps(
         shaderCaps->Caps = 0;
         return S_OK;
     }
+    case D3D11DDICAPS_3DPIPELINESUPPORT: {
+        D3D11DDI_3DPIPELINESUPPORT_CAPS* pipeCaps =
+            (D3D11DDI_3DPIPELINESUPPORT_CAPS*)pCaps->pData;
+        if (pipeCaps == NULL || pCaps->DataSize < sizeof(*pipeCaps)) {
+            return E_INVALIDARG;
+        }
+        pipeCaps->Caps = 0;
+        return S_OK;
+    }
     default:
         if (pCaps->pData == NULL) {
             return E_INVALIDARG;
@@ -211,41 +245,46 @@ WinMaliUmdGetCaps(
 HRESULT APIENTRY
 WinMaliUmdDestroyDevice(D3D10DDI_HDEVICE hDevice)
 {
+    PWINMALI_UMD_DEVICE device = (PWINMALI_UMD_DEVICE)hDevice.pDrvPrivate;
+
     WINMALI_UMD_TRACE("%s hDevice.pDrvPrivate=%p",
                         __FUNCTION__,
                         hDevice.pDrvPrivate);
+    if (device != NULL && device->Magic == WINMALI_UMD_DEVICE_MAGIC) {
+        device->Magic = 0;
+    }
     return S_OK;
 }
 
 VOID APIENTRY
 WinMaliUmdDefaultConstantBufferUpdateSubresourceUP(
-    D3D10DDI_HDEVICE hDevice, UINT Slot,
+    D3D10DDI_HDEVICE hDevice,
+    D3D10DDI_HRESOURCE hResource,
+    UINT Subresource,
     _In_opt_ CONST D3D10_DDI_BOX* pDstBox,
     _In_ CONST VOID* pSysMemUP,
-    UINT RowPitch, UINT DepthPitch, UINT CopyFlags)
+    UINT RowPitch,
+    UINT DepthPitch)
 {
-    WINMALI_UMD_TRACE("%s Slot=%u CopyFlags=0x%x RowPitch=%u DepthPitch=%u pSysMemUP=%p",
+    WINMALI_UMD_TRACE("%s Subresource=%u RowPitch=%u DepthPitch=%u pSysMemUP=%p",
                         __FUNCTION__,
-                        Slot,
-                        CopyFlags,
+                        Subresource,
                         RowPitch,
                         DepthPitch,
                         pSysMemUP);
     UNREFERENCED_PARAMETER(hDevice);
-    UNREFERENCED_PARAMETER(Slot);
+    UNREFERENCED_PARAMETER(hResource);
     UNREFERENCED_PARAMETER(pDstBox);
     UNREFERENCED_PARAMETER(pSysMemUP);
     UNREFERENCED_PARAMETER(RowPitch);
     UNREFERENCED_PARAMETER(DepthPitch);
-    UNREFERENCED_PARAMETER(CopyFlags);
 }
 
 VOID APIENTRY
-WinMaliUmdFlush(D3D10DDI_HDEVICE hDevice, UINT FlushFlags)
+WinMaliUmdFlush(D3D10DDI_HDEVICE hDevice)
 {
-    WINMALI_UMD_TRACE("%s FlushFlags=0x%x", __FUNCTION__, FlushFlags);
+    WINMALI_UMD_TRACE("%s", __FUNCTION__);
     UNREFERENCED_PARAMETER(hDevice);
-    UNREFERENCED_PARAMETER(FlushFlags);
 }
 
 VOID APIENTRY
@@ -271,6 +310,19 @@ WinMaliUmdCheckMultisampleQualityLevels(
     UNREFERENCED_PARAMETER(Format);
     UNREFERENCED_PARAMETER(SampleCount);
     if (pNumQualityLevels != NULL) *pNumQualityLevels = 0;
+}
+
+static void WinMaliUmdPatchDeviceFuncs(D3D11DDI_DEVICEFUNCS *df)
+{
+    if (df == NULL) {
+        return;
+    }
+    df->pfnDestroyDevice = WinMaliUmdDestroyDevice;
+    df->pfnDefaultConstantBufferUpdateSubresourceUP =
+        WinMaliUmdDefaultConstantBufferUpdateSubresourceUP;
+    df->pfnFlush = WinMaliUmdFlush;
+    df->pfnCheckFormatSupport = WinMaliUmdCheckFormatSupport;
+    df->pfnCheckMultisampleQualityLevels = WinMaliUmdCheckMultisampleQualityLevels;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +354,38 @@ OpenAdapter10_2(_Inout_ D3D10DDIARG_OPENADAPTER* pOpenAdapter)
     adapter->Magic            = WINMALI_UMD_ADAPTER_MAGIC;
     adapter->RuntimeAdapter   = pOpenAdapter->hRTAdapter;
     adapter->AdapterCallbacks = *pOpenAdapter->pAdapterCallbacks;
+    memset(&adapter->KmdInfo, 0, sizeof(adapter->KmdInfo));
+
+    if (pOpenAdapter->pAdapterCallbacks == NULL
+        || pOpenAdapter->pAdapterCallbacks->pfnQueryAdapterInfoCb == NULL) {
+        WINMALI_UMD_TRACE("OpenAdapter: missing pfnQueryAdapterInfoCb");
+        HeapFree(GetProcessHeap(), 0, adapter);
+        return E_FAIL;
+    } else {
+        WINMALI_D3DDDICB_QUERYADAPTERINFO qai;
+        HRESULT qhr;
+        WINMALI_PFND3DDDI_QUERYADAPTERINFOCB pfnQai =
+            (WINMALI_PFND3DDDI_QUERYADAPTERINFOCB)
+                pOpenAdapter->pAdapterCallbacks->pfnQueryAdapterInfoCb;
+
+        memset(&qai, 0, sizeof(qai));
+        qai.pPrivateDriverData = &adapter->KmdInfo;
+        qai.PrivateDriverDataSize = sizeof(adapter->KmdInfo);
+        qhr = pfnQai((HANDLE)pOpenAdapter->hRTAdapter.handle, &qai);
+        if (FAILED(qhr)) {
+            WINMALI_UMD_TRACE("OpenAdapter: pfnQueryAdapterInfoCb hr=0x%08lx",
+                              (unsigned long)qhr);
+            HeapFree(GetProcessHeap(), 0, adapter);
+            return qhr;
+        }
+        if (adapter->KmdInfo.Magic != WINMALI_ADAPTER_MAGIC) {
+            WINMALI_UMD_TRACE(
+                "OpenAdapter: not a WinMali KMD (adapter private magic 0x%llx)",
+                (unsigned long long)adapter->KmdInfo.Magic);
+            HeapFree(GetProcessHeap(), 0, adapter);
+            return E_FAIL;
+        }
+    }
 
     pOpenAdapter->hAdapter.pDrvPrivate = adapter;
 

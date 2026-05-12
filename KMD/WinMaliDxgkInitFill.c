@@ -1,5 +1,6 @@
 #include "WinMaliKmd.h"
 #include "WinMaliDxgkInitFill.h"
+#include "WinMaliMmu.h"     // WinMaliMmuBindContextRootPt / UnbindContext
 
 #define WM_UNREF1(a) (void)(a)
 #define WM_UNREF2(a, b) \
@@ -168,20 +169,162 @@ NTSTATUS APIENTRY WinMaliDxgkStub_DestroyOverlay(IN_CONST_HANDLE hOverlay)
     return STATUS_NOT_SUPPORTED;
 }
 
+//
+// DxgkDdiCreateContext / DxgkDdiDestroyContext
+//
+// dxgkrnl creates a GPU context for every D3D device the runtime opens.
+// Our trace was failing at this DDI: once CreateProcess succeeded the
+// runtime immediately called CreateContext, our stub returned NOT_SUPPORTED,
+// and dxgk tore the adapter down (DestroyDevice/DestroyProcess/StopDevice).
+//
+// We allocate a WINMALI_KMD_CONTEXT (pool-tagged, non-paged) and return its
+// pointer as the new hContext. dxgk subsequently keys every per-context DDI
+// (SetRootPageTable, Render, SubmitCommand, ...) off this handle, so the
+// pointer MUST remain stable until DestroyContext fires.
+//
+// The fields we publish in DXGK_CONTEXTINFO follow render-only-sample's
+// RosKmContext::DdiCreateContext:
+//   DmaBufferSegmentSet     = (1 << 0) -> our single system-memory segment
+//   DmaBufferSize           = PAGE_SIZE (matches ROSD_COMMAND_BUFFER_SIZE)
+//   DmaBufferPrivateDataSize= sizeof(WINMALI_DMABUF_PRIVATE) - we use this
+//                                to bridge Render -> Patch -> SubmitCommand
+//                                state (command length, fence id, etc.)
+//   AllocationListSize      = 64  (or DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT
+//                                  = 256 for GDI contexts; we mirror that)
+//   PatchLocationListSize   = 128
+//
 NTSTATUS APIENTRY WinMaliDxgkStub_CreateContext(
     IN_CONST_HANDLE                 hDevice,
     INOUT_PDXGKARG_CREATECONTEXT    pCreateContext)
 {
+    PWINMALI_ADAPTER     adapter;
+    PWINMALI_KMD_CONTEXT ctx;
+    DXGK_CONTEXTINFO*    info;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hDevice, pCreateContext);
-    return STATUS_NOT_SUPPORTED;
+
+    if (pCreateContext == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    //
+    // hDevice is what WinMaliKmdCreateDevice handed back -- currently the
+    // adapter pointer itself. Resolve via the same helper used by Escape so
+    // a future per-device struct still works.
+    //
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hDevice);
+    if (adapter == NULL) {
+        WINMALI_WARN("CreateContext: bad hDevice=%p", hDevice);
+        return STATUS_INVALID_PARAMETER;
+    }
+    //
+    // dxgk encodes the "system context" path with NodeOrdinal = 0x7FFF
+    // (D3DDDI_MAX_NODE_COUNT - 1, also flagged via Flags.SystemContext). It
+    // means "this context isn't bound to a render engine - it's for paging
+    // and system bookkeeping". For our single 3D node we can treat both
+    // node 0 contexts and the system context as the same engine; render-
+    // only-sample / RosKmContext does the same. Anything else is genuinely
+    // out of range for a one-node adapter and gets rejected.
+    //
+    if (pCreateContext->NodeOrdinal != 0
+        && pCreateContext->Flags.SystemContext == 0)
+    {
+        WINMALI_WARN(
+            "CreateContext: unsupported NodeOrdinal=%u flags=0x%x (only node 0 / 3D exists)",
+            pCreateContext->NodeOrdinal,
+            pCreateContext->Flags.Value);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ctx = (PWINMALI_KMD_CONTEXT)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*ctx), WINMALI_POOL_TAG);
+    if (ctx == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    ctx->Magic          = WINMALI_KMD_CONTEXT_MAGIC;
+    ctx->Adapter        = adapter;
+    ctx->hRtContext     = pCreateContext->hContext;
+    //
+    // Clamp the SystemContext "any node" sentinel (0x7FFF) down to our real
+    // node so SubmitCommand's NotifyInterrupt fence packets carry a node
+    // dxgk recognises (0..ExecutionNodeCount-1). Render contexts on a one-
+    // node adapter only ever see NodeOrdinal=0 anyway.
+    //
+    ctx->NodeOrdinal    = (pCreateContext->Flags.SystemContext != 0)
+                            ? 0u
+                            : pCreateContext->NodeOrdinal;
+    ctx->EngineAffinity = pCreateContext->EngineAffinity;
+    ctx->Flags          = pCreateContext->Flags.Value;
+    ctx->SubmittedFence = 0;
+    ctx->CompletedFence = 0;
+    ctx->PendingDmaCount = 0;
+
+    info = &pCreateContext->ContextInfo;
+    RtlZeroMemory(info, sizeof(*info));
+    info->DmaBufferSize             = WINMALI_KMD_DMA_BUFFER_SIZE;
+    info->DmaBufferSegmentSet       = 1u << 0;   // segment 0 (system memory)
+    info->DmaBufferPrivateDataSize  = sizeof(WINMALI_DMABUF_PRIVATE);
+    if (pCreateContext->Flags.GdiContext) {
+        info->AllocationListSize    = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
+        info->PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
+    } else {
+        info->AllocationListSize    = WINMALI_KMD_ALLOCATION_LIST_SIZE;
+        info->PatchLocationListSize = WINMALI_KMD_PATCH_LOCATION_LIST_SIZE;
+    }
+
+    pCreateContext->hContext = (HANDLE)ctx;
+    WINMALI_TRACE(
+        "CreateContext: hDevice=%p hRt=%p node=%u eng=0x%x flags=0x%x -> hCtx=%p "
+        "(dma=%u priv=%u alloc=%u patch=%u segSet=0x%x)",
+        hDevice,
+        ctx->hRtContext,
+        ctx->NodeOrdinal,
+        ctx->EngineAffinity,
+        ctx->Flags,
+        ctx,
+        info->DmaBufferSize,
+        info->DmaBufferPrivateDataSize,
+        info->AllocationListSize,
+        info->PatchLocationListSize,
+        info->DmaBufferSegmentSet);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_DestroyContext(IN_CONST_HANDLE hContext)
 {
+    PWINMALI_KMD_CONTEXT ctx;
+
     WM_STUB_ENTER();
-    WM_UNREF1(hContext);
-    return STATUS_NOT_SUPPORTED;
+
+    ctx = (PWINMALI_KMD_CONTEXT)hContext;
+    if (ctx == NULL) {
+        return STATUS_SUCCESS;
+    }
+    if (ctx->Magic != WINMALI_KMD_CONTEXT_MAGIC) {
+        WINMALI_WARN("DestroyContext: bad magic on hCtx=%p (val=0x%x)",
+                     ctx, ctx->Magic);
+        return STATUS_INVALID_HANDLE;
+    }
+    //
+    // Release the Mali AS slot SetRootPageTable bound to this hContext (if
+    // any) before freeing the context backing. UnbindContext is a no-op when
+    // the context never had a root PT published (paging-only contexts on
+    // adapters that never went past caps walk).
+    //
+    if (ctx->Adapter != NULL) {
+        (VOID)WinMaliMmuUnbindContext(ctx->Adapter, (HANDLE)ctx);
+    }
+
+    WINMALI_TRACE(
+        "DestroyContext: hCtx=%p hRt=%p node=%u flags=0x%x fences=submitted=%llu/completed=%llu",
+        ctx,
+        ctx->hRtContext,
+        ctx->NodeOrdinal,
+        ctx->Flags,
+        (ULONGLONG)ctx->SubmittedFence,
+        (ULONGLONG)ctx->CompletedFence);
+    ctx->Magic = 0;
+    ExFreePoolWithTag(ctx, WINMALI_POOL_TAG);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_LinkDevice(
@@ -225,22 +368,51 @@ NTSTATUS APIENTRY WinMaliDxgkStub_SetPowerComponentFState(
     return STATUS_NOT_SUPPORTED;
 }
 
+//
+// Dxgk calls QueryDependentEngineGroup right after GetNodeMetadata when
+// DRIVERCAPS.SchedulingCaps.MultiEngineAware=1 to learn which nodes share
+// fate during per-engine TDR. Returning NOT_SUPPORTED here causes dxgk to
+// abort initialization between GetNodeMetadata and the segment walk (no
+// QUERYSEGMENT* traces, immediate StopDevice). For our single 3D node we
+// report that the engine only depends on itself.
+//
 NTSTATUS APIENTRY WinMaliDxgkStub_QueryDependentEngineGroup(
     IN_CONST_HANDLE                         hAdapter,
     INOUT_DXGKARG_QUERYDEPENDENTENGINEGROUP pQueryDependentEngineGroup)
 {
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pQueryDependentEngineGroup);
-    return STATUS_NOT_SUPPORTED;
+    WM_UNREF1(hAdapter);
+
+    if (pQueryDependentEngineGroup == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    pQueryDependentEngineGroup->DependentNodeOrdinalMask =
+        1ULL << pQueryDependentEngineGroup->NodeOrdinal;
+    return STATUS_SUCCESS;
 }
 
+//
+// Dxgk calls QueryEngineStatus as part of engine-health probing (also tied
+// to MultiEngineAware/per-engine TDR). Returning NOT_SUPPORTED makes dxgk
+// consider the engine non-existent and bail. Report the engine as
+// responsive so VIDMM/scheduler init can continue. Real implementation will
+// inspect MCU/CSF queue heads.
+//
 NTSTATUS APIENTRY WinMaliDxgkStub_QueryEngineStatus(
     IN_CONST_HANDLE                     hAdapter,
     INOUT_PDXGKARG_QUERYENGINESTATUS    pQueryEngineStatus)
 {
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pQueryEngineStatus);
-    return STATUS_NOT_SUPPORTED;
+    WM_UNREF1(hAdapter);
+
+    if (pQueryEngineStatus == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    pQueryEngineStatus->EngineStatus.Value     = 0;
+    pQueryEngineStatus->EngineStatus.Responsive = 1;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_ResetEngine(
@@ -486,14 +658,107 @@ NTSTATUS APIENTRY WinMaliDxgkStub_SubmitCommandVirtual(
     return STATUS_NOT_SUPPORTED;
 }
 
+//
+// DxgkDdiSetRootPageTable
+//
+// dxgkrnl calls this per-context to publish the root page-table physical
+// address that the GPU MMU should use for that context's address space.
+// On Mali this maps directly to programming TRANSTAB/TRANSCFG/MEMATTR on a
+// free address-space (AS) slot and issuing an UPDATE command. The actual
+// register work happens in WinMaliMmuBindContextRootPt (see WinMaliMmu.c):
+// it picks a free AS, calls WinMaliMmuAsEnable, and remembers the
+// hContext->AS mapping so re-bind requests reuse the same slot.
+//
+// Address == 0 is the documented "drop the root page table" signal from
+// dxgk (context tear-down); we release the AS slot.
+//
 VOID APIENTRY WinMaliDxgkStub_SetRootPageTable(
     IN_CONST_HANDLE                     hAdapter,
     IN_CONST_PDXGKARG_SETROOTPAGETABLE  pSetRootPageTable)
 {
+    PWINMALI_ADAPTER adapter;
+    ULONG            as       = WINMALI_AS_SLOT_MAX;
+    UINT             segId;
+    UINT64           segOffset;
+    UINT64           segBasePa;
+    UINT64           rootPa;
+    NTSTATUS         status;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pSetRootPageTable);
+
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL || pSetRootPageTable == NULL) {
+        WINMALI_WARN("SetRootPageTable: adapter=%p pArgs=%p ignored",
+                     adapter, pSetRootPageTable);
+        return;
+    }
+
+    //
+    // D3DGPU_PHYSICAL_ADDRESS is {SegmentId, Padding, SegmentOffset} - NOT a
+    // LARGE_INTEGER. The actual system physical address is the base of the
+    // referenced segment plus SegmentOffset. We only report segment 0 (the
+    // MMU scratch heap) so anything else is a dxgk bug from our perspective.
+    //
+    // NumEntries == 0 is dxgk's documented "drop the root page table" signal
+    // (context teardown); release the AS slot in that case.
+    //
+    segId     = pSetRootPageTable->Address.SegmentId;
+    segOffset = pSetRootPageTable->Address.SegmentOffset;
+
+    if (pSetRootPageTable->NumEntries == 0) {
+        (VOID)WinMaliMmuUnbindContext(adapter, pSetRootPageTable->hContext);
+        WINMALI_TRACE(
+            "SetRootPageTable: hCtx=%p seg=%u off=0x%llx NumEntries=0 (unbind)",
+            pSetRootPageTable->hContext, segId, (ULONGLONG)segOffset);
+        return;
+    }
+    if (segId != 0) {
+        WINMALI_WARN(
+            "SetRootPageTable: hCtx=%p seg=%u off=0x%llx unsupported segment, no AS programmed",
+            pSetRootPageTable->hContext, segId, (ULONGLONG)segOffset);
+        return;
+    }
+    segBasePa = (UINT64)adapter->MmuScratchHeapPhys.QuadPart;
+    if (segBasePa == 0ULL) {
+        WINMALI_WARN(
+            "SetRootPageTable: hCtx=%p seg0 has no backing (MMU not initialized?)",
+            pSetRootPageTable->hContext);
+        return;
+    }
+    rootPa = segBasePa + segOffset;
+
+    status = WinMaliMmuBindContextRootPt(
+        adapter,
+        pSetRootPageTable->hContext,
+        rootPa,
+        &as);
+    if (!NT_SUCCESS(status)) {
+        WINMALI_WARN(
+            "SetRootPageTable: bind hCtx=%p seg=%u off=0x%llx root=0x%llx -> 0x%08x",
+            pSetRootPageTable->hContext, segId,
+            (ULONGLONG)segOffset, (ULONGLONG)rootPa, status);
+        return;
+    }
+    WINMALI_TRACE(
+        "SetRootPageTable: hCtx=%p seg=%u off=0x%llx -> root=0x%llx numEntries=%u -> AS%u",
+        pSetRootPageTable->hContext,
+        segId,
+        (ULONGLONG)segOffset,
+        (ULONGLONG)rootPa,
+        pSetRootPageTable->NumEntries,
+        as);
 }
 
+//
+// DxgkDdiGetRootPageTableSize
+//
+// dxgk asks how many bytes of root-PT storage we want it to own and zero
+// for us. ARM LPAE 4-level @ 48-bit VA uses 9 index bits per level
+// (matches what we publish in DXGKQAITYPE_PAGETABLELEVELDESC). The L0
+// table therefore holds 512 * 8 = 4096 bytes = one 4 KiB page. Anything
+// less than a full page is invalid for the page-table walker (UPDATE
+// would walk past the allocation). PAGE_SIZE is mandatory, not optional.
+//
 SIZE_T APIENTRY WinMaliDxgkStub_GetRootPageTableSize(
     IN_CONST_HANDLE                     hAdapter,
     INOUT_PDXGKARG_GETROOTPAGETABLESIZE  pArgs)
@@ -501,16 +766,9 @@ SIZE_T APIENTRY WinMaliDxgkStub_GetRootPageTableSize(
     WM_STUB_ENTER();
     WM_UNREF1(hAdapter);
 
-    //
-    // GpuMmu-capable adapters: returning 0 left dxgmms2 without a non-zero
-    // root page-table allocation size on some Win11 26100 paths (AV inside
-    // VIDMM_GLOBAL::ReadPhysicalAdapterConfiguration). One host page is
-    // enough for dxgk to own backing storage; SetRootPageTable remains a
-    // no-op until we program real Mali page tables for process VA.
-    //
     if (pArgs != NULL) {
         WINMALI_TRACE(
-            "GetRootPageTableSize: physIdx=%u NumberOfPte=%u -> size=%u",
+            "GetRootPageTableSize: physIdx=%u NumberOfPte=%u -> size=%u (LPAE 4-level, 9 idx bits)",
             pArgs->PhysicalAdapterIndex,
             pArgs->NumberOfPte,
             (ULONG)PAGE_SIZE);
@@ -518,13 +776,34 @@ SIZE_T APIENTRY WinMaliDxgkStub_GetRootPageTableSize(
     return (SIZE_T)PAGE_SIZE;
 }
 
+//
+// DxgkDdiMapCpuHostAperture / UnmapCpuHostAperture
+//
+// These are only meaningful for segments that advertise a CPU-visible
+// host aperture. We currently report a single system-memory segment with
+// Flags.Aperture == 0, so dxgkrnl should never legitimately call these on
+// our adapter. The interest in returning STATUS_SUCCESS (instead of the
+// old NOT_SUPPORTED) is purely defensive: a few WDDM paths probe the DDI
+// pointer's success result during caps walks, and NOT_SUPPORTED has
+// historically been treated as "driver claims GPU MMU but cannot satisfy
+// VIDMM" -> StopDevice. The no-op is harmless because we touch no state.
+//
 NTSTATUS APIENTRY WinMaliDxgkStub_MapCpuHostAperture(
     IN_CONST_HANDLE                         hAdapter,
     IN_CONST_PDXGKARG_MAPCPUHOSTAPERTURE    pMapCpuHostAperture)
 {
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pMapCpuHostAperture);
-    return STATUS_NOT_SUPPORTED;
+    WM_UNREF1(hAdapter);
+
+    if (pMapCpuHostAperture == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    WINMALI_TRACE(
+        "MapCpuHostAperture: seg=%u physIdx=%u pages=%llu (no-op, no host aperture exposed)",
+        pMapCpuHostAperture->SegmentId,
+        pMapCpuHostAperture->PhysicalAdapterIndex,
+        (ULONGLONG)pMapCpuHostAperture->NumberOfPages);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_UnmapCpuHostAperture(
@@ -532,8 +811,17 @@ NTSTATUS APIENTRY WinMaliDxgkStub_UnmapCpuHostAperture(
     IN_CONST_PDXGKARG_UNMAPCPUHOSTAPERTURE pArgs)
 {
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pArgs);
-    return STATUS_NOT_SUPPORTED;
+    WM_UNREF1(hAdapter);
+
+    if (pArgs == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    WINMALI_TRACE(
+        "UnmapCpuHostAperture: seg=%u physIdx=%u pages=%llu (no-op)",
+        pArgs->SegmentId,
+        pArgs->PhysicalAdapterIndex,
+        (ULONGLONG)pArgs->NumberOfPages);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_CheckMultiPlaneOverlaySupport2(
@@ -545,22 +833,103 @@ NTSTATUS APIENTRY WinMaliDxgkStub_CheckMultiPlaneOverlaySupport2(
     return STATUS_NOT_SUPPORTED;
 }
 
+//
+// DxgkDdiCreateProcess / DxgkDdiDestroyProcess
+//
+// dxgkrnl creates a paging process at adapter init (with GpuMmuSupported)
+// and one logical process per user-mode client thereafter. We allocate a
+// WINMALI_KMD_PROCESS, populate identity + flags, and thread it onto
+// adapter->ProcessList so RemoveDevice / surprise-removal paths can free
+// any state dxgk forgot. The opaque handle dxgk passes around is the
+// struct pointer itself; Magic catches stale handles.
+//
+// AS-slot lifetime is per-context, not per-process: SetRootPageTable hands
+// out slots, DestroyContext (or SetRootPageTable(Address=0)) returns them.
+// DestroyProcess only frees the per-process scaffolding.
+//
 NTSTATUS APIENTRY WinMaliDxgkStub_CreateProcess(
     IN_CONST_HANDLE             hAdapter,
     INOUT_PDXGKARG_CREATEPROCESS pArgs)
 {
+    PWINMALI_ADAPTER     adapter;
+    PWINMALI_KMD_PROCESS proc;
+    KIRQL                irql;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pArgs);
-    return STATUS_NOT_SUPPORTED;
+
+    if (pArgs == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL) {
+        WINMALI_WARN("CreateProcess: bad hAdapter=%p", hAdapter);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    proc = (PWINMALI_KMD_PROCESS)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*proc), WINMALI_POOL_TAG);
+    if (proc == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    proc->Magic        = WINMALI_KMD_PROCESS_MAGIC;
+    proc->Flags        = pArgs->Flags.Value;
+    proc->hDxgkProcess = pArgs->hDxgkProcess;
+    proc->Adapter      = adapter;
+    InitializeListHead(&proc->AdapterLink);
+
+    KeAcquireSpinLock(&adapter->ProcessListLock, &irql);
+    InsertTailList(&adapter->ProcessList, &proc->AdapterLink);
+    ++adapter->ActiveProcessCount;
+    KeReleaseSpinLock(&adapter->ProcessListLock, irql);
+
+    pArgs->hKmdProcess = (HANDLE)proc;
+    WINMALI_TRACE(
+        "CreateProcess: hDxgk=%p flags=0x%x hKmd=%p (active=%u)",
+        pArgs->hDxgkProcess,
+        pArgs->Flags.Value,
+        proc,
+        adapter->ActiveProcessCount);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_DestroyProcess(
     IN_CONST_HANDLE hAdapter,
     IN_CONST_HANDLE hKmdProcess)
 {
+    PWINMALI_ADAPTER     adapter;
+    PWINMALI_KMD_PROCESS proc;
+    KIRQL                irql;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, hKmdProcess);
-    return STATUS_NOT_SUPPORTED;
+
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    proc    = (PWINMALI_KMD_PROCESS)hKmdProcess;
+    if (proc == NULL) {
+        return STATUS_SUCCESS;
+    }
+    if (proc->Magic != WINMALI_KMD_PROCESS_MAGIC) {
+        WINMALI_WARN("DestroyProcess: bad magic on hKmd=%p (val=0x%x)", proc, proc->Magic);
+        return STATUS_INVALID_HANDLE;
+    }
+    if (adapter == NULL) {
+        adapter = proc->Adapter;
+    }
+
+    if (adapter != NULL) {
+        KeAcquireSpinLock(&adapter->ProcessListLock, &irql);
+        RemoveEntryList(&proc->AdapterLink);
+        if (adapter->ActiveProcessCount > 0) {
+            --adapter->ActiveProcessCount;
+        }
+        KeReleaseSpinLock(&adapter->ProcessListLock, irql);
+    }
+
+    WINMALI_TRACE(
+        "DestroyProcess: hKmd=%p hDxgk=%p flags=0x%x",
+        proc, proc->hDxgkProcess, proc->Flags);
+    proc->Magic = 0;
+    ExFreePoolWithTag(proc, WINMALI_POOL_TAG);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_SetVidPnSourceAddressWithMultiPlaneOverlay2(
@@ -640,16 +1009,30 @@ NTSTATUS APIENTRY WinMaliDxgkStub_ControlModeBehavior(
     INOUT_PDXGKARG_CONTROLMODEBEHAVIOR       pControlModeBehavior)
 {
     WM_STUB_ENTER();
+    WM_UNREF1(hAdapter);
     //
-    // ControlModeBehavior is dxgkrnl asking us to opt in/out of various VidPN
-    // behaviors (e.g. clone-mode handling, mode switch on session change). On
-    // recent Win11 builds returning STATUS_NOT_SUPPORTED here is enough to
-    // make dxgkrnl decide we're not a viable primary display and unload us
-    // immediately after the post-StartDevice cap probe. Returning SUCCESS
-    // with no out-data changes ("accept the default behaviors") is what
-    // most modern WDDM samples do.
+    // DXGKARG_CONTROLMODEBEHAVIOR layout:
+    //   IN   Request       - DXGK_MODE_BEHAVIOR_FLAGS dxgk wants us to honour
+    //   OUT  Satisfied     - subset we WILL honour
+    //   OUT  NotSatisfied  - subset we will NOT honour
     //
-    WM_UNREF2(hAdapter, pControlModeBehavior);
+    // Previously we returned STATUS_SUCCESS with Satisfied / NotSatisfied
+    // left at whatever dxgk pre-filled (typically Request copied into both,
+    // or uninitialised). On Win11 26100 that ambiguity can flow into dxgk's
+    // mode-behaviour bookkeeping and result in the device being stopped
+    // when it later cannot reconcile our "satisfied" claim against runtime.
+    //
+    // Until we wire real mode-behaviour handling (we have one always-on
+    // GOP-backed HDMI target; no clone, no rotation, no power-aware mode
+    // switching), the safe answer is "I satisfy nothing; I reject all of
+    // your requests" - i.e. Satisfied = 0, NotSatisfied = Request. dxgk
+    // then knows the requested behaviours won't be enforced and proceeds
+    // with the default VidPn model.
+    //
+    if (pControlModeBehavior != NULL) {
+        pControlModeBehavior->Satisfied.Value    = 0;
+        pControlModeBehavior->NotSatisfied.Value = pControlModeBehavior->Request.Value;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -787,9 +1170,55 @@ NTSTATUS APIENTRY WinMaliDxgkStub_DisplayDetectControl(
     IN_CONST_HANDLE                         hAdapter,
     IN_CONST_PDXGKARG_DISPLAYDETECTCONTROL  pDisplayDetectControl)
 {
+    enum {
+        WINMALI_DDCT_POLLONE    = 1,
+        WINMALI_DDCT_POLLALL    = 2,
+        WINMALI_DDCT_ENABLEHPD  = 3,
+        WINMALI_DDCT_DISABLEHPD = 4
+    };
+    PWINMALI_ADAPTER adapter;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pDisplayDetectControl);
-    return STATUS_NOT_SUPPORTED;
+
+    if (pDisplayDetectControl == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL) {
+        WINMALI_WARN("DisplayDetectControl: bad hAdapter=%p", hAdapter);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // We currently expose one always-connected connector only.
+    if ((ULONG)pDisplayDetectControl->Type == WINMALI_DDCT_POLLONE
+        && pDisplayDetectControl->TargetId != (D3DDDI_VIDEO_PRESENT_TARGET_ID)adapter->PrimaryConnector)
+    {
+        WINMALI_WARN(
+            "DisplayDetectControl: POLLONE target %u unsupported (primary=%u)",
+            pDisplayDetectControl->TargetId,
+            adapter->PrimaryConnector);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    switch ((ULONG)pDisplayDetectControl->Type) {
+    case WINMALI_DDCT_POLLONE:
+    case WINMALI_DDCT_POLLALL:
+    case WINMALI_DDCT_ENABLEHPD:
+    case WINMALI_DDCT_DISABLEHPD:
+        WINMALI_TRACE(
+            "DisplayDetectControl: type=%u target=%u nonDestructive=%u (no-op, always-connected GOP path)",
+            (ULONG)pDisplayDetectControl->Type,
+            (ULONG)pDisplayDetectControl->TargetId,
+            (ULONG)pDisplayDetectControl->NonDestructiveOnly);
+        return STATUS_SUCCESS;
+
+    default:
+        WINMALI_WARN("DisplayDetectControl: unsupported type=%u target=%u",
+                     (ULONG)pDisplayDetectControl->Type,
+                     (ULONG)pDisplayDetectControl->TargetId);
+        return STATUS_NOT_SUPPORTED;
+    }
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_QueryConnectionChange(
@@ -806,8 +1235,48 @@ NTSTATUS APIENTRY WinMaliDxgkStub_ExchangePreStartInfo(
     IN_OUT_PDXGK_PRE_START_INFO pPreStartInfo)
 {
     WM_STUB_ENTER();
-    // OS calls before StartDevice; NOT_SUPPORTED fails bring-up (build 26200).
-    WM_UNREF2(hAdapter, pPreStartInfo);
+    WM_UNREF1(hAdapter);
+
+    if (pPreStartInfo == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    //
+    // dispmprt.h DXGK_PRE_START_INFO has two *output* bits dxgk reads
+    // BEFORE DxgkDdiStartDevice to decide whether to keep us as the
+    // POST display owner or transfer ownership to an indirect display
+    // (Microsoft Basic Display) and surprise-remove us.
+    //
+    //   SupportPreserveBootDisplay = 1
+    //       "I support keeping the UEFI/GOP framebuffer presenting
+    //        while my StartDevice runs; don't blank the screen and
+    //        don't fall back to the indirect display."
+    //   IsUEFIFrameBufferCpuAccessibleDuringStartup = 1
+    //       "The UEFI framebuffer is reachable by CPU during my
+    //        startup window so dxgk's sysdisplay / bug-check path
+    //        can write to it before SetVidPnSourceAddress fires."
+    //
+    // These are *capability assertions*, not state queries: dxgk calls
+    // ExchangePreStartInfo before StartDevice, so we have no
+    // DxgkInterface and therefore no GOP captured yet. We always claim
+    // both because RK3588 edk2 always boots via a UEFI GOP framebuffer,
+    // and we genuinely do support both behaviors via Rk3588DispCaptureGopFb
+    // in StartDevice and the kernel-mapped Gop.SystemDisplayVa for
+    // sysdisplay writes.
+    //
+    // Returning STATUS_SUCCESS with Output=0 (the old stub) caused
+    // dxgkrnl on Win11 build 26200 to surprise-remove us right after
+    // GetNodeMetadata via DxgkDdiStopDeviceAndReleasePostDisplayOwnership.
+    //
+    pPreStartInfo->Output                                      = 0;
+    pPreStartInfo->SupportPreserveBootDisplay                  = 1;
+    pPreStartInfo->IsUEFIFrameBufferCpuAccessibleDuringStartup = 1;
+
+    WINMALI_TRACE(
+        "ExchangePreStartInfo: in=0x%08x out=0x%08x preserve=1 uefi_cpu=1",
+        pPreStartInfo->Input,
+        pPreStartInfo->Output);
+
     return STATUS_SUCCESS;
 }
 
@@ -1380,7 +1849,33 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
         return;
     }
 
-    p->Version = DXGKDDI_INTERFACE_VERSION;
+    //
+    // CRITICAL: This MUST match what every cap surface reports.
+    //
+    //   DRIVERCAPS.WDDMVersion           = DXGKDDI_WDDMv2_4 (0x2400)
+    //   WDDMDEVICECAPS.WDDMVersion       = DXGKDDI_WDDMv2_4 (0x2400)
+    //   INF HKR,, WDDMVersion            = 0x2400
+    //   init.Version                     = DXGKDDI_INTERFACE_VERSION_WDDM2_4 (0x9006) <- HERE
+    //
+    // Previously we wrote DXGKDDI_INTERFACE_VERSION which on the 26100 WDK
+    // expands to DXGKDDI_INTERFACE_VERSION_WDDM3_2 (0x11007). That made
+    // DxgkInitialize negotiate WDDM 3.2 with dxgkrnl while every cap query
+    // we serve below answers 2.4. On Win11 26100 dxgk validates that the
+    // negotiated DDI version is consistent with the cap-reported WDDM
+    // version; the mismatch caused dxgk to abort the post-StartDevice cap
+    // walk right after GetNodeMetadata (no GPUMMUCAPS / PAGETABLELEVELDESC /
+    // QUERYSEGMENT* / DISPLAY_DRIVERCAPS_EXTENSION queries) and PnP-stop
+    // the device.
+    //
+    // We compile with the default DXGKDDI_INTERFACE_VERSION (3.2) so every
+    // 3.2 DDI slot in DRIVER_INITIALIZATION_DATA exists in our struct, but
+    // pinning init.Version to WDDM 2.4 tells dxgkrnl to only walk DDI
+    // pointers up to the WDDM 2.4 layout boundary. Everything beyond that
+    // (CreateMemoryBasis, doorbells, native fence log buffers, etc.) is
+    // ignored, which is correct because those stubs return NOT_SUPPORTED
+    // anyway and shouldn't be advertised at the 2.4 surface.
+    //
+    p->Version = DXGKDDI_INTERFACE_VERSION_WDDM2_4;
 
     p->DxgkDdiAddDevice = WinMaliKmdAddDevice;
     p->DxgkDdiStartDevice = WinMaliKmdStartDevice;

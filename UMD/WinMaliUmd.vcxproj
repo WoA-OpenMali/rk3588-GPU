@@ -87,6 +87,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WinMaliUmd.c" />
+    <ClCompile Include="wm_d3d11_devstubs.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <DisableSpecificWarnings>4100;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="WinMaliUmd.def" />

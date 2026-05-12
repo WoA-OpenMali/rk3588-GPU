@@ -112,3 +112,36 @@ NTSTATUS WinMaliMmuUnmapGpuRange(
 // Fills WINMALI_ESCAPE_MMU_OUT from live MMIO + CPU heap view (Passive).
 NTSTATUS WinMaliMmuEscapePing(_In_ PWINMALI_ADAPTER Adapter,
                               _Out_ WINMALI_ESCAPE_MMU_OUT* Out);
+
+//
+// AS-slot allocator and dxgk-context -> Mali AS binding. Used by
+// DxgkDdiCreateProcess / DxgkDdiSetRootPageTable / DxgkDdiDestroyProcess
+// (see WinMaliDxgkInitFill.c).
+//
+// WinMaliMmuInitAsAllocator marks AS0 (CSF MCU) and AS1 (kernel bring-up)
+// as in-use so dxgk handles never reuse them. Must be called once during
+// AddDevice, before any QueryAdapterInfo / CreateProcess can race.
+//
+VOID     WinMaliMmuInitAsAllocator(_Inout_ PWINMALI_ADAPTER Adapter);
+
+//
+// Program (or reprogram) the GPU MMU AS slot bound to `hContext` so that
+// `RootPtPa` becomes its live root page table. If `hContext` is already
+// bound to an AS slot the same slot is reused (TRANSTAB rewritten +
+// UPDATE issued). Otherwise a free AS is allocated. On success
+// `*OutAs` receives the slot number (informational).
+//
+// RootPtPa == 0 is treated as "unbind"; the slot is disabled and freed.
+//
+NTSTATUS WinMaliMmuBindContextRootPt(_Inout_ PWINMALI_ADAPTER Adapter,
+                                     _In_ HANDLE              hContext,
+                                     _In_ UINT64              RootPtPa,
+                                     _Out_opt_ PULONG         OutAs);
+
+//
+// Release the AS slot currently bound to `hContext` (no-op if none). Called
+// from DxgkDdiDestroyContext / DxgkDdiDestroyProcess so we never leak AS
+// slots across process exit.
+//
+NTSTATUS WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter,
+                                 _In_ HANDLE              hContext);

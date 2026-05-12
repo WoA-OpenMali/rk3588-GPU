@@ -20,13 +20,7 @@ Abstract:
 // including the DDI headers. This mirrors the pattern used by Mesa's
 // d3d10umd frontend (mesa\include\winddk\winddk_compat.h).
 #include <windows.h>
-
-#ifndef NTSTATUS
-#define NTSTATUS LONG
-#endif
-#ifndef STATUS_SUCCESS
-#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
-#endif
+#include <winternl.h>
 
 // Pick a minor header version supported by the installed WDK; D3D10.1 is
 // version 2, D3D11 adds 3+.
@@ -72,7 +66,7 @@ typedef struct _WINMALI_UMD_DEVICE {
     UINT32 Magic;
 #define WINMALI_UMD_DEVICE_MAGIC   'DdeM'  // "MdeD"
 
-    D3D10DDI_HDEVICE          RuntimeDevice;
+    D3D10DDI_HRTDEVICE        RuntimeDevice;
     PWINMALI_UMD_ADAPTER      Adapter;
 } WINMALI_UMD_DEVICE, *PWINMALI_UMD_DEVICE;
 
@@ -98,7 +92,22 @@ HRESULT APIENTRY WinMaliUmdGetCaps                  (D3D10DDI_HADAPTER hAdapter,
 // ---------------------------------------------------------------------------
 
 HRESULT APIENTRY WinMaliUmdDestroyDevice            (D3D10DDI_HDEVICE hDevice);
-VOID    APIENTRY WinMaliUmdDefaultConstantBufferUpdateSubresourceUP(D3D10DDI_HDEVICE hDevice, UINT Slot, _In_opt_ CONST D3D10_DDI_BOX* pDstBox, _In_ CONST VOID* pSysMemUP, UINT RowPitch, UINT DepthPitch, UINT CopyFlags);
-VOID    APIENTRY WinMaliUmdFlush                    (D3D10DDI_HDEVICE hDevice, UINT FlushFlags);
+VOID    APIENTRY WinMaliUmdDefaultConstantBufferUpdateSubresourceUP(
+    D3D10DDI_HDEVICE hDevice,
+    D3D10DDI_HRESOURCE hResource,
+    UINT Subresource,
+    _In_opt_ CONST D3D10_DDI_BOX* pDstBox,
+    _In_ CONST VOID* pSysMemUP,
+    UINT RowPitch,
+    UINT DepthPitch);
+VOID    APIENTRY WinMaliUmdFlush                    (D3D10DDI_HDEVICE hDevice);
 VOID    APIENTRY WinMaliUmdCheckFormatSupport       (D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, _Out_ UINT* pFormatSupport);
 VOID    APIENTRY WinMaliUmdCheckMultisampleQualityLevels(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, UINT SampleCount, _Out_ UINT* pNumQualityLevels);
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+void WinMaliUmdFillD3d11DeviceFuncs(D3D11DDI_DEVICEFUNCS *df);
+#ifdef __cplusplus
+}
+#endif

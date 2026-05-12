@@ -229,3 +229,108 @@ typedef struct _WINMALI_ESCAPE_RAW_SHADER {
 
 #define WINMALI_ESCAPE_RAW_SHADER_TOTAL_BYTES(_shaderByteCount) \
     (WINMALI_ESCAPE_RAW_SHADER_BASE_BYTES + (unsigned int)(_shaderByteCount))
+
+// ---------------------------------------------------------------------------
+// UMD <-> KMD shared structures for allocations and DMA buffer private data.
+//
+// Mirror the lifecycle of render-only-sample's RosAllocationGroupExchange /
+// RosAllocationExchange / RosDmaBufInfo blobs, sized so we can extend without
+// rev-locking the UMD binary (KMD always honours the on-wire `SizeInBytes`).
+//
+// Layout rules:
+//   * No pointers across the UMD/KMD boundary - dxgk copies these blobs
+//     verbatim, so an `unsigned long long` field is interpreted on whichever
+//     side reads it.
+//   * Magic + Version go first so KMD can reject blobs from older / wrong
+//     UMD bits before dereferencing the body.
+//   * All sizes are bytes; all addresses (DMA buf phys, etc.) are 64-bit.
+// ---------------------------------------------------------------------------
+
+// Per-allocation UMD payload supplied via DXGKARG_CREATEALLOCATION ->
+// pAllocationInfo[i].pPrivateDriverData (and echoed back in OpenAllocation,
+// DescribeAllocation, GetStandardAllocationDriverData).
+//
+// Old UMD bits / external (Mesa pan_kmod) callers may pass less than the
+// full struct; KMD honours whatever fits and zeroes the rest.
+
+#define WINMALI_ALLOC_PRIVATE_MAGIC    0x416c6c57u   /* 'WllA' */
+#define WINMALI_ALLOC_PRIVATE_VERSION  1u
+
+// Per-allocation usage flags. CPU_VISIBLE forces the allocation into a
+// CPU-mappable segment; PRIMARY marks display scan-out (DescribeAllocation
+// must answer fully). The 3D-pipeline-stage flags help the KMD pick the
+// right Mali memory attributes once Valhall paging is wired.
+#define WINMALI_ALLOC_FLAG_CPU_VISIBLE   0x00000001u
+#define WINMALI_ALLOC_FLAG_PRIMARY       0x00000002u
+#define WINMALI_ALLOC_FLAG_RENDERTARGET  0x00000004u
+#define WINMALI_ALLOC_FLAG_TEXTURE       0x00000008u
+#define WINMALI_ALLOC_FLAG_SHADER        0x00000010u
+#define WINMALI_ALLOC_FLAG_CMDBUFFER     0x00000020u
+#define WINMALI_ALLOC_FLAG_UNIFORM       0x00000040u
+#define WINMALI_ALLOC_FLAG_VERTEX        0x00000080u
+#define WINMALI_ALLOC_FLAG_INDEX         0x00000100u
+#define WINMALI_ALLOC_FLAG_DEPTHSTENCIL  0x00000200u
+#define WINMALI_ALLOC_FLAG_SHARED        0x00000400u
+
+typedef struct _WINMALI_ALLOC_PRIVATE {
+    unsigned long       Magic;            // = WINMALI_ALLOC_PRIVATE_MAGIC
+    unsigned long       Version;          // = WINMALI_ALLOC_PRIVATE_VERSION
+    unsigned long       Flags;            // WINMALI_ALLOC_FLAG_*
+    unsigned long       Format;           // D3DDDIFORMAT (echoed for primaries)
+    unsigned long       Width;            // 0 for buffer-typed allocations
+    unsigned long       Height;           // 0 for buffer-typed allocations
+    unsigned long       Pitch;            // bytes per scanline (primary)
+    unsigned long       BytesPerPixel;    // 0 for buffer-typed allocations
+    unsigned long long  SizeBytes;        // total bytes requested
+    unsigned long       Alignment;        // 0 -> PAGE_SIZE
+    unsigned long       RefreshNumerator; // primary scan-out (e.g. 60000)
+    unsigned long       RefreshDenominator;//                  (e.g. 1000)
+    unsigned long       MultisampleMethod;// D3DDDI_MULTISAMPLINGMETHOD
+    unsigned long       Rotation;         // D3DDDI_ROTATION
+    unsigned long       Reserved[6];      // future flags / debug name
+} WINMALI_ALLOC_PRIVATE;
+
+// Per-resource UMD payload (DXGKARG_CREATEALLOCATION::pPrivateDriverData when
+// Flags.Resource == 1). RosKmd uses this to remember "this whole resource is
+// a swapchain / mip-chain"; we keep it lightweight for now.
+#define WINMALI_RESOURCE_PRIVATE_MAGIC    0x73655257u  /* 'WseR' */
+#define WINMALI_RESOURCE_PRIVATE_VERSION  1u
+
+typedef struct _WINMALI_RESOURCE_PRIVATE {
+    unsigned long       Magic;            // = WINMALI_RESOURCE_PRIVATE_MAGIC
+    unsigned long       Version;          // = WINMALI_RESOURCE_PRIVATE_VERSION
+    unsigned long       NumAllocations;   // for sanity (echo of dxgk count)
+    unsigned long       Flags;            // reserved
+    unsigned long long  Reserved[2];
+} WINMALI_RESOURCE_PRIVATE;
+
+// KMD-only per-DMA-buffer state. dxgk allocates DmaBufferPrivateDataSize
+// bytes of zeroed memory for every DMA buffer (CreateContext); KMD owns the
+// layout. We use it to bridge Render -> Patch -> SubmitCommand and to track
+// completion when SubmitCommand can short-circuit to NotifyInterrupt.
+#define WINMALI_DMABUF_PRIVATE_MAGIC      0x66426D44u  /* 'DmBf' */
+#define WINMALI_DMABUF_PRIVATE_VERSION    1u
+
+#define WINMALI_DMABUF_FLAG_RENDERED      0x00000001u  // set by Render
+#define WINMALI_DMABUF_FLAG_PATCHED       0x00000002u  // set by Patch
+#define WINMALI_DMABUF_FLAG_SUBMITTED     0x00000004u  // set by SubmitCommand
+#define WINMALI_DMABUF_FLAG_COMPLETED     0x00000008u  // set by fake-complete
+#define WINMALI_DMABUF_FLAG_PAGING        0x00000010u  // BuildPagingBuffer
+#define WINMALI_DMABUF_FLAG_PRESENT       0x00000020u  // Present DDI
+#define WINMALI_DMABUF_FLAG_NULLRENDER    0x00000040u
+
+typedef struct _WINMALI_DMABUF_PRIVATE {
+    unsigned long       Magic;             // = WINMALI_DMABUF_PRIVATE_MAGIC
+    unsigned long       Version;           // = WINMALI_DMABUF_PRIVATE_VERSION
+    unsigned long       Flags;             // WINMALI_DMABUF_FLAG_*
+    unsigned long       CommandLength;     // bytes written by Render
+    unsigned long       NumPatches;        // patches resolved in Patch
+    unsigned long       PatchedAtOffset;   // last byte position Patch wrote
+    unsigned long long  SubmissionFenceId; // captured in SubmitCommand
+    unsigned long long  CompletionFenceId; // == fence acked to dxgk
+    unsigned long long  DmaBufferPhys;     // from DXGKARG_SUBMITCOMMAND
+    unsigned long long  DmaBufferGpuVa;    // 0 until we have real paging
+    unsigned long       NodeOrdinal;
+    unsigned long       EngineOrdinal;
+    unsigned long long  Reserved[2];
+} WINMALI_DMABUF_PRIVATE;

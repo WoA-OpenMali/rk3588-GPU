@@ -18,6 +18,9 @@
     <ClCompile Include="WinMaliUmd.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="wm_d3d11_devstubs.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="WinMaliUmd.h">

@@ -169,8 +169,47 @@ WinMaliMmuAsDisable(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG asNr)
 VOID
 WinMaliMmuTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
 {
+    KIRQL irql;
+    ULONG i;
+    ULONG releasedMask = 0;
+
     if (Adapter == NULL) {
         return;
+    }
+
+    //
+    // Release any per-context AS slots dxgk left programmed. In normal
+    // teardown DxgkDdiDestroyContext / SetRootPageTable(Address=0) cleans
+    // these out before we get here; on surprise-removal we may still see
+    // bound AS slots whose root-PT pages are about to vanish from system
+    // memory. Drop TRANSTAB/UPDATE on each so the GPU never page-walks
+    // through stale physical addresses.
+    //
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        if (!Adapter->AsBindings[i].Bound) {
+            continue;
+        }
+        if (i == WINMALI_MMU_MCU_AS || i == WINMALI_MMU_BRINGUP_AS) {
+            // These two slots are unbound by their own owners below.
+            continue;
+        }
+        Adapter->AsBindings[i].Bound    = FALSE;
+        Adapter->AsBindings[i].hContext = NULL;
+        Adapter->AsBindings[i].RootPtPa = 0;
+        Adapter->AsSlotInUseMask &= ~(1u << i);
+        releasedMask |= (1u << i);
+    }
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+
+    if (releasedMask != 0 && Adapter->GpuRegsMapped) {
+        for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+            if ((releasedMask & (1u << i)) != 0u) {
+                (VOID)WinMaliMmuAsDisable(Adapter, i);
+            }
+        }
+        WINMALI_WARN("MMU teardown: forced-disable AS mask=0x%x (leaked context binds)",
+                     releasedMask);
     }
 
     if (Adapter->GpuMmuAsBound && Adapter->GpuRegsMapped) {
@@ -449,6 +488,177 @@ WinMaliMmuMapGpuRange(
     }
 
     (VOID)WinMaliMmuAsFlushMem_(&Adapter->Hw, Adapter->GpuMmuBringupAs);
+    return STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// AS-slot allocator (CreateProcess / SetRootPageTable / DestroyProcess).
+//
+// AS0 = CSF MCU, AS1 = kernel bring-up. AS2..AS(N-1) are dynamic.
+// `AsSlotInUseMask` is the source of truth; `AsSlotPresentMask` mirrors the
+// HW `GPU_AS_PRESENT` register. Both are populated by
+// WinMaliMmuInitAsAllocator at AddDevice time so this allocator works even
+// before WinMaliMmuInit has bound the bring-up AS.
+// ---------------------------------------------------------------------------
+
+VOID
+WinMaliMmuInitAsAllocator(_Inout_ PWINMALI_ADAPTER Adapter)
+{
+    if (Adapter == NULL) {
+        return;
+    }
+
+    KeInitializeSpinLock(&Adapter->AsSlotLock);
+    Adapter->AsSlotPresentMask = (Adapter->Hw.AsPresent != 0)
+                                     ? Adapter->Hw.AsPresent
+                                     : 0xFFu;
+    if ((Adapter->AsSlotPresentMask & ((1u << WINMALI_MMU_MCU_AS)
+                                       | (1u << WINMALI_MMU_BRINGUP_AS))) !=
+        ((1u << WINMALI_MMU_MCU_AS) | (1u << WINMALI_MMU_BRINGUP_AS)))
+    {
+        Adapter->AsSlotPresentMask |= (1u << WINMALI_MMU_MCU_AS)
+                                    | (1u << WINMALI_MMU_BRINGUP_AS);
+    }
+    Adapter->AsSlotInUseMask = (1u << WINMALI_MMU_MCU_AS)
+                             | (1u << WINMALI_MMU_BRINGUP_AS);
+    RtlZeroMemory(Adapter->AsBindings, sizeof(Adapter->AsBindings));
+}
+
+static ULONG
+WinMaliMmuFindAsForContext_(_In_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
+{
+    ULONG i;
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        if (Adapter->AsBindings[i].Bound
+            && Adapter->AsBindings[i].hContext == hContext)
+        {
+            return i;
+        }
+    }
+    return WINMALI_AS_SLOT_MAX;
+}
+
+static ULONG
+WinMaliMmuPickFreeAs_(_In_ PWINMALI_ADAPTER Adapter)
+{
+    ULONG i;
+    for (i = 0; i < WINMALI_AS_SLOT_MAX; ++i) {
+        if ((Adapter->AsSlotPresentMask & (1u << i)) == 0u) {
+            continue;
+        }
+        if ((Adapter->AsSlotInUseMask & (1u << i)) != 0u) {
+            continue;
+        }
+        return i;
+    }
+    return WINMALI_AS_SLOT_MAX;
+}
+
+NTSTATUS
+WinMaliMmuBindContextRootPt(_Inout_ PWINMALI_ADAPTER Adapter,
+                            _In_ HANDLE              hContext,
+                            _In_ UINT64              RootPtPa,
+                            _Out_opt_ PULONG         OutAs)
+{
+    KIRQL    irql;
+    ULONG    as;
+    NTSTATUS status;
+    UINT64   transcfg = 0;
+    UINT64   memattr  = 0;
+    BOOLEAN  reused;
+
+    if (OutAs != NULL) {
+        *OutAs = WINMALI_AS_SLOT_MAX;
+    }
+    if (Adapter == NULL || !Adapter->GpuRegsMapped) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (RootPtPa == 0ULL) {
+        return WinMaliMmuUnbindContext(Adapter, hContext);
+    }
+    if ((RootPtPa & 0xFFFull) != 0ULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    as = WinMaliMmuFindAsForContext_(Adapter, hContext);
+    reused = (as < WINMALI_AS_SLOT_MAX);
+    if (!reused) {
+        as = WinMaliMmuPickFreeAs_(Adapter);
+        if (as >= WINMALI_AS_SLOT_MAX) {
+            KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+            WINMALI_WARN(
+                "BindContextRootPt: no free AS slot (inUse=0x%x present=0x%x hCtx=%p)",
+                Adapter->AsSlotInUseMask,
+                Adapter->AsSlotPresentMask,
+                hContext);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        Adapter->AsSlotInUseMask |= (1u << as);
+    }
+    Adapter->AsBindings[as].hContext = hContext;
+    Adapter->AsBindings[as].RootPtPa = RootPtPa;
+    Adapter->AsBindings[as].Bound    = TRUE;
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+
+    WinMaliMmuGetDefaultAsParams(Adapter, &transcfg, &memattr);
+
+    status = WinMaliMmuAsEnable(Adapter, as, RootPtPa, transcfg, memattr);
+    if (!NT_SUCCESS(status)) {
+        KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+        Adapter->AsBindings[as].Bound    = FALSE;
+        Adapter->AsBindings[as].hContext = NULL;
+        Adapter->AsBindings[as].RootPtPa = 0;
+        if (!reused) {
+            Adapter->AsSlotInUseMask &= ~(1u << as);
+        }
+        KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+        WINMALI_WARN("BindContextRootPt: AsEnable AS%u failed 0x%08x", as, status);
+        return status;
+    }
+
+    if (OutAs != NULL) {
+        *OutAs = as;
+    }
+    WINMALI_TRACE(
+        "BindContextRootPt: hCtx=%p root=0x%llx -> AS%u (%s)",
+        hContext,
+        (ULONGLONG)RootPtPa,
+        as,
+        reused ? "rebind" : "new");
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
+{
+    KIRQL  irql;
+    ULONG  as;
+    UINT64 root;
+
+    if (Adapter == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    as = WinMaliMmuFindAsForContext_(Adapter, hContext);
+    if (as >= WINMALI_AS_SLOT_MAX) {
+        KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+        return STATUS_SUCCESS;
+    }
+    root = Adapter->AsBindings[as].RootPtPa;
+    Adapter->AsBindings[as].Bound    = FALSE;
+    Adapter->AsBindings[as].hContext = NULL;
+    Adapter->AsBindings[as].RootPtPa = 0;
+    Adapter->AsSlotInUseMask &= ~(1u << as);
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+
+    if (Adapter->GpuRegsMapped) {
+        (VOID)WinMaliMmuAsDisable(Adapter, as);
+    }
+    WINMALI_TRACE(
+        "UnbindContext: hCtx=%p AS%u root=0x%llx released",
+        hContext, as, (ULONGLONG)root);
     return STATUS_SUCCESS;
 }
 

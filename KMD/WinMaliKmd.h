@@ -27,12 +27,12 @@ extern "C" {
 #endif
 
 //
-// DRIVER_INITIALIZATION_DATA.Version must equal DXGKDDI_INTERFACE_VERSION
-// from the WDK headers. On recent Windows builds, DxgkInitialize can fail
-// with STATUS_REVISION_MISMATCH if required slots in the expanded init
-// structure are NULL; WinMaliDxgkPatchInitializationData (WinMaliDxgkInitFill.c)
-// assigns the full WDDM 3.2 callback table.
-
+// DRIVER_INITIALIZATION_DATA.Version is pinned in WinMaliDxgkInitFill.c to
+// DXGKDDI_INTERFACE_VERSION_WDDM2_4 so it matches DRIVERCAPS /
+// WDDMDEVICECAPS / INF WDDMVersion. The WDK default DXGKDDI_INTERFACE_VERSION
+// is WDDM 3.2; using that while reporting WDDM 2.4 caps made dxgk abort
+// adapter init after GetNodeMetadata.
+//
 #include <ntstrsafe.h>
 
 #include "..\Shared\WinMaliCommon.h"
@@ -134,8 +134,53 @@ typedef struct _WINMALI_ADAPTER {
     LONG64            GpuSubmittedFence;
     LONG64            GpuCompletedFence;
 
+    // SubmitCommand / PreemptCommand fake-complete via DxgkCbNotifyInterrupt
+    // and then queue a DPC. NotifyDpcPending is a single-bit "we owe dxgk a
+    // NotifyDpc call" flag, set by the submit path and cleared by the DPC.
+    // Reset on TDR/recovery (no in-flight commands across reset).
+    LONG              NotifyDpcPending;
+
     // D3: firmware parked (FwTeardown); D0 re-runs FwInit.
     BOOLEAN           GpuFwParkedForD3;
+
+    //
+    // Mali MMU AS-slot allocator. The MMU exposes up to 16 address-space
+    // slots (`GPU_AS_PRESENT` bitmap, 0xFF for G610). The CSF firmware lives
+    // permanently in AS0 (`WINMALI_MMU_MCU_AS`) and our static kernel bring-up
+    // VM is bound to AS1 (`WINMALI_MMU_BRINGUP_AS`). CreateProcess /
+    // SetRootPageTable hand out AS2..AS(N-1) on demand and return them via
+    // DestroyProcess. AsSlotLock is taken at DISPATCH_LEVEL by all paths so
+    // SetRootPageTable can be safely called from any IRQL dxgk uses.
+    //
+    KSPIN_LOCK         AsSlotLock;
+    ULONG              AsSlotInUseMask;     // bit i set => AS i programmed
+    ULONG              AsSlotPresentMask;   // mirror of `GPU_AS_PRESENT`
+
+    //
+    // Process / context -> AS-slot bindings. SetRootPageTable is keyed by
+    // dxgk's per-context handle (hContext), not by hKmdProcess, so we keep a
+    // small flat table indexed by AS slot. Each slot remembers which dxgk
+    // handle programmed it and what root-PT physical address is live, so
+    // re-bind requests with the same hContext rewrite the same AS and we
+    // never accidentally leak an AS slot.
+    //
+#define WINMALI_AS_SLOT_MAX            16u
+    struct {
+        HANDLE  hContext;       // dxgk-owned, opaque to us
+        UINT64  RootPtPa;       // last programmed root-PT phys addr
+        BOOLEAN Bound;
+    } AsBindings[WINMALI_AS_SLOT_MAX];
+
+    //
+    // KMD process list. CreateProcess allocates a WINMALI_KMD_PROCESS and
+    // hands its address back as DXGKARG_CREATEPROCESS.hKmdProcess; we keep a
+    // doubly-linked list so RemoveDevice can clean up any process state that
+    // dxgk leaked across a surprise teardown. ProcessListLock guards both
+    // ProcessList and ActiveProcessCount; taken at DISPATCH_LEVEL.
+    //
+    KSPIN_LOCK         ProcessListLock;
+    LIST_ENTRY         ProcessList;
+    ULONG              ActiveProcessCount;
 
     /* VOP2 */
     RK3588_DISP_GOP_FB Gop;
@@ -144,6 +189,102 @@ typedef struct _WINMALI_ADAPTER {
     BOOLEAN                           HasActivePath;
       BOOLEAN                           SourceVisible;
 } WINMALI_ADAPTER, *PWINMALI_ADAPTER;
+
+//
+// Per-process driver state. Returned via DXGKARG_CREATEPROCESS.hKmdProcess
+// and freed in DxgkDdiDestroyProcess. The CreateProcess path inserts it on
+// adapter->ProcessList; DestroyProcess removes it. Magic catches stale /
+// wrong-type handles that some test harnesses pass on accident.
+//
+#define WINMALI_KMD_PROCESS_MAGIC      'PrcW'
+
+typedef struct _WINMALI_KMD_PROCESS {
+    ULONG               Magic;             // = WINMALI_KMD_PROCESS_MAGIC
+    ULONG               Flags;             // mirror of DXGK_CREATEPROCESSFLAGS
+    HANDLE              hDxgkProcess;      // hDxgkProcess from CreateProcess
+    PWINMALI_ADAPTER    Adapter;           // back-ref (never NULL)
+    LIST_ENTRY          AdapterLink;       // adapter->ProcessList
+} WINMALI_KMD_PROCESS, *PWINMALI_KMD_PROCESS;
+
+//
+// Per-context driver state. Returned via DXGKARG_CREATECONTEXT.hContext (out)
+// and freed in DxgkDdiDestroyContext. Mirrors render-only-sample's RosKmContext
+// but tied to our adapter/process layout. SetRootPageTable uses the same
+// pointer to look up the Mali AS slot owned by this context, so the address
+// MUST stay stable for the entire context lifetime.
+//
+#define WINMALI_KMD_CONTEXT_MAGIC      'CtxW'
+
+//
+// DmaBufferSize for "render" contexts. dxgk allocates a DMA buffer of this
+// size for every command submission. PAGE_SIZE matches render-only-sample
+// (ROSD_COMMAND_BUFFER_SIZE) and is plenty for the NOP-style command streams
+// we currently emit; bump when real Valhall command streams need more.
+//
+#define WINMALI_KMD_DMA_BUFFER_SIZE              PAGE_SIZE
+#define WINMALI_KMD_ALLOCATION_LIST_SIZE         64u
+#define WINMALI_KMD_PATCH_LOCATION_LIST_SIZE     128u
+
+typedef struct _WINMALI_KMD_CONTEXT {
+    ULONG               Magic;             // = WINMALI_KMD_CONTEXT_MAGIC
+    PWINMALI_ADAPTER    Adapter;           // back-ref (never NULL)
+    HANDLE              hRtContext;        // dxgk runtime handle (in from
+                                            //  DXGKARG_CREATECONTEXT.hContext)
+    UINT                NodeOrdinal;       // 0 = our only 3D node
+    UINT                EngineAffinity;
+    UINT                Flags;             // mirror of DXGK_CREATECONTEXTFLAGS
+    UINT64              SubmittedFence;    // monotonic; reset on TDR
+    UINT64              CompletedFence;
+    LONG                PendingDmaCount;   // submitted but not yet NotifyDpc'd
+} WINMALI_KMD_CONTEXT, *PWINMALI_KMD_CONTEXT;
+
+//
+// Per-resource driver state. dxgk creates a "resource" whenever
+// DXGK_CREATEALLOCATIONFLAGS.Resource is set; the resource is an opaque
+// grouping (typically a swapchain or a mip-chain) whose allocations live or
+// die together. We mirror that with a small list head; the actual allocation
+// structs are stored on AllocationListHead so RemoveDevice can defensively
+// reap leaked allocations on surprise teardown.
+//
+#define WINMALI_KMD_RESOURCE_MAGIC     'ReoW'
+
+typedef struct _WINMALI_KMD_RESOURCE {
+    ULONG               Magic;             // = WINMALI_KMD_RESOURCE_MAGIC
+    PWINMALI_ADAPTER    Adapter;           // back-ref (never NULL)
+    ULONG               NumAllocations;    // count of live allocations
+    ULONG               Flags;
+    LIST_ENTRY          AllocationListHead;// WINMALI_KMD_ALLOCATION::ResourceLink
+} WINMALI_KMD_RESOURCE, *PWINMALI_KMD_RESOURCE;
+
+//
+// Per-allocation driver state. Lifetime spans CreateAllocation ->
+// DestroyAllocation; open/close on a per-device handle is currently a
+// no-op (we hand the same pointer back as hDeviceSpecificAllocation).
+//
+// Magic catches stale or wrong-type handles that test harnesses sometimes
+// pass; OwnerResource (NULL for stand-alone allocations) is followed by
+// DestroyAllocation when the runtime asks to destroy the whole resource.
+//
+#define WINMALI_KMD_ALLOC_MAGIC        'AolW'
+
+typedef struct _WINMALI_KMD_ALLOCATION {
+    ULONG               Magic;             // = WINMALI_KMD_ALLOC_MAGIC
+    PWINMALI_ADAPTER    Adapter;           // back-ref (never NULL)
+    SIZE_T              Size;              // bytes (page aligned)
+    ULONG               Alignment;
+    ULONG               Flags;             // WINMALI_ALLOC_FLAG_*
+    ULONG               Format;            // D3DDDIFORMAT
+    ULONG               Width;
+    ULONG               Height;
+    ULONG               Pitch;
+    ULONG               BytesPerPixel;
+    ULONG               RefreshNumerator;
+    ULONG               RefreshDenominator;
+    ULONG               MultisampleMethod;
+    ULONG               Rotation;
+    PWINMALI_KMD_RESOURCE OwnerResource;   // NULL for stand-alone allocs
+    LIST_ENTRY          ResourceLink;      // links into OwnerResource list
+} WINMALI_KMD_ALLOCATION, *PWINMALI_KMD_ALLOCATION;
 
 // ---------------------------------------------------------------------------
 // DXGKDDI entry points exported by this driver.

@@ -38,6 +38,7 @@ extern "C" {
 #include "..\Shared\WinMaliCommon.h"
 #include "WinMaliTrace.h"       // WINMALI_TRACE / _WARN / _ERROR / _ENTER
 #include "hw\WinMaliHw.h"       // WINMALI_HW, register offsets
+#include "vop2\WinMaliVop2.h"   // WINMALI_VOP2 - VOP2 MMIO + state snapshot
 
 struct _WINMALI_FWCTX;
 
@@ -187,8 +188,124 @@ typedef struct _WINMALI_ADAPTER {
     D3DKMDT_VIDPN_PRESENT_PATH        ActivePath;
     UINT PrimaryConnector;
     BOOLEAN                           HasActivePath;
-      BOOLEAN                           SourceVisible;
+    BOOLEAN                           SourceVisible;
+
+    //
+    // VOP2 hardware sub-block (RK3588 video output processor v2). Populated
+    // by WinMaliVop2Initialize during WinMaliBringupHardware; valid for the
+    // life of the adapter once Vop2.Initialized==TRUE. Phase 2a is probe-
+    // only (read VP timings so we know what UEFI handed off); phase 2b
+    // adds reset / clock / IRQ; phase 2c+ takes over scan-out so we can
+    // publish a real sysmem-backed primary segment to dxgk.
+    //
+    WINMALI_VOP2                      Vop2;
+
+    //
+    // Route B segment publication: a CPU-visible aperture segment for
+    // general D3D allocations and a tiny local-memory segment backed by
+    // the captured GOP framebuffer for the DWM primary. The aperture
+    // page table tracks pages that VIDMM has installed via
+    // MAP_APERTURE_SEGMENT in DxgkDdiBuildPagingBuffer; we don't program
+    // any GPU MMU off of it yet, but VIDMM still validates the calls.
+    //
+    PPFN_NUMBER       AperturePageTable;   // size = AperturePageCount
+    SIZE_T            AperturePageCount;   // pages in the aperture seg
+    SIZE_T            ApertureSegmentBytes;// = AperturePageCount * PAGE_SIZE
+
+    //
+    // Dedicated PopulatedFromSystemMemory segment backing kernel DMA buffers
+    // and other non-primary D3D allocations. dxgmms2 in GpuMmu mode expects
+    // CreateContext's DmaBufferSegmentSet to name a real segment dxgk owns;
+    // setting it to 0 ("anywhere in sysmem") AVed dxgmms2!AddDmaBufferToPool
+    // on Win11 26100, so we publish a separate contiguous WC sysmem block
+    // and reference it as segment id 1 / DmaBufferSegmentSet bit 0.
+    //
+    // The block is independent of MmuScratchHeap (which is reserved for
+    // page tables + bring-up scratch we own) so dxgk can freely lay DMA
+    // buffers and small allocations across this whole region.
+    //
+    PVOID             DmaSegmentVa;
+    PHYSICAL_ADDRESS  DmaSegmentPhys;
+    SIZE_T            DmaSegmentBytes;
+
+    //
+    // Phase 2d: contiguous cached sysmem block published as dxgk segment id
+    // WINMALI_GOP_SEGMENT_ID (2) — CpuVisible | PopulatedFromSystemMemory |
+    // DirectFlip | LocalBudgetGroup. Filled at StartDevice from the GOP
+    // framebuffer copy, then VOP2 Esmart YRGB_MST points here instead of
+    // BIOS-reserved 0xEDA00000. Freed in WinMaliVop2TeardownScanoutSegment.
+    //
+    PVOID             ScanoutSegmentVa;
+    PHYSICAL_ADDRESS  ScanoutSegmentPhys;
+    SIZE_T            ScanoutSegmentBytes;
+
+    // CPU-visible mapping of the GOP framebuffer for the post-display /
+    // SetVidPnSourceAddress fallback path. Lazy-initialised the first
+    // time we need it.
+    PVOID             GopRuntimeVa;
+    SIZE_T            GopRuntimeBytes;
 } WINMALI_ADAPTER, *PWINMALI_ADAPTER;
+
+//
+// Route B segment id constants. dxgk segment ids are 1-based; segment 0
+// is reserved as the "unused" slot in DXGK_SEGMENTPREFERENCE. Bit positions
+// in SupportedReadSegmentSet / SupportedWriteSegmentSet are zero-based:
+// segment i corresponds to bit (i - 1).
+//
+// Segment 1 was historically a CpuVisible Aperture window for sysmem. After
+// the WDDM 2.4 GpuMmu rewrite (see WinMaliBuildSegmentList_ comments) it now
+// names a PopulatedFromSystemMemory block, not an aperture - kept under the
+// APERTURE-flavoured name so the QUERYSEGMENT path, allocation routing, and
+// MAP/UNMAP_APERTURE_SEGMENT fallbacks all keep referring to a stable id.
+// The macro just means "segment id 1, our sysmem-backed segment".
+#define WINMALI_APERTURE_SEGMENT_ID      1u
+#define WINMALI_SYSMEM_SEGMENT_ID        WINMALI_APERTURE_SEGMENT_ID
+#define WINMALI_GOP_SEGMENT_ID           2u
+#define WINMALI_SEGMENT_COUNT            2u
+
+//
+// GPU-side base addresses we report to dxgk in DXGK_SEGMENTDESCRIPTOR*.
+//
+// PHYSICALADAPTERCAPS publishes MinimumAddress=0x10000 and the firmware lives
+// at fixed GPU VAs in [0x00000000..0x04040000). VIDMM uses the segment's
+// BaseAddress as a hint for where the segment occupies the GPU VA space, so
+// we must keep both segments above the FW reservations and above
+// MinimumAddress. dxgkrnl validates this and silently StopDevices the adapter
+// when BaseAddress is 0 or below MinimumAddress.
+//
+// Aperture sits at 0x10000000 (256 MB) for 256 MB of room; GOP local sits at
+// 0xC0000000 (3 GB), matching the convention used by roskmd / other shipping
+// WDDM samples.
+//
+#define WINMALI_APERTURE_GPU_BASE        0x10000000ull
+#define WINMALI_GOP_GPU_BASE             0x30000000ull
+
+//
+// Legacy "fake but plausible" CPU translated address for the CpuVisible
+// aperture: we don't expose a real linear CPU window for the aperture
+// (each page has its own kernel VA via the MDL the runtime maps), but
+// CpuVisible=1 requires SOMETHING here. Shipping WDDM samples use this
+// magic value so dxgk never tries to touch it directly.
+//
+#define WINMALI_APERTURE_CPU_FAKE_ADDR   0xFFFFFFFE00000000ull
+
+// 64 MB aperture. We previously sized this at 256 MB but
+// DRIVERCAPS.ApertureSegmentCommitLimit is 64 MB; dxgkrnl validates that
+// the aperture segment Size cannot exceed the announced commit limit and
+// silently StopDevices us right after QUERYSEGMENT4 pass-2 when it does.
+//
+// 64 MB is also more than enough for early bring-up - DWM's redirection
+// surfaces for a single 1080p primary fit in well under 32 MB. If we ever
+// need more, we MUST raise both this value AND
+// DRIVERCAPS.ApertureSegmentCommitLimit together.
+// surfaces, D3D11 textures, swap-chain back buffers and shader heaps
+// without rejecting CreateAllocation. dxgk only ever fills the pages
+// it actually needs (demand-paged), so the page-table allocation cost
+// scales with usage, not with the announced size.
+#define WINMALI_APERTURE_SEGMENT_PAGES   16384u
+#define WINMALI_APERTURE_SEGMENT_BYTES   ((SIZE_T)WINMALI_APERTURE_SEGMENT_PAGES * 0x1000u)
+
+C_ASSERT(WINMALI_APERTURE_SEGMENT_BYTES == (64u * 1024u * 1024u));
 
 //
 // Per-process driver state. Returned via DXGKARG_CREATEPROCESS.hKmdProcess
@@ -282,6 +399,11 @@ typedef struct _WINMALI_KMD_ALLOCATION {
     ULONG               RefreshDenominator;
     ULONG               MultisampleMethod;
     ULONG               Rotation;
+    // dxgk segment id (1-based) we asked VIDMM to land this allocation
+    // in. Used by SetVidPnSourceAddress to tell whether the primary is
+    // already on the GOP framebuffer (no copy) or needs the aperture
+    // memcpy fallback.
+    ULONG               PreferredSegmentId;
     PWINMALI_KMD_RESOURCE OwnerResource;   // NULL for stand-alone allocs
     LIST_ENTRY          ResourceLink;      // links into OwnerResource list
 } WINMALI_KMD_ALLOCATION, *PWINMALI_KMD_ALLOCATION;
@@ -448,6 +570,17 @@ NTSTATUS WinMaliBringupHardware(_Inout_ PWINMALI_ADAPTER Adapter);
 // Tear down anything WinMaliBringupHardware set up. Safe to call even
 // if bring-up failed partway through.
 VOID     WinMaliTeardownHardware(_Inout_ PWINMALI_ADAPTER Adapter);
+
+//
+// Optional bring-up smoke test (deploy / lab builds): maps the GOP
+// framebuffer after DxgkCbAcquirePostDisplayOwnership, draws a visible
+// square into scan-out RAM, then re-pulses YRGB_MST + CFG_DONE. Call
+// once from StartDevice after Rk3588DispCaptureGopFb.
+//
+VOID     WinMaliVop2SmokeVisualDraw(_Inout_ PWINMALI_ADAPTER Adapter);
+
+NTSTATUS WinMaliVop2SetupSysmemScanout(_Inout_ PWINMALI_ADAPTER Adapter);
+VOID     WinMaliVop2TeardownScanoutSegment(_Inout_ PWINMALI_ADAPTER Adapter);
 
 // Connect the shared GPU interrupt (GSIV 124/125/126) via the DXGK
 // callback surface. No-op if the IRQ was already connected.

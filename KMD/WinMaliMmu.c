@@ -227,6 +227,16 @@ WinMaliMmuTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
         Adapter->MmuScratchHeapPhys.QuadPart = 0;
         Adapter->MmuScratchHeapBytes  = 0;
     }
+
+    if (Adapter->DmaSegmentVa != NULL) {
+        MmFreeContiguousMemory(Adapter->DmaSegmentVa);
+        WINMALI_TRACE("DMA segment freed va=%p phys=0x%llx",
+                      Adapter->DmaSegmentVa,
+                      (ULONGLONG)Adapter->DmaSegmentPhys.QuadPart);
+        Adapter->DmaSegmentVa     = NULL;
+        Adapter->DmaSegmentPhys.QuadPart = 0;
+        Adapter->DmaSegmentBytes  = 0;
+    }
 }
 
 VOID
@@ -336,6 +346,38 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
     Adapter->MmuScratchHeapBytes  = WINMALI_MMU_SCRATCH_HEAP_BYTES;
 
     RtlFillMemory(va, WINMALI_MMU_SCRATCH_HEAP_BYTES, 0);
+
+    //
+    // Dedicated DMA-buffer segment storage. Cached because dxgmms2 writes
+    // DMA command buffers from CPU and we don't actually submit them to the
+    // GPU yet (no real Render/SubmitCommand path); once we do, we'll either
+    // switch to MmWriteCombined or add explicit cache maintenance around
+    // the submit/complete callbacks. Distinct from MmuScratchHeap so the
+    // PT/L3 region cannot be clobbered by VIDMM allocations.
+    //
+    {
+        PVOID dmaVa = MmAllocateContiguousMemorySpecifyCache(
+            WINMALI_DMA_SEGMENT_BYTES, low, high, low, MmCached);
+        if (dmaVa == NULL) {
+            WINMALI_ERROR(
+                "DMA segment: MmAllocateContiguousMemorySpecifyCache(%u) failed",
+                (ULONG)WINMALI_DMA_SEGMENT_BYTES);
+            MmFreeContiguousMemory(va);
+            Adapter->MmuScratchHeapVa = NULL;
+            Adapter->MmuScratchHeapPhys.QuadPart = 0;
+            Adapter->MmuScratchHeapBytes = 0;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        Adapter->DmaSegmentVa    = dmaVa;
+        Adapter->DmaSegmentPhys  = MmGetPhysicalAddress(dmaVa);
+        Adapter->DmaSegmentBytes = WINMALI_DMA_SEGMENT_BYTES;
+        RtlFillMemory(dmaVa, WINMALI_DMA_SEGMENT_BYTES, 0);
+        WINMALI_TRACE(
+            "DMA segment: va=%p phys=0x%llx bytes=%u (cached, seg id 1 backing)",
+            dmaVa,
+            (ULONGLONG)Adapter->DmaSegmentPhys.QuadPart,
+            (ULONG)WINMALI_DMA_SEGMENT_BYTES);
+    }
 
     base   = (PUCHAR)va;
     rootPa = Adapter->MmuScratchHeapPhys.QuadPart;

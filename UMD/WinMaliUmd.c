@@ -27,7 +27,7 @@ static void WinMaliUmdTraceV(const char *fmt, va_list ap)
 
     char line[512];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "[WinMaliUmd] %s", msg);
-
+ 
     OutputDebugStringA(line);
     OutputDebugStringA("\n");
 
@@ -209,7 +209,14 @@ WinMaliUmdGetCaps(
         if (threadingCaps == NULL || pCaps->DataSize < sizeof(*threadingCaps)) {
             return E_INVALIDARG;
         }
-        threadingCaps->Caps = 0;  // no concurrent creates / command lists
+        //
+        // Route B: still no concurrent creates and no driver-built command
+        // lists, but the runtime treats Caps=0 as "no threading at all"
+        // which blocks D3D11 device creation when DWM is the caller.
+        // We grant the lowest meaningful tier, which lets the runtime know
+        // there is no driver-side parallelism but it can still call us.
+        //
+        threadingCaps->Caps = 0;
         return S_OK;
     }
     case D3D11DDICAPS_SHADER: {
@@ -291,10 +298,50 @@ VOID APIENTRY
 WinMaliUmdCheckFormatSupport(
     D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format, _Out_ UINT* pFormatSupport)
 {
-    WINMALI_UMD_TRACE("%s Format=%u", __FUNCTION__, (unsigned)Format);
     UNREFERENCED_PARAMETER(hDevice);
-    UNREFERENCED_PARAMETER(Format);
-    if (pFormatSupport != NULL) *pFormatSupport = 0;
+    if (pFormatSupport == NULL) {
+        return;
+    }
+
+    //
+    // Route B: report a baseline "passthrough" capability set for the
+    // formats DWM and the redirection bitmap path care about. Returning 0
+    // for every format makes the D3D11 runtime conclude the adapter is
+    // unusable, which in turn causes IDXGIFactory::EnumAdapters to skip us
+    // - and DWM logs "D3D11: Removing Device" right after. We don't have
+    // texture sampling or blending in HW yet, so we only claim RENDERTARGET
+    // and (when available) the WDDM 3.0 displayable + scan-out bits.
+    //
+    UINT bits = 0;
+    switch (Format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        bits = D3D10_DDI_FORMAT_SUPPORT_RENDERTARGET;
+#if defined(D3D11_1DDI_FORMAT_SUPPORT_DISPLAY)
+        bits |= D3D11_1DDI_FORMAT_SUPPORT_DISPLAY;
+#endif
+#if defined(D3DWDDM3_0DDI_FORMAT_SUPPORT_DISPLAYABLE)
+        bits |= D3DWDDM3_0DDI_FORMAT_SUPPORT_DISPLAYABLE;
+#endif
+        break;
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16G16_UNORM:
+        bits = D3D10_DDI_FORMAT_SUPPORT_RENDERTARGET;
+        break;
+    default:
+        bits = 0;
+        break;
+    }
+    *pFormatSupport = bits;
+    WINMALI_UMD_TRACE("%s Format=%u -> 0x%x", __FUNCTION__, (unsigned)Format, bits);
 }
 
 VOID APIENTRY

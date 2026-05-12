@@ -12,8 +12,19 @@ typedef struct _WINMALI_ADAPTER WINMALI_ADAPTER, *PWINMALI_ADAPTER;
 /** Contiguous non-cached heap: page tables, firmware PT, MMU bring-up scratch, VIDMM carve-out. */
 #define WINMALI_MMU_SCRATCH_HEAP_BYTES (256UL * 1024UL)
 
-/** Paging buffer size we request from our single system-memory segment (must fit in heap). */
-#define WINMALI_VIDMM_PAGING_BUFFER_BYTES (64UL * 1024UL)
+/** Paging buffer carved from segment id 1 (PagingBufferSegmentId). ROS uses PAGE_SIZE; a larger value increases VIDMM commit during DpiFdoStartAdapter. */
+#define WINMALI_VIDMM_PAGING_BUFFER_BYTES (4096UL)
+
+/**
+ * Size of the contiguous PopulatedFromSystemMemory segment we publish as
+ * segment id 1. dxgmms2 lays kernel DMA buffers (4 KiB each, one per
+ * outstanding command submission) and small non-primary D3D allocations
+ * into this region. 4 MiB proved too tight on some Win11 start paths
+ * (DpiFdoStartAdapter rolling back with STATUS_NO_MEMORY immediately after
+ * QUERYSEGMENT4 pass2). Use 16 MiB to give VIDMM headroom for early
+ * paging/DMA buffer pools while keeping contiguous-allocation pressure low.
+ */
+#define WINMALI_DMA_SEGMENT_BYTES (32UL * 1024UL * 1024UL)
 
 #if WINMALI_VIDMM_PAGING_BUFFER_BYTES > WINMALI_MMU_SCRATCH_HEAP_BYTES
 #error WINMALI_VIDMM_PAGING_BUFFER_BYTES must fit in WINMALI_MMU_SCRATCH_HEAP_BYTES

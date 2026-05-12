@@ -249,6 +249,30 @@ WinMaliBringupHardware(_Inout_ PWINMALI_ADAPTER Adapter)
                      Adapter->Hw.ProdMajor);
     }
 
+    //
+    // Best-effort VOP2 bring-up: maps the VOP2 + GRF MMIO ranges and dumps
+    // the current VP/HDMI state so we can confirm UEFI handed off the
+    // expected mode. Failure is non-fatal (Vop2.Initialized stays FALSE);
+    // the GPU side of the driver still works and the GOP capture path keeps
+    // owning the screen until phase 2c hooks CommitVidPn into VOP2.
+    //
+    {
+        NTSTATUS vopStatus = WinMaliVop2Initialize(&Adapter->Vop2);
+        if (!NT_SUCCESS(vopStatus)) {
+            WINMALI_WARN("WinMaliVop2Initialize returned 0x%08x - "
+                         "VOP2 path disabled, falling back to GOP scan-out",
+                         vopStatus);
+        } else if (!Adapter->Vop2.Initialized) {
+            WINMALI_WARN("VOP2 initialize succeeded but main MMIO did not "
+                         "map - VOP2 path disabled");
+        } else {
+            WINMALI_TRACE("VOP2 ready: VP%u driving HDMI0 at %ux%u",
+                          Adapter->Vop2.ActiveVpId,
+                          Adapter->Vop2.ActiveHActive,
+                          Adapter->Vop2.ActiveVActive);
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
@@ -256,6 +280,18 @@ VOID
 WinMaliTeardownHardware(_Inout_ PWINMALI_ADAPTER Adapter)
 {
     if (Adapter == NULL) return;
+
+    //
+    // Free the scan-out sysmem slab (after optionally restoring YRGB_MST
+    // to the GOP framebuffer) before unmapping VOP2 MMIO.
+    //
+    WinMaliVop2TeardownScanoutSegment(Adapter);
+
+    //
+    // Drop VOP2 maps before the GPU MMIO so a partial bring-up (VOP2
+    // succeeded, GPU init failed) still tears down cleanly. NULL-safe.
+    //
+    WinMaliVop2Shutdown(&Adapter->Vop2);
 
     WinMaliHwShutdown(&Adapter->Hw);
 

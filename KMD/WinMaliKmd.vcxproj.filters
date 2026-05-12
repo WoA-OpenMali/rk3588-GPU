@@ -19,6 +19,9 @@
     <Filter Include="Source Files\diag">
       <UniqueIdentifier>{22222222-2222-2222-2222-222222222222}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\vop2">
+      <UniqueIdentifier>{33333333-3333-3333-3333-333333333333}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WinMaliDriver.c">
@@ -29,6 +32,9 @@
     </ClCompile>
     <ClCompile Include="diag\WinMaliDiag.c">
       <Filter>Source Files\diag</Filter>
+    </ClCompile>
+    <ClCompile Include="vop2\WinMaliVop2.c">
+      <Filter>Source Files\vop2</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -45,6 +51,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\Shaders\winmali_shader_programs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vop2\WinMaliVop2.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

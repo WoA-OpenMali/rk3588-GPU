@@ -130,6 +130,7 @@
     <ClInclude Include="..\Shared\WinMaliCommon.h" />
     <ClInclude Include="..\Shaders\winmali_shader_programs.h" />
     <ClInclude Include="vop2\Vop2ConnectorsShared.h" />
+    <ClInclude Include="vop2\WinMaliVop2.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WinMaliDxgkInitFill.c" />
@@ -142,6 +143,7 @@
     <ClCompile Include="diag\WinMaliDiag.c" />
     <ClCompile Include="vop2\Vop2Connectors.c" />
     <ClCompile Include="vop2\Vop2Gop.c" />
+    <ClCompile Include="vop2\WinMaliVop2.c" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="WinMaliKmd.inx" />

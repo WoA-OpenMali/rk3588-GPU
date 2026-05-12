@@ -95,7 +95,7 @@ WinMaliUmd.dll
 [WinMaliKmd.SoftwareSettings]
 HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll"
 HKR,, UserModeDriverNameWOW, %REG_MULTI_SZ%, "WinMaliUmd.dll"
-HKR,, InstalledDisplayDrivers,%REG_MULTI_SZ%, "WinMaliKmd"
+HKR,, InstalledDisplayDrivers,%REG_MULTI_SZ%, "WinMaliUmd"
 HKR,, VgaCompatible,         %REG_DWORD%, 0
 HKR,, WDDMVersion,           %REG_DWORD%, 0x2400  ; WDDM 2.4
 

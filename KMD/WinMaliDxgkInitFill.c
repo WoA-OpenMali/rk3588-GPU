@@ -22,11 +22,18 @@
     WM_UNREF6(a, b, c, d, e, f);       \
     WM_UNREF1(g)
 
-// Trace every stub DDI so bring-up logs show which callback dxgkrnl hit first.
+// Trace every DDI entry so bring-up logs show which callback dxgkrnl hit first.
+// Originally only used for the unimplemented stubs (hence the name) - kept for
+// every dispatch entry so the call sequence stays visible in WPP traces even
+// for functions that have grown a real implementation.
 #define WM_STUB_ENTER() WINMALI_ENTER()
 
 // ---------------------------------------------------------------------------
-// Stubs — NTSTATUS / HANDLE / VOID signatures must match d3dkmddi.h exactly.
+// dxgk DDI dispatch entries - mix of:
+//   * WinMaliDxgkStub_<Name>  ... still a true stub returning STATUS_NOT_SUPPORTED
+//                                 (or the documented "doesn't apply" status)
+//   * WinMaliKmd<Name>        ... real implementation backed by adapter state
+// All signatures must match d3dkmddi.h exactly.
 // ---------------------------------------------------------------------------
 
 NTSTATUS APIENTRY WinMaliDxgkStub_DispatchIoRequest(
@@ -99,13 +106,14 @@ NTSTATUS APIENTRY WinMaliDxgkStub_SetPointerShape(
     return STATUS_NOT_SUPPORTED;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_RecommendVidPnTopology(
+NTSTATUS APIENTRY WinMaliKmdRecommendVidPnTopology(
     IN_CONST_HANDLE                                   hAdapter,
     IN_CONST_PDXGKARG_RECOMMENDVIDPNTOPOLOGY_CONST    pRecommendVidPnTopology)
 {
     WM_STUB_ENTER();
     WM_UNREF2(hAdapter, pRecommendVidPnTopology);
-    return STATUS_NOT_SUPPORTED;
+    // GOP-first bring-up: let dxgkrnl own topology synthesis.
+    return STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_GetScanLine(
@@ -113,8 +121,13 @@ NTSTATUS APIENTRY WinMaliDxgkStub_GetScanLine(
     INOUT_PDXGKARG_GETSCANLINE  pGetScanLine)
 {
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pGetScanLine);
-    return STATUS_NOT_SUPPORTED;
+    UNREFERENCED_PARAMETER(hAdapter);
+    if (pGetScanLine == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    pGetScanLine->InVerticalBlank = FALSE;
+    pGetScanLine->ScanLine = 0;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_StopCapture(
@@ -193,7 +206,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_DestroyOverlay(IN_CONST_HANDLE hOverlay)
 //                                  = 256 for GDI contexts; we mirror that)
 //   PatchLocationListSize   = 128
 //
-NTSTATUS APIENTRY WinMaliDxgkStub_CreateContext(
+NTSTATUS APIENTRY WinMaliKmdCreateContext(
     IN_CONST_HANDLE                 hDevice,
     INOUT_PDXGKARG_CREATECONTEXT    pCreateContext)
 {
@@ -261,7 +274,23 @@ NTSTATUS APIENTRY WinMaliDxgkStub_CreateContext(
     info = &pCreateContext->ContextInfo;
     RtlZeroMemory(info, sizeof(*info));
     info->DmaBufferSize             = WINMALI_KMD_DMA_BUFFER_SIZE;
-    info->DmaBufferSegmentSet       = 1u << 0;   // segment 0 (system memory)
+    //
+    // DmaBufferSegmentSet is a 1-based bitmap of segments where dxgk may
+    // allocate the kernel-side DMA buffer.
+    //
+    // History:
+    //   * (1u << 0) at first - worked while we published a sysmem aperture
+    //     as id 1.
+    //   * 0 after we dropped the aperture - on Win11 26100 this AVed
+    //     dxgmms2!AddDmaBufferToPool+0x6c8 because dxgmms2 still wants a
+    //     real segment dxgk owns for kernel DMA buffer storage; "0 means
+    //     anywhere in sysmem" is not actually honoured by this build.
+    //   * (1u << (WINMALI_SYSMEM_SEGMENT_ID - 1)) (current) - points at our
+    //     dedicated PopulatedFromSystemMemory segment 1 (Adapter->DmaSegment*).
+    //     This gives dxgmms2 a 4 MiB pool for command buffers without ever
+    //     overlapping the GOP framebuffer (segment 2).
+    //
+    info->DmaBufferSegmentSet       = 1u << (WINMALI_SYSMEM_SEGMENT_ID - 1u);
     info->DmaBufferPrivateDataSize  = sizeof(WINMALI_DMABUF_PRIVATE);
     if (pCreateContext->Flags.GdiContext) {
         info->AllocationListSize    = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
@@ -289,7 +318,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_CreateContext(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_DestroyContext(IN_CONST_HANDLE hContext)
+NTSTATUS APIENTRY WinMaliKmdDestroyContext(IN_CONST_HANDLE hContext)
 {
     PWINMALI_KMD_CONTEXT ctx;
 
@@ -327,7 +356,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_DestroyContext(IN_CONST_HANDLE hContext)
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_LinkDevice(
+NTSTATUS APIENTRY WinMaliKmdLinkDevice(
     IN_CONST_PDEVICE_OBJECT   PhysicalDeviceObject,
     IN_CONST_PVOID            MiniportDeviceContext,
     INOUT_PLINKED_DEVICE      LinkedDevice)
@@ -376,7 +405,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_SetPowerComponentFState(
 // QUERYSEGMENT* traces, immediate StopDevice). For our single 3D node we
 // report that the engine only depends on itself.
 //
-NTSTATUS APIENTRY WinMaliDxgkStub_QueryDependentEngineGroup(
+NTSTATUS APIENTRY WinMaliKmdQueryDependentEngineGroup(
     IN_CONST_HANDLE                         hAdapter,
     INOUT_DXGKARG_QUERYDEPENDENTENGINEGROUP pQueryDependentEngineGroup)
 {
@@ -399,7 +428,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_QueryDependentEngineGroup(
 // responsive so VIDMM/scheduler init can continue. Real implementation will
 // inspect MCU/CSF queue heads.
 //
-NTSTATUS APIENTRY WinMaliDxgkStub_QueryEngineStatus(
+NTSTATUS APIENTRY WinMaliKmdQueryEngineStatus(
     IN_CONST_HANDLE                     hAdapter,
     INOUT_PDXGKARG_QUERYENGINESTATUS    pQueryEngineStatus)
 {
@@ -434,7 +463,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_ResetEngine(
 // GOP framebuffer is enough to clear that hurdle even before any real
 // VOP2 plane programming exists.
 //
-NTSTATUS WinMaliDxgkStub_SystemDisplayEnable(
+NTSTATUS WinMaliKmdSystemDisplayEnable(
     IN_CONST_PVOID                       MiniportDeviceContext,
     IN D3DDDI_VIDEO_PRESENT_TARGET_ID    TargetId,
     IN PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS Flags,
@@ -492,7 +521,7 @@ NTSTATUS WinMaliDxgkStub_SystemDisplayEnable(
     return STATUS_SUCCESS;
 }
 
-VOID WinMaliDxgkStub_SystemDisplayWrite(
+VOID WinMaliKmdSystemDisplayWrite(
     IN_CONST_PVOID MiniportDeviceContext,
     IN PVOID       Source,
     IN UINT        SourceWidth,
@@ -672,7 +701,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_SubmitCommandVirtual(
 // Address == 0 is the documented "drop the root page table" signal from
 // dxgk (context tear-down); we release the AS slot.
 //
-VOID APIENTRY WinMaliDxgkStub_SetRootPageTable(
+VOID APIENTRY WinMaliKmdSetRootPageTable(
     IN_CONST_HANDLE                     hAdapter,
     IN_CONST_PDXGKARG_SETROOTPAGETABLE  pSetRootPageTable)
 {
@@ -759,7 +788,7 @@ VOID APIENTRY WinMaliDxgkStub_SetRootPageTable(
 // less than a full page is invalid for the page-table walker (UPDATE
 // would walk past the allocation). PAGE_SIZE is mandatory, not optional.
 //
-SIZE_T APIENTRY WinMaliDxgkStub_GetRootPageTableSize(
+SIZE_T APIENTRY WinMaliKmdGetRootPageTableSize(
     IN_CONST_HANDLE                     hAdapter,
     INOUT_PDXGKARG_GETROOTPAGETABLESIZE  pArgs)
 {
@@ -788,7 +817,7 @@ SIZE_T APIENTRY WinMaliDxgkStub_GetRootPageTableSize(
 // historically been treated as "driver claims GPU MMU but cannot satisfy
 // VIDMM" -> StopDevice. The no-op is harmless because we touch no state.
 //
-NTSTATUS APIENTRY WinMaliDxgkStub_MapCpuHostAperture(
+NTSTATUS APIENTRY WinMaliKmdMapCpuHostAperture(
     IN_CONST_HANDLE                         hAdapter,
     IN_CONST_PDXGKARG_MAPCPUHOSTAPERTURE    pMapCpuHostAperture)
 {
@@ -806,7 +835,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_MapCpuHostAperture(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_UnmapCpuHostAperture(
+NTSTATUS APIENTRY WinMaliKmdUnmapCpuHostAperture(
     IN_CONST_HANDLE                         hAdapter,
     IN_CONST_PDXGKARG_UNMAPCPUHOSTAPERTURE pArgs)
 {
@@ -847,7 +876,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_CheckMultiPlaneOverlaySupport2(
 // out slots, DestroyContext (or SetRootPageTable(Address=0)) returns them.
 // DestroyProcess only frees the per-process scaffolding.
 //
-NTSTATUS APIENTRY WinMaliDxgkStub_CreateProcess(
+NTSTATUS APIENTRY WinMaliKmdCreateProcess(
     IN_CONST_HANDLE             hAdapter,
     INOUT_PDXGKARG_CREATEPROCESS pArgs)
 {
@@ -892,7 +921,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_CreateProcess(
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_DestroyProcess(
+NTSTATUS APIENTRY WinMaliKmdDestroyProcess(
     IN_CONST_HANDLE hAdapter,
     IN_CONST_HANDLE hKmdProcess)
 {
@@ -1004,7 +1033,7 @@ NTSTATUS APIENTRY WinMaliDxgkStub_ValidateUpdateAllocationProperty(
     return STATUS_NOT_SUPPORTED;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_ControlModeBehavior(
+NTSTATUS APIENTRY WinMaliKmdControlModeBehavior(
     IN_CONST_HANDLE                         hAdapter,
     INOUT_PDXGKARG_CONTROLMODEBEHAVIOR       pControlModeBehavior)
 {
@@ -1022,27 +1051,42 @@ NTSTATUS APIENTRY WinMaliDxgkStub_ControlModeBehavior(
     // mode-behaviour bookkeeping and result in the device being stopped
     // when it later cannot reconcile our "satisfied" claim against runtime.
     //
-    // Until we wire real mode-behaviour handling (we have one always-on
-    // GOP-backed HDMI target; no clone, no rotation, no power-aware mode
-    // switching), the safe answer is "I satisfy nothing; I reject all of
-    // your requests" - i.e. Satisfied = 0, NotSatisfied = Request. dxgk
-    // then knows the requested behaviours won't be enforced and proceeds
-    // with the default VidPn model.
+    // Current bring-up evidence says the opposite is safer on Win11: if we
+    // reject every requested bit, dxgkrnl may stop the display path before
+    // it even materializes the monitor / VidPn callbacks. For our one fixed
+    // GOP-backed output, accept the requested startup behaviour wholesale and
+    // let the later display DDIs (child status, monitor modes, VidPn walk)
+    // constrain the actual topology and timings.
     //
-    if (pControlModeBehavior != NULL) {
-        pControlModeBehavior->Satisfied.Value    = 0;
-        pControlModeBehavior->NotSatisfied.Value = pControlModeBehavior->Request.Value;
+    if (pControlModeBehavior == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
+
+    pControlModeBehavior->Satisfied.Value    = pControlModeBehavior->Request.Value;
+    pControlModeBehavior->NotSatisfied.Value = 0;
+
+    WINMALI_TRACE(
+        "ControlModeBehavior: request=0x%08x satisfied=0x%08x notSatisfied=0x%08x",
+        pControlModeBehavior->Request.Value,
+        pControlModeBehavior->Satisfied.Value,
+        pControlModeBehavior->NotSatisfied.Value);
     return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_UpdateMonitorLinkInfo(
+NTSTATUS APIENTRY WinMaliKmdUpdateMonitorLinkInfo(
     IN_CONST_HANDLE                         hAdapter,
     INOUT_PDXGKARG_UPDATEMONITORLINKINFO    pUpdateMonitorLinkInfo)
 {
+    PWINMALI_ADAPTER adapter;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pUpdateMonitorLinkInfo);
-    return STATUS_NOT_SUPPORTED;
+
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL || pUpdateMonitorLinkInfo == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS APIENTRY WinMaliDxgkStub_CreateHwContext(
@@ -1156,17 +1200,30 @@ NTSTATUS APIENTRY WinMaliDxgkStub_SetTargetAnalogCopyProtection(
     return STATUS_NOT_SUPPORTED;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_SetTargetAdjustedColorimetry(
+NTSTATUS APIENTRY WinMaliKmdSetTargetAdjustedColorimetry(
     IN_CONST_HANDLE                    hAdapter,
     IN D3DDDI_VIDEO_PRESENT_TARGET_ID  TargetId,
     IN DXGK_COLORIMETRY                AdjustedColorimetry)
 {
+    PWINMALI_ADAPTER adapter;
+
     WM_STUB_ENTER();
-    WM_UNREF3(hAdapter, TargetId, AdjustedColorimetry);
-    return STATUS_NOT_SUPPORTED;
+
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (TargetId != (D3DDDI_VIDEO_PRESENT_TARGET_ID)adapter->PrimaryConnector
+        && TargetId != D3DDDI_ID_UNINITIALIZED)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    WM_UNREF1(AdjustedColorimetry);
+    return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_DisplayDetectControl(
+NTSTATUS APIENTRY WinMaliKmdDisplayDetectControl(
     IN_CONST_HANDLE                         hAdapter,
     IN_CONST_PDXGKARG_DISPLAYDETECTCONTROL  pDisplayDetectControl)
 {
@@ -1221,16 +1278,25 @@ NTSTATUS APIENTRY WinMaliDxgkStub_DisplayDetectControl(
     }
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_QueryConnectionChange(
+NTSTATUS APIENTRY WinMaliKmdQueryConnectionChange(
     IN_CONST_HANDLE                        hAdapter,
     IN_PDXGKARG_QUERYCONNECTIONCHANGE       pQueryConnectionChange)
 {
+    PWINMALI_ADAPTER adapter;
+
     WM_STUB_ENTER();
-    WM_UNREF2(hAdapter, pQueryConnectionChange);
-    return STATUS_NOT_SUPPORTED;
+
+    adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+    if (adapter == NULL || pQueryConnectionChange == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // No HPD queue yet (AlwaysConnected model): report no pending changes.
+    RtlZeroMemory(pQueryConnectionChange, sizeof(*pQueryConnectionChange));
+    return STATUS_SUCCESS;
 }
 
-NTSTATUS APIENTRY WinMaliDxgkStub_ExchangePreStartInfo(
+NTSTATUS APIENTRY WinMaliKmdExchangePreStartInfo(
     IN_CONST_HANDLE             hAdapter,
     IN_OUT_PDXGK_PRE_START_INFO pPreStartInfo)
 {
@@ -1922,7 +1988,7 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiCommitVidPn = WinMaliKmdCommitVidPn;
     p->DxgkDdiUpdateActiveVidPnPresentPath = WinMaliKmdUpdateActiveVidPnPresentPath;
     p->DxgkDdiRecommendMonitorModes = WinMaliKmdRecommendMonitorModes;
-    p->DxgkDdiRecommendVidPnTopology = WinMaliDxgkStub_RecommendVidPnTopology;
+    p->DxgkDdiRecommendVidPnTopology = WinMaliKmdRecommendVidPnTopology;
     p->DxgkDdiGetScanLine = WinMaliDxgkStub_GetScanLine;
     p->DxgkDdiStopCapture = WinMaliDxgkStub_StopCapture;
     p->DxgkDdiControlInterrupt = WinMaliKmdControlInterrupt;
@@ -1938,10 +2004,10 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiFlipOverlay = WinMaliDxgkStub_FlipOverlay;
     p->DxgkDdiDestroyOverlay = WinMaliDxgkStub_DestroyOverlay;
 
-    p->DxgkDdiCreateContext = WinMaliDxgkStub_CreateContext;
-    p->DxgkDdiDestroyContext = WinMaliDxgkStub_DestroyContext;
+    p->DxgkDdiCreateContext = WinMaliKmdCreateContext;
+    p->DxgkDdiDestroyContext = WinMaliKmdDestroyContext;
 
-    p->DxgkDdiLinkDevice = WinMaliDxgkStub_LinkDevice;
+    p->DxgkDdiLinkDevice = WinMaliKmdLinkDevice;
     p->DxgkDdiSetDisplayPrivateDriverFormat = WinMaliDxgkStub_SetDisplayPrivateDriverFormat;
 
     p->DxgkDdiDescribePageTable = NULL;
@@ -1956,13 +2022,13 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiRenderKm = WinMaliKmdRender;
 
     p->DxgkDdiSetPowerComponentFState = WinMaliDxgkStub_SetPowerComponentFState;
-    p->DxgkDdiQueryDependentEngineGroup = WinMaliDxgkStub_QueryDependentEngineGroup;
-    p->DxgkDdiQueryEngineStatus = WinMaliDxgkStub_QueryEngineStatus;
+    p->DxgkDdiQueryDependentEngineGroup = WinMaliKmdQueryDependentEngineGroup;
+    p->DxgkDdiQueryEngineStatus = WinMaliKmdQueryEngineStatus;
     p->DxgkDdiResetEngine = WinMaliDxgkStub_ResetEngine;
     p->DxgkDdiStopDeviceAndReleasePostDisplayOwnership =
         WinMaliKmdStopDeviceAndReleasePostDisplayOwnership;
-    p->DxgkDdiSystemDisplayEnable = WinMaliDxgkStub_SystemDisplayEnable;
-    p->DxgkDdiSystemDisplayWrite = WinMaliDxgkStub_SystemDisplayWrite;
+    p->DxgkDdiSystemDisplayEnable = WinMaliKmdSystemDisplayEnable;
+    p->DxgkDdiSystemDisplayWrite = WinMaliKmdSystemDisplayWrite;
     p->DxgkDdiCancelCommand = WinMaliKmdCancelCommand;
     p->DxgkDdiGetChildContainerId = WinMaliDxgkStub_GetChildContainerId;
     p->DxgkDdiPowerRuntimeControlRequest = WinMaliDxgkStub_PowerRuntimeControlRequest;
@@ -1979,13 +2045,13 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
 
     p->DxgkDdiRenderGdi = WinMaliDxgkStub_RenderGdi;
     p->DxgkDdiSubmitCommandVirtual = WinMaliDxgkStub_SubmitCommandVirtual;
-    p->DxgkDdiSetRootPageTable = WinMaliDxgkStub_SetRootPageTable;
-    p->DxgkDdiGetRootPageTableSize = WinMaliDxgkStub_GetRootPageTableSize;
-    p->DxgkDdiMapCpuHostAperture = WinMaliDxgkStub_MapCpuHostAperture;
-    p->DxgkDdiUnmapCpuHostAperture = WinMaliDxgkStub_UnmapCpuHostAperture;
+    p->DxgkDdiSetRootPageTable = WinMaliKmdSetRootPageTable;
+    p->DxgkDdiGetRootPageTableSize = WinMaliKmdGetRootPageTableSize;
+    p->DxgkDdiMapCpuHostAperture = WinMaliKmdMapCpuHostAperture;
+    p->DxgkDdiUnmapCpuHostAperture = WinMaliKmdUnmapCpuHostAperture;
     p->DxgkDdiCheckMultiPlaneOverlaySupport2 = WinMaliDxgkStub_CheckMultiPlaneOverlaySupport2;
-    p->DxgkDdiCreateProcess = WinMaliDxgkStub_CreateProcess;
-    p->DxgkDdiDestroyProcess = WinMaliDxgkStub_DestroyProcess;
+    p->DxgkDdiCreateProcess = WinMaliKmdCreateProcess;
+    p->DxgkDdiDestroyProcess = WinMaliKmdDestroyProcess;
     p->DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2 =
         WinMaliDxgkStub_SetVidPnSourceAddressWithMultiPlaneOverlay2;
     p->Reserved1 = NULL;
@@ -1999,8 +2065,8 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
         WinMaliDxgkStub_SetVidPnSourceAddressWithMultiPlaneOverlay3;
     p->DxgkDdiPostMultiPlaneOverlayPresent = WinMaliDxgkStub_PostMultiPlaneOverlayPresent;
     p->DxgkDdiValidateUpdateAllocationProperty = WinMaliDxgkStub_ValidateUpdateAllocationProperty;
-    p->DxgkDdiControlModeBehavior = WinMaliDxgkStub_ControlModeBehavior;
-    p->DxgkDdiUpdateMonitorLinkInfo = WinMaliDxgkStub_UpdateMonitorLinkInfo;
+    p->DxgkDdiControlModeBehavior = WinMaliKmdControlModeBehavior;
+    p->DxgkDdiUpdateMonitorLinkInfo = WinMaliKmdUpdateMonitorLinkInfo;
 
     p->DxgkDdiCreateHwContext = WinMaliDxgkStub_CreateHwContext;
     p->DxgkDdiDestroyHwContext = WinMaliDxgkStub_DestroyHwContext;
@@ -2015,10 +2081,10 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiSetTargetGamma = WinMaliDxgkStub_SetTargetGamma;
     p->DxgkDdiSetTargetContentType = WinMaliDxgkStub_SetTargetContentType;
     p->DxgkDdiSetTargetAnalogCopyProtection = WinMaliDxgkStub_SetTargetAnalogCopyProtection;
-    p->DxgkDdiSetTargetAdjustedColorimetry = WinMaliDxgkStub_SetTargetAdjustedColorimetry;
-    p->DxgkDdiDisplayDetectControl = WinMaliDxgkStub_DisplayDetectControl;
-    p->DxgkDdiQueryConnectionChange = WinMaliDxgkStub_QueryConnectionChange;
-    p->DxgkDdiExchangePreStartInfo = WinMaliDxgkStub_ExchangePreStartInfo;
+    p->DxgkDdiSetTargetAdjustedColorimetry = WinMaliKmdSetTargetAdjustedColorimetry;
+    p->DxgkDdiDisplayDetectControl = WinMaliKmdDisplayDetectControl;
+    p->DxgkDdiQueryConnectionChange = WinMaliKmdQueryConnectionChange;
+    p->DxgkDdiExchangePreStartInfo = WinMaliKmdExchangePreStartInfo;
     p->DxgkDdiGetMultiPlaneOverlayCaps = WinMaliDxgkStub_GetMultiPlaneOverlayCaps;
     p->DxgkDdiGetPostCompositionCaps = WinMaliDxgkStub_GetPostCompositionCaps;
 

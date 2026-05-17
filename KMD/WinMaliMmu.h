@@ -21,10 +21,17 @@ typedef struct _WINMALI_ADAPTER WINMALI_ADAPTER, *PWINMALI_ADAPTER;
  * outstanding command submission) and small non-primary D3D allocations
  * into this region. 4 MiB proved too tight on some Win11 start paths
  * (DpiFdoStartAdapter rolling back with STATUS_NO_MEMORY immediately after
- * QUERYSEGMENT4 pass2). Use 16 MiB to give VIDMM headroom for early
- * paging/DMA buffer pools while keeping contiguous-allocation pressure low.
+ * QUERYSEGMENT4 pass2); 32 MiB was still under the 64 MiB floor that
+ * dxgmms2!VIDMM_GLOBAL::ReadCommitLimitInformation clamps
+ * `MinimumSystemMemoryCommitLimit` to (decomp dxgmms2.sys.c:89350:
+ * `if ((v7 << 20) <= 0x4000000) v1 = 0x4000000;`). When our reported
+ * segment is below that kernel-wide floor, dxgkrnl boots the system
+ * paging context, immediately tears it down, and PnP-stops the adapter
+ * — matching the smoke-test → StopDevice cascade observed at runtime.
+ * 128 MiB sits well above the floor while staying easy to satisfy as a
+ * contiguous allocation on a 4-16 GiB rk3588 board.
  */
-#define WINMALI_DMA_SEGMENT_BYTES (32UL * 1024UL * 1024UL)
+#define WINMALI_DMA_SEGMENT_BYTES (128UL * 1024UL * 1024UL)
 
 #if WINMALI_VIDMM_PAGING_BUFFER_BYTES > WINMALI_MMU_SCRATCH_HEAP_BYTES
 #error WINMALI_VIDMM_PAGING_BUFFER_BYTES must fit in WINMALI_MMU_SCRATCH_HEAP_BYTES

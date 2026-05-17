@@ -1313,33 +1313,16 @@ NTSTATUS APIENTRY WinMaliKmdExchangePreStartInfo(
     // POST display owner or transfer ownership to an indirect display
     // (Microsoft Basic Display) and surprise-remove us.
     //
-    //   SupportPreserveBootDisplay = 1
-    //       "I support keeping the UEFI/GOP framebuffer presenting
-    //        while my StartDevice runs; don't blank the screen and
-    //        don't fall back to the indirect display."
-    //   IsUEFIFrameBufferCpuAccessibleDuringStartup = 1
-    //       "The UEFI framebuffer is reachable by CPU during my
-    //        startup window so dxgk's sysdisplay / bug-check path
-    //        can write to it before SetVidPnSourceAddress fires."
-    //
-    // These are *capability assertions*, not state queries: dxgk calls
-    // ExchangePreStartInfo before StartDevice, so we have no
-    // DxgkInterface and therefore no GOP captured yet. We always claim
-    // both because RK3588 edk2 always boots via a UEFI GOP framebuffer,
-    // and we genuinely do support both behaviors via Rk3588DispCaptureGopFb
-    // in StartDevice and the kernel-mapped Gop.SystemDisplayVa for
-    // sysdisplay writes.
-    //
-    // Returning STATUS_SUCCESS with Output=0 (the old stub) caused
-    // dxgkrnl on Win11 build 26200 to surprise-remove us right after
-    // GetNodeMetadata via DxgkDdiStopDeviceAndReleasePostDisplayOwnership.
-    //
+    // Render-only conversion: this adapter no longer owns boot display,
+    // monitor targets, or sysdisplay writes. Advertising preserve-boot
+    // support here keeps dxgkrnl/DispBroker on the display-target path
+    // even though StartDevice later reports zero sources/children.
     pPreStartInfo->Output                                      = 0;
-    pPreStartInfo->SupportPreserveBootDisplay                  = 1;
-    pPreStartInfo->IsUEFIFrameBufferCpuAccessibleDuringStartup = 1;
+    pPreStartInfo->SupportPreserveBootDisplay                  = 0;
+    pPreStartInfo->IsUEFIFrameBufferCpuAccessibleDuringStartup = 0;
 
     WINMALI_TRACE(
-        "ExchangePreStartInfo: in=0x%08x out=0x%08x preserve=1 uefi_cpu=1",
+        "ExchangePreStartInfo: in=0x%08x out=0x%08x preserve=0 uefi_cpu=0",
         pPreStartInfo->Input,
         pPreStartInfo->Output);
 
@@ -1941,7 +1924,7 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     // ignored, which is correct because those stubs return NOT_SUPPORTED
     // anyway and shouldn't be advertised at the 2.4 surface.
     //
-    p->Version = DXGKDDI_INTERFACE_VERSION_WDDM2_4;
+    p->Version = DXGKDDI_INTERFACE_VERSION_WDDM2_0;
 
     p->DxgkDdiAddDevice = WinMaliKmdAddDevice;
     p->DxgkDdiStartDevice = WinMaliKmdStartDevice;
@@ -1972,27 +1955,27 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiSubmitCommand = WinMaliKmdSubmitCommand;
     p->DxgkDdiPreemptCommand = WinMaliKmdPreemptCommand;
     p->DxgkDdiBuildPagingBuffer = WinMaliKmdBuildPagingBuffer;
-    p->DxgkDdiSetPalette = WinMaliDxgkStub_SetPalette;
-    p->DxgkDdiSetPointerPosition = WinMaliDxgkStub_SetPointerPosition;
-    p->DxgkDdiSetPointerShape = WinMaliDxgkStub_SetPointerShape;
+    p->DxgkDdiSetPalette = NULL;
+    p->DxgkDdiSetPointerPosition = NULL;
+    p->DxgkDdiSetPointerShape = NULL;
     p->DxgkDdiResetFromTimeout = WinMaliKmdResetFromTimeout;
     p->DxgkDdiRestartFromTimeout = WinMaliKmdRestartFromTimeout;
     p->DxgkDdiEscape = WinMaliKmdEscape;
     p->DxgkDdiCollectDbgInfo = WinMaliDxgkStub_CollectDbgInfo;
     p->DxgkDdiQueryCurrentFence = WinMaliKmdQueryCurrentFence;
-    p->DxgkDdiIsSupportedVidPn = WinMaliKmdIsSupportedVidPn;
-    p->DxgkDdiRecommendFunctionalVidPn = WinMaliKmdRecommendFunctionalVidPn;
-    p->DxgkDdiEnumVidPnCofuncModality = WinMaliKmdEnumVidPnCofuncModality;
-    p->DxgkDdiSetVidPnSourceAddress = Rk3588DispSetVidPnSourceAddress;
-    p->DxgkDdiSetVidPnSourceVisibility = WinMaliKmdSetVidPnSourceVisibility;
-    p->DxgkDdiCommitVidPn = WinMaliKmdCommitVidPn;
-    p->DxgkDdiUpdateActiveVidPnPresentPath = WinMaliKmdUpdateActiveVidPnPresentPath;
-    p->DxgkDdiRecommendMonitorModes = WinMaliKmdRecommendMonitorModes;
-    p->DxgkDdiRecommendVidPnTopology = WinMaliKmdRecommendVidPnTopology;
-    p->DxgkDdiGetScanLine = WinMaliDxgkStub_GetScanLine;
-    p->DxgkDdiStopCapture = WinMaliDxgkStub_StopCapture;
+    p->DxgkDdiIsSupportedVidPn = NULL;
+    p->DxgkDdiRecommendFunctionalVidPn = NULL;
+    p->DxgkDdiEnumVidPnCofuncModality = NULL;
+    p->DxgkDdiSetVidPnSourceAddress = NULL;
+    p->DxgkDdiSetVidPnSourceVisibility = NULL;
+    p->DxgkDdiCommitVidPn = NULL;
+    p->DxgkDdiUpdateActiveVidPnPresentPath = NULL;
+    p->DxgkDdiRecommendMonitorModes = NULL;
+    p->DxgkDdiRecommendVidPnTopology = NULL;
+    p->DxgkDdiGetScanLine = NULL;
+    p->DxgkDdiStopCapture = NULL;
     p->DxgkDdiControlInterrupt = WinMaliKmdControlInterrupt;
-    p->DxgkDdiCreateOverlay = WinMaliDxgkStub_CreateOverlay;
+    p->DxgkDdiCreateOverlay = NULL;
 
     p->DxgkDdiDestroyDevice = WinMaliKmdDestroyDevice;
     p->DxgkDdiOpenAllocation = WinMaliKmdOpenAllocation;
@@ -2000,15 +1983,15 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiRender = WinMaliKmdRender;
     p->DxgkDdiPresent = WinMaliDxgkStub_Present;
 
-    p->DxgkDdiUpdateOverlay = WinMaliDxgkStub_UpdateOverlay;
-    p->DxgkDdiFlipOverlay = WinMaliDxgkStub_FlipOverlay;
-    p->DxgkDdiDestroyOverlay = WinMaliDxgkStub_DestroyOverlay;
+    p->DxgkDdiUpdateOverlay = NULL;
+    p->DxgkDdiFlipOverlay = NULL;
+    p->DxgkDdiDestroyOverlay = NULL;
 
     p->DxgkDdiCreateContext = WinMaliKmdCreateContext;
     p->DxgkDdiDestroyContext = WinMaliKmdDestroyContext;
 
-    p->DxgkDdiLinkDevice = WinMaliKmdLinkDevice;
-    p->DxgkDdiSetDisplayPrivateDriverFormat = WinMaliDxgkStub_SetDisplayPrivateDriverFormat;
+    p->DxgkDdiLinkDevice = NULL;
+    p->DxgkDdiSetDisplayPrivateDriverFormat = NULL;
 
     p->DxgkDdiDescribePageTable = NULL;
     p->DxgkDdiUpdatePageTable = NULL;
@@ -2017,7 +2000,7 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiSubmitRender = NULL;
     p->DxgkDdiCreateAllocation2 = NULL;
     p->Reserved = NULL;
-    p->DxgkDdiQueryVidPnHWCapability = WinMaliDxgkStub_QueryVidPnHWCapability;
+    p->DxgkDdiQueryVidPnHWCapability = NULL;
 
     p->DxgkDdiRenderKm = WinMaliKmdRender;
 
@@ -2025,12 +2008,11 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiQueryDependentEngineGroup = WinMaliKmdQueryDependentEngineGroup;
     p->DxgkDdiQueryEngineStatus = WinMaliKmdQueryEngineStatus;
     p->DxgkDdiResetEngine = WinMaliDxgkStub_ResetEngine;
-    p->DxgkDdiStopDeviceAndReleasePostDisplayOwnership =
-        WinMaliKmdStopDeviceAndReleasePostDisplayOwnership;
-    p->DxgkDdiSystemDisplayEnable = WinMaliKmdSystemDisplayEnable;
-    p->DxgkDdiSystemDisplayWrite = WinMaliKmdSystemDisplayWrite;
+    p->DxgkDdiStopDeviceAndReleasePostDisplayOwnership = NULL;
+    p->DxgkDdiSystemDisplayEnable = NULL;
+    p->DxgkDdiSystemDisplayWrite = NULL;
     p->DxgkDdiCancelCommand = WinMaliKmdCancelCommand;
-    p->DxgkDdiGetChildContainerId = WinMaliDxgkStub_GetChildContainerId;
+    p->DxgkDdiGetChildContainerId = NULL;
     p->DxgkDdiPowerRuntimeControlRequest = WinMaliDxgkStub_PowerRuntimeControlRequest;
     p->DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay =
         WinMaliDxgkStub_SetVidPnSourceAddressWithMultiPlaneOverlay;
@@ -2066,7 +2048,7 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiPostMultiPlaneOverlayPresent = WinMaliDxgkStub_PostMultiPlaneOverlayPresent;
     p->DxgkDdiValidateUpdateAllocationProperty = WinMaliDxgkStub_ValidateUpdateAllocationProperty;
     p->DxgkDdiControlModeBehavior = WinMaliKmdControlModeBehavior;
-    p->DxgkDdiUpdateMonitorLinkInfo = WinMaliKmdUpdateMonitorLinkInfo;
+    p->DxgkDdiUpdateMonitorLinkInfo = NULL;
 
     p->DxgkDdiCreateHwContext = WinMaliDxgkStub_CreateHwContext;
     p->DxgkDdiDestroyHwContext = WinMaliDxgkStub_DestroyHwContext;
@@ -2081,9 +2063,9 @@ WinMaliDxgkPatchInitializationData(_Inout_ PDRIVER_INITIALIZATION_DATA p)
     p->DxgkDdiSetTargetGamma = WinMaliDxgkStub_SetTargetGamma;
     p->DxgkDdiSetTargetContentType = WinMaliDxgkStub_SetTargetContentType;
     p->DxgkDdiSetTargetAnalogCopyProtection = WinMaliDxgkStub_SetTargetAnalogCopyProtection;
-    p->DxgkDdiSetTargetAdjustedColorimetry = WinMaliKmdSetTargetAdjustedColorimetry;
-    p->DxgkDdiDisplayDetectControl = WinMaliKmdDisplayDetectControl;
-    p->DxgkDdiQueryConnectionChange = WinMaliKmdQueryConnectionChange;
+    p->DxgkDdiSetTargetAdjustedColorimetry = NULL;
+    p->DxgkDdiDisplayDetectControl = NULL;
+    p->DxgkDdiQueryConnectionChange = NULL;
     p->DxgkDdiExchangePreStartInfo = WinMaliKmdExchangePreStartInfo;
     p->DxgkDdiGetMultiPlaneOverlayCaps = WinMaliDxgkStub_GetMultiPlaneOverlayCaps;
     p->DxgkDdiGetPostCompositionCaps = WinMaliDxgkStub_GetPostCompositionCaps;

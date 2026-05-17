@@ -1,12 +1,12 @@
 ;
 ; WinMaliKmd.inx
 ;
-; Installs the WinMali full-graphics WDDM miniport for the Mali-G610 GPU
+; Installs the WinMali render-only WDDM miniport for the Mali-G610 GPU
 ; on RK3588 (ACPI HID ARMH5655 as exported by edk2-rk3588's gpu.asl).
 ;
-; This is the unified Mali-render + VOP2-display "Full Graphics" driver:
-; Windows 11 client refuses to use a render-only adapter as the primary
-; DWM target, so we publish a single adapter that owns both pieces.
+; Display ownership is intentionally split out. This package exposes only
+; the render/MMU scheduling path; VOP2/display is expected to live in a
+; separate display driver.
 ;
 
 [Version]
@@ -51,8 +51,8 @@ AddReg       = WinMaliKmd.GraphicsDrivers.AddReg
 AddService = WinMaliKmd, 0x00000002, WinMaliKmd.Service, WinMaliKmd.EventLog
 
 ;
-; Service installation. LoadOrderGroup = Video is REQUIRED for a full
-; graphics driver: it places us in the boot phase where dxgkrnl/dxgmms2
+; Service installation. LoadOrderGroup = Video is still required so this
+; WDDM miniport comes up in the phase where dxgkrnl/dxgmms2
 ; are already initialized and can construct the per-adapter PnP registry
 ; path that VIDMM_GLOBAL::ReadPhysicalAdapterConfiguration walks. Without
 ; it, VIDMM tried to look us up before our PnP registry node existed and
@@ -80,7 +80,7 @@ WinMaliKmd.sys
 WinMaliUmd.dll
 
 ;
-; HKR (per-device) software settings.
+; HKR (per-device) software settings for the render-only adapter.
 ;
 ; WDDMVersion MUST match what we report in DXGK_DRIVERCAPS / WDDMDEVICECAPS /
 ; UMDRIVERPRIVATE at QueryAdapterInfo time. Bumped from 0x2000 to 0x2400 to
@@ -100,11 +100,9 @@ HKR,, VgaCompatible,         %REG_DWORD%, 0
 HKR,, WDDMVersion,           %REG_DWORD%, 0x2400  ; WDDM 2.4
 
 ;
-; HKLM (machine-wide) graphics-driver knobs. Every WDDM full graphics
-; driver I've cribbed from sets these. Without them, dxgmms2's TDR /
-; preemption / direct-flip code paths read uninitialized values out of
-; the registry and either misbehave or crash. The values mirror the
-; render-only sample (malicsf) from windows-driver-samples.
+; HKLM (machine-wide) graphics-driver knobs mirrored from the render-only
+; sample. They keep dxgmms2's scheduler/TDR paths on known values even
+; though this adapter no longer owns scan-out.
 ;
 [WinMaliKmd.GraphicsDrivers.AddReg]
 HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",       EnablePreemption,            %REG_DWORD%, 0
@@ -114,7 +112,7 @@ HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager",   Direct
 [Strings]
 ProviderName           = "WinMali Project"
 DiskName               = "WinMali Driver Disk"
-WinMaliKmd.DeviceDesc  = "Mali-G610 GPU + RK3588 Display (WinMali)"
+WinMaliKmd.DeviceDesc  = "Mali-G610 GPU Render-Only (WinMali)"
 REG_MULTI_SZ           = 0x00010000
 REG_EXPAND_SZ          = 0x00020000
 REG_DWORD              = 0x00010001

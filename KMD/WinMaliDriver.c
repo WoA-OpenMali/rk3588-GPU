@@ -7,6 +7,40 @@
 #define WINMALI_KMD_MAJOR   0
 #define WINMALI_KMD_MINOR   1
 
+//
+// WINMALI_QAI_COPYOUT — safe copy-out for a QueryAdapterInfo handler that
+// fills a struct.
+//
+// Why this exists: dxgk's pOutputData buffer is sized to whatever the running
+// kernel's sizeof(DXGK_*) is. The driver is compiled against a WDK header,
+// which may be newer (bigger struct) or older (smaller). Writing through the
+// caller's pointer with our WDK's full struct layout scribbles past the
+// kernel's buffer; requiring sizeof(WDK_struct) returns BUFFER_TOO_SMALL on
+// every older kernel. The right answer is: build into a local, then bounded-
+// copy. Trailing bytes in the (larger) caller buffer stay zero.
+//
+// Usage:
+//   case DXGKQAITYPE_FOO: {
+//       DXGK_FOO local;
+//       if (pQueryAdapterInfo->pOutputData == NULL ||
+//           pQueryAdapterInfo->OutputDataSize == 0) {
+//           return STATUS_BUFFER_TOO_SMALL;
+//       }
+//       RtlZeroMemory(&local, sizeof(local));
+//       local.X = ...;
+//       WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &local);
+//       return STATUS_SUCCESS;
+//   }
+//
+#define WINMALI_QAI_COPYOUT(_pQai, _pLocal)                                                          \
+    do {                                                                                             \
+        SIZE_T _qaiOutSz = (SIZE_T)(_pQai)->OutputDataSize;                                          \
+        SIZE_T _qaiLclSz = sizeof(*(_pLocal));                                                       \
+        SIZE_T _qaiCopy  = (_qaiOutSz < _qaiLclSz) ? _qaiOutSz : _qaiLclSz;                          \
+        RtlZeroMemory((_pQai)->pOutputData, _qaiOutSz);                                              \
+        RtlCopyMemory((_pQai)->pOutputData, (_pLocal), _qaiCopy);                                    \
+    } while (0)
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -70,6 +104,13 @@ WinMaliAdapterFromDxgkHandle(_In_opt_ const VOID* hAdapter)
         return adapter;
     }
     return NULL;
+}
+
+static BOOLEAN
+WinMaliKmdIsRenderOnlyAdapter_(_In_opt_ const WINMALI_ADAPTER* adapter)
+{
+    return (adapter != NULL
+            && adapter->PrimaryConnector == D3DDDI_ID_UNINITIALIZED);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,46 +303,21 @@ WinMaliKmdStartDevice(
         }
     }
 
-    adapter->StartedDevice             = TRUE;
-    adapter->StartDeviceEverSucceeded  = TRUE;
-    //
-    // PrimaryConnector is currently a fixed UID we use as both the
-    // ChildUid in QueryChildRelations and the VidPnTargetId in our one
-    // recommended path. UID 0 is fine; using 1 confused some dxgkrnl
-    // versions because the source/target IDs are also zero-based. The
-    // VOP2 connector ID (e.g. Vop2DispConnHdmi0=0) maps to this once we
-    // wire vop2connectors.c.
-    //
-    adapter->PrimaryConnector = 0;
-    Rk3588DispCaptureGopFb(adapter);
-    {
-        NTSTATUS voSt = WinMaliVop2SetupSysmemScanout(adapter);
-        if (!NT_SUCCESS(voSt)) {
-            WINMALI_WARN(
-                "WinMaliVop2SetupSysmemScanout failed 0x%08x — "
-                "single-segment render-only path, primaries stay on seg 1",
-                voSt);
-        }
-    }
+    adapter->StartedDevice            = TRUE;
+    adapter->StartDeviceEverSucceeded = TRUE;
 
-    //
-    // Sources: one VidPN source (the desktop). We always claim 1 so the
-    // OS can build a desktop topology even if GOP capture failed.
-    // Children: expose the primary connector unconditionally, matching
-    // BasicDisplay's display-first bring-up. QueryDeviceDescriptor already
-    // warns if the synthesized 1080p EDID doesn't match the captured GOP.
-    //
+    // Render-only mode: this adapter owns no VidPn sources or children.
+    // VOP2/display ownership will move to a separate display miniport.
+    adapter->PrimaryConnector = D3DDDI_ID_UNINITIALIZED;
+
     if (NumberOfVideoPresentSources != NULL) {
-        *NumberOfVideoPresentSources = 1;
+        *NumberOfVideoPresentSources = 0;
     }
     if (NumberOfChildren != NULL) {
-        *NumberOfChildren = 1u;
+        *NumberOfChildren = 0;
     }
 
-    WINMALI_TRACE("StartDevice OK: sources=1 children=%u gop_valid=%u "
-                  "mmio_mapped=%u irq_ok=%u",
-                  1u,
-                  (ULONG)adapter->Gop.Valid,
+    WINMALI_TRACE("StartDevice OK: render-only sources=0 children=0 mmio_mapped=%u irq_ok=%u",
                   adapter->GpuRegsMapped,
                   adapter->InterruptConnected);
     return STATUS_SUCCESS;
@@ -447,8 +463,9 @@ WinMaliBuildSegmentList_(
     RtlZeroMemory(descs, sizeof(WINMALI_SEGMENT_DESC) * 2u);
 
     //
-    // Segment id 1: dedicated PopulatedFromSystemMemory + CpuVisible block
-    // backing kernel DMA buffers and small non-primary D3D allocations.
+    // Single-segment render-only model: publish only the CPU-visible,
+    // PopulatedFromSystemMemory block backing kernel DMA buffers, page
+    // tables, and general D3D allocations.
     //
     // History:
     //   * v1 attempted a 64 MB Aperture=1 segment here. With every flag
@@ -490,49 +507,10 @@ WinMaliBuildSegmentList_(
     }
 
     //
-    // Segment id 2: same slab WinMaliVop2SetupSysmemScanout allocates —
-    // contiguous cached CPU RAM, copied from the GOP image then handed
-    // to VOP2 via YRGB_MST. PopulatedFromSystemMemory + CpuVisible +
-    // DirectFlip + LocalBudgetGroup — accepted by dxgk as a pair with
-    // segment 1 (both sysmem-class), unlike the old BIOS-reserved GOP PA.
     //
-    if (adapter != NULL
-        && adapter->ScanoutSegmentVa != NULL
-        && adapter->ScanoutSegmentBytes != 0)
-    {
-        descs[n].SegmentId                     = WINMALI_GOP_SEGMENT_ID;
-        descs[n].Size                          = adapter->ScanoutSegmentBytes;
-        descs[n].BaseAddress.QuadPart          = (LONGLONG)WINMALI_GOP_GPU_BASE;
-        descs[n].CpuTranslatedAddress          = adapter->ScanoutSegmentPhys;
-        descs[n].Flags =
-            WINMALI_SEGFLAG_CPU_VISIBLE
-          | WINMALI_SEGFLAG_POP_SYSMEM
-          | WINMALI_SEGFLAG_DIRECT_FLIP
-          | WINMALI_SEGFLAG_NONLOCAL_BUDGET;
-        ++n;
-    }
-
-    //
-    // Historical note: publishing BIOS-reserved GOP PA as segment id 2
-    // alongside segment 1 failed dxgk validation (StopDevice after
-    // QUERYSEGMENT4). Segment id 2 is now driver-allocated contiguous
-    // sysmem (see WinMaliVop2SetupSysmemScanout).
-    //
-    // Phase 2 (VOP2 sprint) brings up the VOP2 IP, allocates a real
-    // sysmem-backed primary slab, publishes it as id 2 with
-    // CpuVisible + DirectFlip + LocalBudgetGroup, sets DRIVERCAPS
-    // .MemoryManagementCaps.SectionBackedPrimary=1 and
-    // .SupportDirectFlip=1, and points VOP2's VP-A scan-out address at
-    // each new flip target via SetVidPnSourceAddress. At that point the
-    // 2-segment publication is a sysmem+sysmem pair, which is the topology
-    // dxgk accepts under GpuMmu.
-    //
-
-    //
-    // Belt-and-braces fallback: if neither the aperture nor the GOP was
-    // available (out of pool, no GOP capture), expose the static MMU scratch
-    // heap as a single sysmem segment so VIDMM at least has SOMETHING to
-    // bind to. Without this dxgkrnl aborts with no segments published.
+    // Belt-and-braces fallback: if the DMA segment is unavailable, expose the
+    // static MMU scratch heap as the one and only sysmem segment so VIDMM at
+    // least has something to bind to.
     //
     // Even the fallback descriptor uses WINMALI_APERTURE_GPU_BASE because
     // PHYSICALADAPTERCAPS.MinimumAddress is 0x10000 and the raw
@@ -572,46 +550,36 @@ WinMaliKmdQueryAdapterInfoImpl(
     switch (pQueryAdapterInfo->Type) {
 
     case DXGKQAITYPE_DRIVERCAPS: {
-        DXGK_DRIVERCAPS* caps = (DXGK_DRIVERCAPS*)pQueryAdapterInfo->pOutputData;
+        //
+        // Lenient struct-size pattern: build into a local of our WDK's full
+        // size, then bounded-copy back. Older kernels send a smaller buffer
+        // than our WDK's sizeof(DXGK_DRIVERCAPS); newer kernels may send
+        // larger. Both directions are handled safely without ever scribbling
+        // past the caller's buffer.
+        //
+        // History: requiring sizeof(*caps) or FIELD_OFFSET to a recent field
+        // (MaxHwQueuedFlips at offset 580) caused STATUS_BUFFER_TOO_SMALL on
+        // a Win11 26100 kernel whose internal DXGK_DRIVERCAPS is 576 bytes,
+        // and earlier zeroed past the end of dxgk's buffer when the in-place
+        // write pattern was used. See report 2026-05-13 ~01:48.
+        //
+        DXGK_DRIVERCAPS  local;
+        DXGK_DRIVERCAPS* caps  = &local;
         SIZE_T           outSz = pQueryAdapterInfo->OutputDataSize;
 
-        //
-        // Buffer sizing follows the negotiated DDI surface in
-        // DRIVER_INITIALIZATION_DATA.Version (WinMaliDxgkInitFill.c pins
-        // DXGKDDI_INTERFACE_VERSION_WDDM2_4). On Win11 26100 dxgk passes
-        // OutputDataSize = 584 for DRIVERCAPS — the layout through MiscCaps
-        // only. Our WDK still compiles DXGK_DRIVERCAPS with the WDDM2_9 tail
-        // (MaxHwQueuedFlips + HwQueuedFlipCaps), so sizeof(*caps) == 592.
-        //
-        // Requiring sizeof(*caps) caused STATUS_BUFFER_TOO_SMALL / invalid
-        // reject; RtlZeroMemory(caps, sizeof(*caps)) also scribbled 8 bytes
-        // past the end of dxgk's 584-byte buffer (undefined behaviour).
-        //
-#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_9)
-        CONST SIZE_T kDriverCapsMinOut = FIELD_OFFSET(DXGK_DRIVERCAPS, MaxHwQueuedFlips);
-#else
-        CONST SIZE_T kDriverCapsMinOut = sizeof(DXGK_DRIVERCAPS);
-#endif
-        if (caps == NULL) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if (outSz < kDriverCapsMinOut) {
-            WINMALI_WARN(
-                "DRIVERCAPS: buffer too small have=%Iu need>=%Iu fullStruct=%Iu",
-                outSz,
-                kDriverCapsMinOut,
-                (SIZE_T)sizeof(DXGK_DRIVERCAPS));
+        if (pQueryAdapterInfo->pOutputData == NULL || outSz == 0) {
+            WINMALI_WARN("DRIVERCAPS: NULL or empty output buffer (size=%Iu)", outSz);
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        RtlZeroMemory(caps, outSz);
+        RtlZeroMemory(caps, sizeof(*caps));
 
         //
         // DRIVERCAPS payload mirrored from render-only-sample
-        // (roskmd\RosKmdAdapter.cpp DXGKQAITYPE_DRIVERCAPS) with the
-        // "display" sub-block from its !IsRenderOnly() branch, because
-        // our WinMali KMD is the unified Mali render + RK3588 VOP2
-        // display "Full Graphics" adapter.
+        // (roskmd\RosKmdAdapter.cpp DXGKQAITYPE_DRIVERCAPS), now taking
+        // the render-only branch. VOP2/display ownership moves to a
+        // separate display miniport, so this adapter advertises only the
+        // render/MMU scheduling surface.
         //
         // Most-important consistency invariants dxgk validates here on
         // Win11 26200:
@@ -631,7 +599,7 @@ WinMaliKmdQueryAdapterInfoImpl(
         //     We are setting neither for now; primary lives in our
         //     normal segment once we add real VRAM.
         //
-        caps->WDDMVersion = DXGKDDI_WDDMv2_4;
+        caps->WDDMVersion = DXGKDDI_WDDMv2;
         caps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
 
         //
@@ -647,33 +615,18 @@ WinMaliKmdQueryAdapterInfoImpl(
         caps->PresentationCaps.MaxTextureHeightShift          = 3;   // 16K
 
         //
-        // FlipCaps: full-graphics adapter, so we copy the !IsRenderOnly()
-        // arm of the sample. MaxQueuedFlipOnVSync = 1 says the hardware
-        // can store one pending flip; FlipOnVSyncMmIo + FlipOnVSyncWithNoWait
-        // says "I program the new source address immediately and it
-        // latches at the next VSync".
+        // Render-only branch: keep only FlipOnVSyncMmIo, matching the
+        // sample's base path. DirectFlip / independent flip and the rest of
+        // the display-present contract stay disabled.
         //
-        // FlipIndependent / SupportDirectFlip: RtlZeroMemory leaves them
-        // false / zero. When WinMaliVop2SetupSysmemScanout succeeds we
-        // publish segment id 2 with DirectFlip and enable the trio at the
-        // end of this case (before TRACE); see WinMaliBuildSegmentList_.
-        //
-        caps->MaxQueuedFlipOnVSync           = 1;
         caps->FlipCaps.FlipOnVSyncMmIo       = TRUE;
-        caps->FlipCaps.FlipOnVSyncWithNoWait = TRUE;
-        caps->FlipCaps.FlipInterval          = FALSE;
-        caps->FlipCaps.FlipImmediateMmIo     = FALSE;
 
         //
-        // SchedulingCaps: render-only-sample sets MultiEngineAware,
-        // CancelCommandAware, and PreemptionAware. We additionally keep
-        // VSyncPowerSaveAware so dxgk's VSync power-save logic knows we
-        // honor its requests.
+        // SchedulingCaps: match the render-only-sample baseline.
         //
         caps->SchedulingCaps.MultiEngineAware    = 1;
         caps->SchedulingCaps.CancelCommandAware  = 1;
         caps->SchedulingCaps.PreemptionAware     = 1;
-        caps->SchedulingCaps.VSyncPowerSaveAware = 1;
 
         //
         // MemoryManagementCaps:
@@ -749,10 +702,6 @@ WinMaliKmdQueryAdapterInfoImpl(
         // and since we advertise only Identity per path, the cap is
         // trivially true.
         //
-        // SupportDirectFlip defaults to 0 (RtlZeroMemory). Enabled together
-        // with FlipIndependent + SectionBackedPrimary when segment id 2 is
-        // published — see block before WINMALI_TRACE below.
-        //
         // SupportPerEngineTDR matches SchedulingCaps.MultiEngineAware.
         //
         caps->SupportNonVGA                 = TRUE;
@@ -778,25 +727,9 @@ WinMaliKmdQueryAdapterInfoImpl(
         caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
 
         //
-        // DirectFlip trio when contiguous scan-out sysmem is live (matches
-        // WinMaliBuildSegmentList_ segment id 2).
-        //
-        {
-            PWINMALI_ADAPTER adapterDf = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
-            BOOLEAN          scanoutSegLive =
-                (adapterDf != NULL
-                 && adapterDf->ScanoutSegmentVa != NULL
-                 && adapterDf->ScanoutSegmentBytes != 0);
-
-            if (scanoutSegLive) {
-                caps->FlipCaps.FlipIndependent                      = TRUE;
-                caps->SupportDirectFlip                             = 1;
-                caps->MemoryManagementCaps.SectionBackedPrimary     = 1;
-            }
-        }
         WINMALI_TRACE(
-            "DRIVERCAPS: WDDM=0x%x preempt=gfx:Prim/cmp:Disp sched=ME+Cnl+Pmt+VSps "
-            "flip=Mmio+NoWait maxQ=%u nonvga=1 smooth=1 dirFlip=%u indFlip=%u "
+            "DRIVERCAPS: WDDM=0x%x preempt=gfx:Prim/cmp:Disp sched=ME+Cnl+Pmt "
+            "flip=Mmio-only maxQ=%u nonvga=1 smooth=1 dirFlip=%u indFlip=%u "
             "pTDR=1 memMgr=XAdpt+GpuMmu+VirtAddr gpuVA=[0x%llx,0x%llx] slots=%u "
             "apertureLimit=%llu nodes=%u",
             caps->WDDMVersion,
@@ -808,39 +741,44 @@ WinMaliKmdQueryAdapterInfoImpl(
             caps->MaxAllocationListSlotId,
             (ULONGLONG)caps->ApertureSegmentCommitLimit,
             caps->GpuEngineTopology.NbAsymetricProcessingNodes);
+
+        //
+        // Bounded copy-out: zero whatever the caller gave us, then copy at
+        // most min(their-size, our-struct-size) bytes from our local. Trailing
+        // bytes (when caller buffer is larger than our WDK's struct) stay
+        // zero, which is the correct "field not reported" value for any
+        // future WDDM field we don't know about.
+        //
+        RtlZeroMemory(pQueryAdapterInfo->pOutputData, outSz);
+        {
+            SIZE_T copyLen = (outSz < sizeof(*caps)) ? outSz : sizeof(*caps);
+            RtlCopyMemory(pQueryAdapterInfo->pOutputData, caps, copyLen);
+            WINMALI_TRACE("DRIVERCAPS: copy-out have=%Iu wdkSize=%Iu copied=%Iu",
+                          outSz, (SIZE_T)sizeof(*caps), copyLen);
+        }
         return STATUS_SUCCESS;
     }
 
     //
-    // DISPLAY_DRIVERCAPS_EXTENSION: queried only on full-graphics drivers.
-    // Returning NOT_SUPPORTED here previously made dxgkrnl re-classify us
-    // as not-a-display-adapter and fall back to MS Basic Display. The
-    // bare minimum is to advertise virtual-mode support so the OS knows it
-    // can request modes that don't exactly match a monitor EDID entry.
+    // Render-only conversion: this adapter no longer owns display outputs,
+    // so the display-driver extension surface is intentionally absent.
     //
     case DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION: {
-        DXGK_DISPLAY_DRIVERCAPS_EXTENSION* dext;
-        if (pQueryAdapterInfo->pOutputData == NULL
-            || pQueryAdapterInfo->OutputDataSize < sizeof(*dext))
-        {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        dext = (DXGK_DISPLAY_DRIVERCAPS_EXTENSION*)pQueryAdapterInfo->pOutputData;
-        RtlZeroMemory(dext, sizeof(*dext));
-        dext->VirtualModeSupport = 1;
-        return STATUS_SUCCESS;
+        return STATUS_NOT_SUPPORTED;
     }
 
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_6)
     // Queried after AddDevice, before StartDevice (same window as DRIVERCAPS).
     case DXGKQAITYPE_WDDMDEVICECAPS: {
-        DXGK_WDDMDEVICECAPS* wddmDev = (DXGK_WDDMDEVICECAPS*)pQueryAdapterInfo->pOutputData;
+        DXGK_WDDMDEVICECAPS wddmDev;
 
-        if (wddmDev == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*wddmDev)) {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        RtlZeroMemory(wddmDev, sizeof(*wddmDev));
-        wddmDev->WDDMVersion = DXGKDDI_WDDMv2_4;  // keep in sync with DRIVERCAPS / UMDRIVERPRIVATE
+        RtlZeroMemory(&wddmDev, sizeof(wddmDev));
+        wddmDev.WDDMVersion = DXGKDDI_WDDMv2;  // keep in sync with DRIVERCAPS / UMDRIVERPRIVATE
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &wddmDev);
         return STATUS_SUCCESS;
     }
 #endif
@@ -849,45 +787,26 @@ WinMaliKmdQueryAdapterInfoImpl(
         //
         // Microsoft Learn (DXGK_PHYSICALADAPTERCAPS): DxgkPhysicalAdapterHandle
         // is the value passed as DXGKRNL_INTERFACE::DeviceHandle from
-        // DxgkDdiStartDevice — we store it in adapter->DxgkHandle. Do not use
-        // the miniport context pointer here even if it aliases the same
-        // address on some builds; always use DeviceHandle after StartDevice.
+        // DxgkDdiStartDevice — we store it in adapter->DxgkHandle.
         //
         // pInputData can be DXGK_QUERYPHYSICALADAPTERCAPSIN (physical adapter
         // index in an LDA chain). Single-GPU: only index 0 is valid.
         //
-        // Buffer sizing: with init.Version pinned to WDDM 2.4, dxgk passes
-        // OutputDataSize = 24 — the layout through VPRPagingNode only. Our
-        // WDK's DXGK_PHYSICALADAPTERCAPS also includes VirtualCopyNodeIndex
-        // (WDDM 2.7), so sizeof(*phys) is 28. Requiring sizeof(*phys) or
-        // RtlZeroMemory(phys, sizeof(*phys)) scribbled 4 bytes past the end
-        // of dxgk's buffer and/or skipped returning valid caps, which showed
-        // up as PnP-stop right after GetNodeMetadata despite GPUMMUCAPS
-        // succeeding (dxgk had a corrupted / incomplete physical-adapter
-        // snapshot).
+        // Lenient struct-size pattern: build into a local of our WDK's full
+        // size, bounded-copy at the end. Different kernels expose different
+        // struct sizes:
+        //   * Win11 26100 pinned to WDDM 2.0: outSz = 20 (pre-VPRPagingNode)
+        //   * Win11 26100 pinned to WDDM 2.4: outSz = 24 (with VPRPagingNode)
+        //   * WDK header (this build) WDDM 2.7+: sizeof = 28+ (adds VirtualCopyNodeIndex)
+        // Earlier we'd reject anything below FIELD_OFFSET(VirtualCopyNodeIndex)
+        // = 24, which broke on the 20-byte kernel.
         //
-        DXGK_PHYSICALADAPTERCAPS* phys = (DXGK_PHYSICALADAPTERCAPS*)pQueryAdapterInfo->pOutputData;
-        PWINMALI_ADAPTER          adapter;
+        DXGK_PHYSICALADAPTERCAPS               phys;
+        PWINMALI_ADAPTER                       adapter;
         const DXGK_QUERYPHYSICALADAPTERCAPSIN* physIn;
-        SIZE_T                    outSz = pQueryAdapterInfo->OutputDataSize;
 
-#if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_7)
-        CONST SIZE_T kPhysCapsMinOut = FIELD_OFFSET(DXGK_PHYSICALADAPTERCAPS, VirtualCopyNodeIndex);
-#elif (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_1)
-        CONST SIZE_T kPhysCapsMinOut = sizeof(DXGK_PHYSICALADAPTERCAPS);
-#else
-        CONST SIZE_T kPhysCapsMinOut = sizeof(DXGK_PHYSICALADAPTERCAPS);
-#endif
-
-        if (phys == NULL) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if (outSz < kPhysCapsMinOut) {
-            WINMALI_WARN(
-                "PHYSICALADAPTERCAPS: buffer too small have=%Iu need>=%Iu fullStruct=%Iu",
-                outSz,
-                kPhysCapsMinOut,
-                (SIZE_T)sizeof(DXGK_PHYSICALADAPTERCAPS));
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
 
@@ -912,8 +831,8 @@ WinMaliKmdQueryAdapterInfoImpl(
             return STATUS_DEVICE_NOT_READY;
         }
 
-        RtlZeroMemory(phys, outSz);
-        phys->NumExecutionNodes        = 1;
+        RtlZeroMemory(&phys, sizeof(phys));
+        phys.NumExecutionNodes        = 1;
         //
         // PagingNodeIndex semantics per MSDN DXGK_PHYSICALADAPTERCAPS:
         //   * value < NumExecutionNodes: "node at this index is a DEDICATED
@@ -936,8 +855,8 @@ WinMaliKmdQueryAdapterInfoImpl(
         // shares the JCS slot with rendering work, so paging happens on the
         // same node as 3D. Use the "no dedicated paging node" encoding.
         //
-        phys->PagingNodeIndex          = phys->NumExecutionNodes;
-        phys->DxgkPhysicalAdapterHandle = adapter->DxgkHandle;
+        phys.PagingNodeIndex          = phys.NumExecutionNodes;
+        phys.DxgkPhysicalAdapterHandle = adapter->DxgkHandle;
         //
         // GpuMmuSupported is REQUIRED whenever DRIVERCAPS reports
         // SectionBackedPrimary or anything beyond the WDDM 1.x aperture
@@ -960,29 +879,28 @@ WinMaliKmdQueryAdapterInfoImpl(
         //                            NOT_SUPPORTED here was tripping caps
         //                            walks on some 26100 paths.
         //
-        phys->Flags.Value              = 0;
-        phys->Flags.GpuMmuSupported    = 1;
+        phys.Flags.Value              = 0;
+        phys.Flags.GpuMmuSupported    = 1;
 
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_1)
-        phys->VPRPagingNode            = phys->NumExecutionNodes;
+        phys.VPRPagingNode            = phys.NumExecutionNodes;
 #endif
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_7)
-        if (outSz >= sizeof(DXGK_PHYSICALADAPTERCAPS)) {
-            phys->VirtualCopyNodeIndex = phys->NumExecutionNodes;
-        }
+        phys.VirtualCopyNodeIndex     = phys.NumExecutionNodes;
 #endif
 
         WINMALI_TRACE(
             "PHYSICALADAPTERCAPS: stamp=%u outSz=%Iu hAdapter=%p DeviceHandle=%p ctx=%p "
             "execNodes=%u pagingIdx=%u(no-dedicated) flags=0x%x (GpuMmu=1)",
             WINMALI_KMD_CAP_STAMP,
-            outSz,
+            (SIZE_T)pQueryAdapterInfo->OutputDataSize,
             hAdapter,
-            phys->DxgkPhysicalAdapterHandle,
+            phys.DxgkPhysicalAdapterHandle,
             adapter,
-            phys->NumExecutionNodes,
-            phys->PagingNodeIndex,
-            phys->Flags.Value);
+            phys.NumExecutionNodes,
+            phys.PagingNodeIndex,
+            phys.Flags.Value);
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &phys);
         return STATUS_SUCCESS;
     }
 
@@ -1012,22 +930,23 @@ WinMaliKmdQueryAdapterInfoImpl(
     }
 
     case DXGKQAITYPE_GPUVERSION: {
-        DXGK_GPUVERSION* ver = (DXGK_GPUVERSION*)pQueryAdapterInfo->pOutputData;
+        DXGK_GPUVERSION ver;
 
-        if (ver == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*ver)) {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        RtlZeroMemory(ver, sizeof(*ver));
-        // Diagnostic strings only. Sized DXGK_MAX_GPUVERSION_NAME_LENGTH
-        // (32 WCHARs incl. NUL). Avoid wcscpy_s here to keep WDK compat
-        // simple; a truncated copy is acceptable per docs.
-        (void)RtlStringCbCopyW(ver->BiosVersion,
-                               sizeof(ver->BiosVersion),
+        RtlZeroMemory(&ver, sizeof(ver));
+        // Diagnostic strings only. Truncation per RtlStringCbCopyW is
+        // acceptable per docs.
+        (void)RtlStringCbCopyW(ver.BiosVersion,
+                               sizeof(ver.BiosVersion),
                                L"WinMali UEFI");
-        (void)RtlStringCbCopyW(ver->GpuArchitecture,
-                               sizeof(ver->GpuArchitecture),
+        (void)RtlStringCbCopyW(ver.GpuArchitecture,
+                               sizeof(ver.GpuArchitecture),
                                L"Mali-G610 (Valhall)");
         WINMALI_TRACE("GPUVERSION: arch='Mali-G610 (Valhall)' bios='WinMali UEFI'");
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &ver);
         return STATUS_SUCCESS;
     }
 #endif
@@ -1146,23 +1065,27 @@ WinMaliKmdQueryAdapterInfoImpl(
 
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_9)
     case DXGKQAITYPE_PHYSICAL_MEMORY_CAPS: {
-        DXGK_PHYSICAL_MEMORY_CAPS* pmem = (DXGK_PHYSICAL_MEMORY_CAPS*)pQueryAdapterInfo->pOutputData;
+        DXGK_PHYSICAL_MEMORY_CAPS pmem;
 
-        if (pmem == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*pmem)) {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        RtlZeroMemory(pmem, sizeof(*pmem));
-        pmem->HighestVisibleAddress.QuadPart = (ULONG64)-1;
+        RtlZeroMemory(&pmem, sizeof(pmem));
+        pmem.HighestVisibleAddress.QuadPart = (ULONG64)-1;
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &pmem);
         return STATUS_SUCCESS;
     }
 
     case DXGKQAITYPE_IOMMU_CAPS: {
-        DXGK_IOMMU_CAPS* iommu = (DXGK_IOMMU_CAPS*)pQueryAdapterInfo->pOutputData;
+        DXGK_IOMMU_CAPS iommu;
 
-        if (iommu == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*iommu)) {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        RtlZeroMemory(iommu, sizeof(*iommu));
+        RtlZeroMemory(&iommu, sizeof(iommu));
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &iommu);
         return STATUS_SUCCESS;
     }
 #endif
@@ -1170,26 +1093,30 @@ WinMaliKmdQueryAdapterInfoImpl(
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_4)
     case DXGKQAITYPE_HARDWARERESERVEDRANGES:
     case DXGKQAITYPE_HARDWARERESERVEDRANGES2: {
-        DXGK_HARDWARERESERVEDRANGES* res = (DXGK_HARDWARERESERVEDRANGES*)pQueryAdapterInfo->pOutputData;
+        DXGK_HARDWARERESERVEDRANGES res;
 
-        if (res == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*res)) {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        RtlZeroMemory(res, sizeof(*res));
-        res->NumRanges        = 0;
-        res->pPhysicalRanges  = NULL;
+        RtlZeroMemory(&res, sizeof(res));
+        res.NumRanges        = 0;
+        res.pPhysicalRanges  = NULL;
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &res);
         return STATUS_SUCCESS;
     }
 #endif
 
     case DXGKQAITYPE_64BITONLYCAPS: {
-        DXGK_64_BIT_ONLY_CAPS* b64 = (DXGK_64_BIT_ONLY_CAPS*)pQueryAdapterInfo->pOutputData;
+        DXGK_64_BIT_ONLY_CAPS b64;
 
-        if (b64 == NULL || pQueryAdapterInfo->OutputDataSize < sizeof(*b64)) {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        RtlZeroMemory(b64, sizeof(*b64));
-        b64->SupportsOnly64Bit = 1;
+        RtlZeroMemory(&b64, sizeof(b64));
+        b64.SupportsOnly64Bit = 1;
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &b64);
         return STATUS_SUCCESS;
     }
 
@@ -1200,7 +1127,7 @@ WinMaliKmdQueryAdapterInfoImpl(
     //
     case DXGKQAITYPE_GPUMMUCAPS: {
         const DXGK_QUERYGPUMMUCAPSIN* in;
-        DXGK_GPUMMUCAPS*              caps;
+        DXGK_GPUMMUCAPS               caps;
 
         if (pQueryAdapterInfo->pInputData == NULL
             || pQueryAdapterInfo->InputDataSize < sizeof(DXGK_QUERYGPUMMUCAPSIN))
@@ -1211,35 +1138,34 @@ WinMaliKmdQueryAdapterInfoImpl(
         if (in->PhysicalAdapterIndex != 0) {
             return STATUS_INVALID_PARAMETER;
         }
-        if (pQueryAdapterInfo->pOutputData == NULL
-            || pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_GPUMMUCAPS))
-        {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        caps = (DXGK_GPUMMUCAPS*)pQueryAdapterInfo->pOutputData;
-        RtlZeroMemory(caps, sizeof(*caps));
-        caps->ReadOnlyMemorySupported   = 1;
-        caps->NoExecuteMemorySupported  = 1;
-        caps->ZeroInPteSupported        = 1;
-        caps->PageTableUpdateMode       = DXGK_PAGETABLEUPDATE_CPU_VIRTUAL;
+        RtlZeroMemory(&caps, sizeof(caps));
+        caps.ReadOnlyMemorySupported   = 1;
+        caps.NoExecuteMemorySupported  = 1;
+        caps.ZeroInPteSupported        = 1;
+        caps.PageTableUpdateMode       = DXGK_PAGETABLEUPDATE_CPU_VIRTUAL;
         //
         // Keep GPUMMUCAPS aligned with DRIVERCAPS.InternalGpuVirtualAddressRange*
         // while we are in the 1 GiB bring-up sandbox. Advertising 48-bit VA
         // here forces dxgk to size internal VA bookkeeping for a much larger
         // space than we actually expose.
         //
-        caps->VirtualAddressBitCount    = 30;
-        caps->LeafPageTableSizeFor64KPagesInBytes = (UINT)PAGE_SIZE;
-        caps->PageTableLevelCount       = 2;
+        caps.VirtualAddressBitCount    = 30;
+        caps.LeafPageTableSizeFor64KPagesInBytes = (UINT)PAGE_SIZE;
+        caps.PageTableLevelCount       = 2;
         WINMALI_TRACE(
             "GPUMMUCAPS: VA_bits=30 levels=2 update=CPU_VIRTUAL "
             "(per-level PageTableSegmentId reported in PAGETABLELEVELDESC)");
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &caps);
         return STATUS_SUCCESS;
     }
 
     case DXGKQAITYPE_PAGETABLELEVELDESC: {
         const DXGK_QUERYPAGETABLELEVELDESCIN* in;
-        DXGK_PAGE_TABLE_LEVEL_DESC*           desc;
+        DXGK_PAGE_TABLE_LEVEL_DESC            desc;
         const UINT                            levels = 2;
         const UINT                            idxBits = 9;
         //
@@ -1277,24 +1203,23 @@ WinMaliKmdQueryAdapterInfoImpl(
         if (in->LevelIndex >= levels) {
             return STATUS_INVALID_PARAMETER;
         }
-        if (pQueryAdapterInfo->pOutputData == NULL
-            || pQueryAdapterInfo->OutputDataSize < sizeof(DXGK_PAGE_TABLE_LEVEL_DESC))
-        {
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        desc = (DXGK_PAGE_TABLE_LEVEL_DESC*)pQueryAdapterInfo->pOutputData;
-        RtlZeroMemory(desc, sizeof(*desc));
-        desc->PageTableIndexBitCount           = idxBits;
-        desc->PageTableSegmentId               = pageTableSegmentId;
-        desc->PagingProcessPageTableSegmentId  = pageTableSegmentId;
-        desc->PageTableSizeInBytes             = (UINT)PAGE_SIZE;
-        desc->PageTableAlignmentInBytes        = 0;
+        RtlZeroMemory(&desc, sizeof(desc));
+        desc.PageTableIndexBitCount           = idxBits;
+        desc.PageTableSegmentId               = pageTableSegmentId;
+        desc.PagingProcessPageTableSegmentId  = pageTableSegmentId;
+        desc.PageTableSizeInBytes             = (UINT)PAGE_SIZE;
+        desc.PageTableAlignmentInBytes        = 0;
         WINMALI_TRACE(
             "PAGETABLELEVELDESC: level=%u idxBits=%u size=%u seg=%u",
             (ULONG)in->LevelIndex,
             idxBits,
             (ULONG)PAGE_SIZE,
             pageTableSegmentId);
+        WINMALI_QAI_COPYOUT(pQueryAdapterInfo, &desc);
         return STATUS_SUCCESS;
     }
 #endif
@@ -1434,45 +1359,6 @@ WinMaliKmdQueryAdapterInfoImpl(
         }
 
         qo       = (DXGK_QUERYSEGMENTOUT4*)pQueryAdapterInfo->pOutputData;
-        //
-        // STRIDE IS HARD-CODED BY DXGMMS2 — DO NOT USE sizeof().
-        //
-        // Decomp shows dxgmms2.sys reads/zeroes descriptor[i] at a literal
-        // 104-byte stride in every code path that touches pass-2 output:
-        //   dxgmms2!CreatePhysicalAdapterSegments
-        //     memset( buf, 0, 104 * NbSeg );                    line 99698
-        //     operator new[]( 104 * NbSeg, 'Vi07', ... );       line 99718
-        //   dxgmms2!ValidateSegmentDescriptors
-        //     v11 = (int *)(a2 + 104i64 * i);                   line 100759
-        //   dxgmms2!InitializePhysicalAdapterSegments
-        //     v17 = v77 + 104 * v11;                            line 100199
-        // None of these consult qo->SegmentDescriptorStride — the field is
-        // set by dxgmms2 (= 104) right before the pass-2 call and is never
-        // read after the miniport returns. Confirmed by exhaustive search
-        // of CreatePhysicalAdapterSegments: v28 is assigned 104 at line
-        // 99727 and never referenced again.
-        //
-        // sizeof(DXGK_SEGMENTDESCRIPTOR4) on this WDK (10.0.26100.0,
-        // d3dkmddi.h lines 2720-2749, WDDM2_2 layout with
-        // NumUEFIFrameBufferRanges) computes to exactly 96 bytes:
-        //   Flags(4) + pad(4) + BaseAddress(8) + Size(8) + CommitLimit(8)
-        //   + SystemMemoryEndAddress(8) + Cpu*/CpuHostAperture union(16)
-        //   + NumInvalidMemoryRanges(4) + pad(4) + VprRangeStartOffset(8)
-        //   + VprRangeSize(8) + VprAlignment(4) + NumVprSupported(4)
-        //   + VprReserveSize(4) + NumUEFIFrameBufferRanges(4) = 96
-        // If we naively use that as the stride, descriptor[i] is written
-        // at byte 96*i but dxgmms2 reads it at byte 104*i. For NbSeg >= 2,
-        // descriptor 1's "Flags" (byte 104 in dxgmms2's view) lands on
-        // byte 8 of OUR descriptor 1 = LowPart of BaseAddress
-        // (= 0x30000000 for our GOP segment). ValidateSegmentDescriptors
-        // rejects with the "Flags >= 0x400000" rule at WdLine 0xEB and
-        // CreatePhysicalAdapterSegments returns STATUS_INVALID_PARAMETER,
-        // which propagates up to DxgkAddAdapter -> StopDevice. This is
-        // the exact symptom comments throughout this file describe as
-        // "silently StopDevice immediately after QUERYSEGMENT4 pass-2 in
-        // the 2-segment case".
-        //
-        stride   = 104u;
         pOutBase = (BYTE*)pQueryAdapterInfo->pOutputData;
         pOutEnd  = pOutBase + pQueryAdapterInfo->OutputDataSize;
 
@@ -1500,65 +1386,54 @@ WinMaliKmdQueryAdapterInfoImpl(
             return STATUS_INVALID_PARAMETER;
         }
 
+        stride = qo->SegmentDescriptorStride;
+        if (stride == 0) {
+            stride = sizeof(DXGK_SEGMENTDESCRIPTOR4);
+        }
+        if (stride < sizeof(DXGK_SEGMENTDESCRIPTOR4)) {
+            WINMALI_WARN(
+                "QUERYSEGMENT4: invalid stride=%Iu (need >= %Iu)",
+                stride,
+                (SIZE_T)sizeof(DXGK_SEGMENTDESCRIPTOR4));
+            return STATUS_INVALID_PARAMETER;
+        }
+
         needTotal = sizeof(DXGK_QUERYSEGMENTOUT4) + (SIZE_T)nbSeg * stride;
 
-        //
-        // Pass 2 layouts:
-        //   (A) Contiguous: pSegmentDescriptor == header + sizeof(DXGK_QUERYSEGMENTOUT4).
-        //       When OutputDataSize is header-only (40), that address equals pOutEnd;
-        //       it is still the first byte of the descriptor in the same allocation.
-        //   (B) In-buffer but not at pOutEnd: psd in (pOutBase, pOutEnd) with room.
-        //   (C) Separate dxgkrnl buffer: psd not in [pOutBase, pOutEnd).
-        //
-        {
-            BYTE* const pAfterHdr = pOutBase + sizeof(DXGK_QUERYSEGMENTOUT4);
-
-            if (qo->pSegmentDescriptor != NULL) {
-                BYTE* psd = (BYTE*)qo->pSegmentDescriptor;
-
-                if (psd == pAfterHdr) {
-                    segs = (DXGK_SEGMENTDESCRIPTOR4*)psd;
-                } else if (psd >= pOutBase && psd < pOutEnd) {
-                    if (psd < pAfterHdr) {
-                        WINMALI_WARN(
-                            "QUERYSEGMENT4: pass2 pSegmentDescriptor overlaps header");
-                        return STATUS_INVALID_PARAMETER;
-                    }
-                    if (psd + (SIZE_T)nbSeg * stride > pOutEnd) {
-                        WINMALI_TRACE(
-                            "QUERYSEGMENT4: pass2 in-buf psd overflow out=%u",
-                            pQueryAdapterInfo->OutputDataSize);
-                        return STATUS_BUFFER_TOO_SMALL;
-                    }
-                    segs = (DXGK_SEGMENTDESCRIPTOR4*)psd;
-                } else {
-                    segs = (DXGK_SEGMENTDESCRIPTOR4*)psd;
-                }
-            } else if (pQueryAdapterInfo->OutputDataSize >= needTotal) {
-                segs = (DXGK_SEGMENTDESCRIPTOR4*)pAfterHdr;
-            } else {
+        if (qo->pSegmentDescriptor == NULL) {
+            if (pQueryAdapterInfo->OutputDataSize < needTotal) {
                 WINMALI_TRACE(
                     "QUERYSEGMENT4: pass2 no psd and out=%u < need=%llu",
                     pQueryAdapterInfo->OutputDataSize,
                     (ULONGLONG)needTotal);
                 return STATUS_BUFFER_TOO_SMALL;
             }
+            qo->pSegmentDescriptor = pOutBase + sizeof(DXGK_QUERYSEGMENTOUT4);
         }
 
-        //
-        // Walk descriptors at the wire stride (104) — NOT sizeof — so each
-        // descriptor lands exactly where dxgmms2 will later read it.
-        // sizeof(DXGK_SEGMENTDESCRIPTOR4) = 96 on this WDK while dxgmms2's
-        // hard-coded read stride is 104; using &segs[i] (which steps by 96)
-        // mis-aligns descriptor[1+] in the 104*N buffer dxgmms2 allocated.
-        // See the long comment above the `stride = 104u` assignment for the
-        // exact decomp lines that prove this.
-        //
-        // Zero the trailing 8-byte gap per descriptor too: dxgmms2 reads
-        // bytes 96..103 of each descriptor (the synthetic "internal"
-        // tail) when walking the segment array, and we cannot leave them
-        // holding our caller's stack garbage.
-        //
+        if (qo->pSegmentDescriptor >= pOutBase && qo->pSegmentDescriptor < pOutEnd) {
+            BYTE* psd = qo->pSegmentDescriptor;
+            BYTE* const pAfterHdr = pOutBase + sizeof(DXGK_QUERYSEGMENTOUT4);
+
+            if (psd < pAfterHdr) {
+                WINMALI_WARN(
+                    "QUERYSEGMENT4: pass2 pSegmentDescriptor overlaps header");
+                return STATUS_INVALID_PARAMETER;
+            }
+            if (psd + (SIZE_T)nbSeg * stride > pOutEnd) {
+                WINMALI_TRACE(
+                    "QUERYSEGMENT4: pass2 in-buf psd overflow out=%u stride=%Iu nb=%u",
+                    pQueryAdapterInfo->OutputDataSize,
+                    stride,
+                    nbSeg);
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+        }
+
+        segs = (DXGK_SEGMENTDESCRIPTOR4*)qo->pSegmentDescriptor;
+
+        // The contract is explicit: pSegmentDescriptor is a BYTE* and the
+        // driver must iterate/write using SegmentDescriptorStride.
         {
             BYTE* base = (BYTE*)segs;
             RtlZeroMemory(base, (SIZE_T)stride * (SIZE_T)nbSeg);
@@ -1631,10 +1506,9 @@ WinMaliKmdQueryAdapterInfoImpl(
         // StopDevices the adapter post-pass2.
         //
         WINMALI_TRACE(
-            "QUERYSEGMENT4: descSize=%Iu stride=%Iu (sizeof=%Iu, dxgmms2 ABI=104)",
+            "QUERYSEGMENT4: descSize=%Iu stride=%Iu",
             (SIZE_T)sizeof(DXGK_SEGMENTDESCRIPTOR4),
-            stride,
-            (SIZE_T)sizeof(DXGK_SEGMENTDESCRIPTOR4));
+            stride);
         for (i = 0; i < nbSeg; ++i) {
             const DXGK_SEGMENTDESCRIPTOR4* seg =
                 (const DXGK_SEGMENTDESCRIPTOR4*)((BYTE*)segs + (SIZE_T)i * stride);
@@ -1988,7 +1862,7 @@ WinMaliKmdQueryAdapterInfoImpl(
         info->Magic           = WINMALI_ADAPTER_MAGIC;
         info->KmdMajorVersion = WINMALI_KMD_MAJOR;
         info->KmdMinorVersion = WINMALI_KMD_MINOR;
-        info->WddmVersion     = DXGKDDI_WDDMv2_4;
+        info->WddmVersion     = DXGKDDI_WDDMv2;
         info->GpuId           = 0;  // filled in once MMIO bring-up lands
         info->CsfId           = 0;
         info->GpuRevId        = 0;
@@ -2103,6 +1977,10 @@ WinMaliKmdQueryChildRelations(
     if (adapter == NULL || ChildRelations == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+    if (WinMaliKmdIsRenderOnlyAdapter_(adapter)) {
+        WINMALI_TRACE("QueryChildRelations: render-only adapter -> NOT_IMPLEMENTED");
+        return STATUS_NOT_IMPLEMENTED;
+    }
     if (ChildRelationsSize < sizeof(DXGK_CHILD_DESCRIPTOR)) {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -2157,6 +2035,10 @@ WinMaliKmdQueryChildStatus(
 
     if (adapter == NULL || ChildStatus == NULL) {
         return STATUS_INVALID_PARAMETER;
+    }
+    if (WinMaliKmdIsRenderOnlyAdapter_(adapter)) {
+        WINMALI_TRACE("QueryChildStatus: render-only adapter -> NOT_IMPLEMENTED");
+        return STATUS_NOT_IMPLEMENTED;
     }
     if (ChildStatus->ChildUid != (ULONG)adapter->PrimaryConnector) {
         // We currently expose exactly one child; any other UID is bogus.
@@ -2309,6 +2191,10 @@ WinMaliKmdQueryDeviceDescriptor(
             adapter,
             DeviceDescriptor);
         return STATUS_INVALID_PARAMETER;
+    }
+    if (WinMaliKmdIsRenderOnlyAdapter_(adapter)) {
+        WINMALI_TRACE("QueryDeviceDescriptor: render-only adapter -> NOT_IMPLEMENTED");
+        return STATUS_NOT_IMPLEMENTED;
     }
 
     WinMaliLogEdidSelfCheckOnce_();
@@ -2878,12 +2764,9 @@ WinMaliPublishAllocationInfo_(
     _In_opt_ PWINMALI_ADAPTER     adapter,
     _Inout_ DXGK_ALLOCATIONINFO*  info)
 {
-    BOOLEAN gopAvailable;
-    BOOLEAN apertureAvailable;
-    UINT    primarySegmentId;
-    UINT    generalSegmentId;
-    UINT    primaryMask;
-    UINT    generalMask;
+    BOOLEAN memorySegmentAvailable;
+    UINT    segmentId;
+    UINT    segmentMask;
 
     info->hAllocation               = (HANDLE)alloc;
     info->Size                      = alloc->Size;
@@ -2892,61 +2775,29 @@ WinMaliPublishAllocationInfo_(
     info->AllocationPriority        = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
     info->PhysicalAdapterIndex      = 0;
 
-    //
-    // Primary routing uses segment id 2 only when QUERYSEGMENT* actually
-    // publishes that slab (SetupSysmemScanout + WinMaliBuildSegmentList_).
-    //
-    gopAvailable =
-        (adapter != NULL
-         && adapter->ScanoutSegmentVa != NULL
-         && adapter->ScanoutSegmentBytes != 0);
+    // Single-segment model: every allocation, including primaries, lands in
+    // the one published GPU-memory/sysmem segment. If the DMA segment was not
+    // allocated we still use segment id 1, which WinMaliBuildSegmentList_
+    // fills from the MMU scratch heap fallback.
+    memorySegmentAvailable = (adapter != NULL
+                              && adapter->DmaSegmentVa != NULL
+                              && adapter->DmaSegmentBytes != 0);
+    UNREFERENCED_PARAMETER(memorySegmentAvailable);
 
-    //
-    // "apertureAvailable" historically meant "AperturePageTable is wired
-    // to back a CpuVisible aperture segment". After the GpuMmu rewrite we
-    // publish segment id 1 as a PopulatedFromSystemMemory block instead,
-    // so the right gating condition is now "the sysmem DMA segment was
-    // allocated". The local variable keeps its name to limit churn in
-    // the segment-routing block below; semantically it's the v3 sysmem
-    // segment that the WINMALI_SYSMEM_SEGMENT_ID alias names.
-    //
-    apertureAvailable = (adapter != NULL
-                         && adapter->DmaSegmentVa != NULL
-                         && adapter->DmaSegmentBytes != 0);
-
-    if (gopAvailable && apertureAvailable) {
-        primarySegmentId = WINMALI_GOP_SEGMENT_ID;
-        generalSegmentId = WINMALI_APERTURE_SEGMENT_ID;
-        primaryMask = (1u << (WINMALI_GOP_SEGMENT_ID - 1u))
-                    | (1u << (WINMALI_APERTURE_SEGMENT_ID - 1u));
-        generalMask = (1u << (WINMALI_APERTURE_SEGMENT_ID - 1u));
-    } else if (gopAvailable) {
-        primarySegmentId = WINMALI_GOP_SEGMENT_ID;
-        generalSegmentId = WINMALI_GOP_SEGMENT_ID;
-        primaryMask = generalMask = (1u << (WINMALI_GOP_SEGMENT_ID - 1u));
-    } else if (apertureAvailable) {
-        primarySegmentId = WINMALI_APERTURE_SEGMENT_ID;
-        generalSegmentId = WINMALI_APERTURE_SEGMENT_ID;
-        primaryMask = generalMask = (1u << (WINMALI_APERTURE_SEGMENT_ID - 1u));
-    } else {
-        // Fallback: only the static scratch segment exists. Use the same
-        // 1-based id 1 we publish for it in WinMaliBuildSegmentList_.
-        primarySegmentId = WINMALI_APERTURE_SEGMENT_ID;
-        generalSegmentId = WINMALI_APERTURE_SEGMENT_ID;
-        primaryMask = generalMask = (1u << (WINMALI_APERTURE_SEGMENT_ID - 1u));
-    }
+    segmentId = WINMALI_APERTURE_SEGMENT_ID;
+    segmentMask = (1u << (WINMALI_APERTURE_SEGMENT_ID - 1u));
 
     info->PreferredSegment.Value      = 0;
     if (alloc->Flags & WINMALI_ALLOC_FLAG_PRIMARY) {
-        info->PreferredSegment.SegmentId0 = (UCHAR)primarySegmentId;
-        info->SupportedReadSegmentSet     = primaryMask;
-        info->SupportedWriteSegmentSet    = primaryMask;
-        alloc->PreferredSegmentId         = primarySegmentId;
+        info->PreferredSegment.SegmentId0 = (UCHAR)segmentId;
+        info->SupportedReadSegmentSet     = segmentMask;
+        info->SupportedWriteSegmentSet    = segmentMask;
+        alloc->PreferredSegmentId         = segmentId;
     } else {
-        info->PreferredSegment.SegmentId0 = (UCHAR)generalSegmentId;
-        info->SupportedReadSegmentSet     = generalMask;
-        info->SupportedWriteSegmentSet    = generalMask;
-        alloc->PreferredSegmentId         = generalSegmentId;
+        info->PreferredSegment.SegmentId0 = (UCHAR)segmentId;
+        info->SupportedReadSegmentSet     = segmentMask;
+        info->SupportedWriteSegmentSet    = segmentMask;
+        alloc->PreferredSegmentId         = segmentId;
     }
     info->EvictionSegmentSet        = 0;
 

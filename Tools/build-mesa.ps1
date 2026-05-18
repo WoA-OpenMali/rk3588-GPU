@@ -51,6 +51,11 @@ param(
     [switch]$SkipIfPresent,
     [switch]$ConfigureOnly,
 
+    # WinMaliVk.dll wraps panvk-v10. The Windows port is still in
+    # progress; pass -SkipVulkan to build just the GL+D3D10 targets
+    # while panvk Windows porting catches up.
+    [switch]$SkipVulkan,
+
     [ValidateSet("ARM64","x64","Win32")]
     [string]$Platform = "x64"
 )
@@ -78,13 +83,31 @@ if (-not $WinMaliPython) {
     exit 1
 }
 
-$buildTree = Join-Path $WinMaliBuildDir ("mesa\" + $Configuration.ToLower())
+# Per-platform build trees so x64 and ARM64 cross-builds don't fight.
+$buildTree = Join-Path $WinMaliBuildDir ("mesa\" + $Configuration.ToLower() + "-" + $Platform.ToLower())
 $binDir    = Join-Path $WinMaliBuildDir ("bin\$Configuration\$Platform")
 
+# clang-cl --target value per requested platform. For ARM64 we cross-
+# compile from an x64 host using the same clang-cl binary. Meson's
+# autodetect runs `clang-cl --version` WITHOUT considering target
+# flags, so we MUST bundle --target into the compiler invocation
+# itself via the cross file's binaries entry (a list) - otherwise
+# meson thinks we're still targeting x86_64 and emits /MACHINE:X64
+# link flags, which break the ARM64 link step.
+$clangTarget = switch ($Platform) {
+    "ARM64" { "aarch64-pc-windows-msvc" }
+    "x64"   { "x86_64-pc-windows-msvc" }
+    "Win32" { "i686-pc-windows-msvc" }
+    default { $null }
+}
+
+# The shared_library() name set by meson via gallium-{wgl,d3d10}-dll-name
+# becomes the .dll basename. panvk's shared_library is hardcoded as
+# vulkan_panfrost - we rename it at publish time.
 $outDlls = @{
     "WinMaliGL.dll"  = "src\gallium\targets\wgl\WinMaliGL.dll"
-    "WinMaliUmd.dll" = "src\gallium\targets\d3d10rk3588\d3d10_rk3588.dll"
-    "WinMaliVk.dll"  = "src\gallium\targets\winmali_vk\WinMaliVk.dll"
+    "WinMaliUmd.dll" = "src\gallium\targets\d3d10rk3588\WinMaliUmd.dll"
+    "WinMaliVk.dll"  = "src\panfrost\vulkan\vulkan_panfrost.dll"
 }
 
 if ($Clean) {
@@ -125,81 +148,172 @@ New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 
 $mesonBuildtype = $Configuration.ToLower()   # 'debug' | 'release'
 
-# Panthor / panfrost backed targets:
-#   gallium-drivers=panfrost      backends the GL ICD + d3d10 UMD
-#   gallium-frontends=wgl,d3d10umd
-#   vulkan-drivers=               (panvk-on-Windows not ready; using own stub target)
-#   winmali-wddm-kmod=true        enables panfrost pan_kmod_winmali path + wgl + d3d10rk3588 wiring
-#   gallium-d3d10umd=true / gallium-d3d10-rk3588=true   build the D3D10 UMD target
-#   gallium-windows-dll-name=WinMaliGL   names wgl target output WinMaliGL.dll directly
+# mesa-modern path: real panvk-v10 for Vulkan, panfrost gallium driver
+# with native CSF support for GL/D3D, WinMali kmod backend that ships
+# panthor ioctls through D3DKMT_ESCAPE to the kernel-mode WDDM 2.0
+# miniport on Windows ARM64.
+#
+# Build-time deps (LLVM dev libs + libclc + SPIRV-Tools) live in
+# C:\mesa-deps - built by Tools\build-mesa-deps.ps1. The pkg-config-path
+# + cmake-prefix-path let meson find them without a pkg-config binary.
+$depsInstallPath = "C:\mesa-deps"
 $mesonSetupArgs = @(
     "setup",
     $buildTree,
     $WinMaliMesaRoot,
     "--buildtype=$mesonBuildtype",
+    "--cmake-prefix-path=$depsInstallPath",
+    "--pkg-config-path=$depsInstallPath\lib\pkgconfig;$depsInstallPath\share\pkgconfig",
+    "-Db_vscrt=md",
     "-Dplatforms=windows",
     "-Dgallium-drivers=panfrost",
+    $(if ($SkipVulkan) { "-Dvulkan-drivers=" } else { "-Dvulkan-drivers=panfrost" }),
     "-Dgallium-d3d10umd=true",
     "-Dgallium-d3d10-rk3588=true",
     "-Dwinmali-wddm-kmod=true",
-    "-Dvulkan-drivers=",
-    "-Dgallium-windows-dll-name=WinMaliGL",
+    "-Dgallium-wgl-dll-name=WinMaliGL",
+    "-Dgallium-d3d10-dll-name=WinMaliUmd",
     "-Dglx=disabled",
-    "-Dosmesa=false",
     "-Dgles1=disabled",
     "-Dgles2=disabled",
     "-Dmicrosoft-clc=disabled",
+    "-Dgallium-rusticl=false",
+    "-Dstatic-libclc=all",
     "-Dbuild-tests=false",
     "-Dshared-glapi=enabled",
-    "-Dllvm=disabled"
+    "-Dvideo-codecs="
 )
 
-function Enter-VsDevEnv {
-    # Already inside a VS dev shell?
-    if ($env:VSCMD_ARG_HOST_ARCH -or $env:VSINSTALLDIR) { return $true }
-
-    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path $vswhere)) {
-        Write-Host "vswhere.exe not found; cannot load VS Dev environment." -ForegroundColor Red
-        return $false
-    }
-    $vsRoot = & $vswhere -all -prerelease -requires Microsoft.Component.MSBuild -property installationPath 2>$null |
-              Select-Object -First 1
-    if (-not $vsRoot) {
-        Write-Host "vswhere found no MSBuild installations." -ForegroundColor Red
-        return $false
-    }
-
-    $devShell = Join-Path $vsRoot "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-    if (-not (Test-Path $devShell)) {
-        Write-Host "Microsoft.VisualStudio.DevShell.dll missing at $devShell" -ForegroundColor Red
-        return $false
-    }
-
-    Import-Module $devShell -ErrorAction Stop | Out-Null
-    Enter-VsDevShell -VsInstallPath $vsRoot -SkipAutomaticLocation `
-        -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
-    return $true
+# LLVM and libclc deps in C:\mesa-deps are x64 binaries. For an ARM64
+# cross-build we can't link them, and panfrost / panvk-v10 don't need
+# the LLVM-backed code paths (LLVMpipe, draw module's llvm fallback,
+# rusticl). Disable both. Microsoft-clc would also need LLVM so it's
+# already off above.
+if ($Platform -eq "ARM64") {
+    $mesonSetupArgs += @(
+        "-Dllvm=disabled",
+        "-Dstatic-libclc=",
+        "-Dshader-cache=disabled"
+    )
 }
 
-if (-not (Enter-VsDevEnv)) {
-    Write-Host "Failed to enter VS Dev environment." -ForegroundColor Red
+# VsDevCmd arch matters for LIB / INCLUDE: arm64 cross-build needs the
+# ARM64 um/km/ucrt lib paths on LIB and the ARM64 cross-compiler's tools
+# on PATH, but the host is x64 so host_arch stays x64.
+#
+# Mesa build uses VS 2022 Build Tools at C:\BuildTools when present, so
+# the STL we compile against ABI-matches the LLVM 18.1.8 we built into
+# C:\mesa-deps with VS 2022. The driver (KMD/UMD) build still uses
+# VS 2017 + 1809 WDK via the default vswhere lookup.
+$devArch = if ($Platform -eq "ARM64") { "arm64" } else { "x64" }
+$vsOverride = if (Test-Path "C:\BuildTools\Common7\Tools\VsDevCmd.bat") { "C:\BuildTools" } else { "" }
+if (-not (Enter-WinMaliVsDevEnv -Arch $devArch -HostArch x64 -VsInstallOverride $vsOverride)) {
+    Write-Host "Failed to enter VS Dev environment ($devArch)." -ForegroundColor Red
     exit 1
+}
+
+# VsDevCmd resets PATH. Reinstate ninja + win_flex_bison + python +
+# LLVM bin which env.ps1 found - their dirs need to be on PATH for
+# meson to discover them.
+foreach ($extra in @(
+    $WinMaliNinja,
+    "C:\tools\winflexbison\win_flex.exe",
+    "C:\Program Files\LLVM\bin\clang-cl.exe",
+    $WinMaliPython
+)) {
+    if ($extra -and (Test-Path $extra)) {
+        $extraDir = Split-Path $extra -Parent
+        if ($env:PATH -notlike "*$extraDir*") {
+            $env:PATH = "$extraDir;$env:PATH"
+        }
+    }
 }
 
 # Mesa's panfrost subtree relies on GCC builtins / __attribute__ /
 # __inline__ that plain MSVC cl.exe does not understand. clang-cl
-# (LLVM's MSVC-ABI compatible compiler, ships with the VS "C++ Clang
-# tools for Windows" component) accepts those AND uses the MSVC ABI, so
-# everything links cleanly with the rest of the MSVC-built mesa code.
-$clangCl = Join-Path $env:VSINSTALLDIR "VC\Tools\Llvm\x64\bin\clang-cl.exe"
-if (-not (Test-Path $clangCl)) {
-    $clangCl = Join-Path $env:VSINSTALLDIR "VC\Tools\Llvm\bin\clang-cl.exe"
+# (LLVM's MSVC-ABI compatible compiler) accepts those AND uses the
+# MSVC ABI, so everything links cleanly with the rest of the MSVC-built
+# mesa code. Two install locations are common:
+#   - The VS "C++ Clang tools for Windows" component, under VSINSTALLDIR
+#     (VC\Tools\Llvm\... — path layout differs between VS 2017 and 2019+)
+#   - A standalone LLVM install from llvm.org under
+#     %ProgramFiles%\LLVM\bin (preferred on VS 2017 boxes because the
+#     VS-shipped clang is several major versions behind mesa's needs).
+$clangCl = $null
+$clangCandidates = @(
+    (Join-Path $env:VSINSTALLDIR "VC\Tools\Llvm\x64\bin\clang-cl.exe"),
+    (Join-Path $env:VSINSTALLDIR "VC\Tools\Llvm\bin\clang-cl.exe"),
+    "$env:ProgramFiles\LLVM\bin\clang-cl.exe",
+    "${env:ProgramFiles(x86)}\LLVM\bin\clang-cl.exe"
+)
+foreach ($cand in $clangCandidates) {
+    if ($cand -and (Test-Path $cand)) { $clangCl = $cand; break }
 }
-if (Test-Path $clangCl) {
+if ($clangCl) {
     Write-Host "Using clang-cl: $clangCl" -ForegroundColor DarkGreen
     $env:CC = $clangCl
     $env:CXX = $clangCl
+} else {
+    Write-Host "WARNING: clang-cl not found in VS or standalone LLVM; mesa likely won't build." -ForegroundColor Yellow
+}
+
+# 1809 WDK quirk: d3dkmthk.h lives in km\, not shared\ (Microsoft
+# moved it in 19041). The mesa panfrost winmali bridge transitively
+# includes <d3dkmthk.h>, so put km\ on the compiler include path
+# globally via CFLAGS/CXXFLAGS. meson bakes these into the compile
+# lines at setup time, so this only matters on the first configure or
+# after -Reconfigure.
+if ($env:WindowsSdkDir -and $env:WindowsSDKVersion) {
+    $kmInc = "$($env:WindowsSdkDir)Include\$($env:WindowsSDKVersion)km".TrimEnd('\')
+    # WindowsSDKVersion is "10.0.17763.0\" (note trailing slash that
+    # VsDevCmd sets); after the join above the path is correct.
+    $kmInc = $kmInc -replace '\\\\','\'
+    if (Test-Path $kmInc) {
+        Write-Host "Adding WDK km\ include dir to mesa CFLAGS: $kmInc" -ForegroundColor DarkCyan
+        $env:CFLAGS   = "$env:CFLAGS /I`"$kmInc`""
+        $env:CXXFLAGS = "$env:CXXFLAGS /I`"$kmInc`""
+    }
+}
+
+# Mesa is built with clang-cl 18 against VS 2022 BT's STL (so the ABI
+# matches the LLVM 18 we built into C:\mesa-deps). Two version-check
+# bypasses are needed:
+#   -fms-compatibility-version=19.40   - LLVM headers reject < VS 2019
+#   -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH - VS 2022 STL refuses
+#       Clang < 19 in <yvals_core.h>. We ABI-match fine in practice.
+$env:CFLAGS   = "$env:CFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+$env:CXXFLAGS = "$env:CXXFLAGS -fms-compatibility-version=19.40 -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+
+# For non-x64 targets, meson needs a cross-file so it knows host_machine
+# is different and so VC_LibraryPath_* / lld-link / llvm-rc /
+# llvm-lib are wired up with explicit --target=<triple>. We emit one
+# per build tree.
+if ($Platform -ne "x64" -and $clangCl -and $clangTarget) {
+    $crossFile = Join-Path $buildTree "winmali-$($Platform.ToLower()).cross"
+    $cpuFamily = if ($Platform -eq "ARM64") { "aarch64" } else { "x86" }
+    $cpu       = $cpuFamily
+    # Forward slashes in paths so meson's INI parser doesn't choke on
+    # backslash-escape ambiguities; "&" -> %26 and quote everything.
+    $clangFs   = $clangCl -replace '\\','/'
+    $crossText = @"
+# Auto-generated by build-mesa.ps1; do not edit. Regenerate by deleting
+# the surrounding build tree and re-running with -Reconfigure.
+[binaries]
+c       = ['$clangFs', '--target=$clangTarget']
+cpp     = ['$clangFs', '--target=$clangTarget']
+ar      = 'llvm-lib'
+windres = 'llvm-rc'
+
+[host_machine]
+system     = 'windows'
+cpu_family = '$cpuFamily'
+cpu        = '$cpu'
+endian     = 'little'
+"@
+    New-Item -ItemType Directory -Force -Path $buildTree | Out-Null
+    Set-Content -Path $crossFile -Value $crossText -Encoding ASCII
+    Write-Host "Wrote meson cross-file: $crossFile" -ForegroundColor DarkCyan
+    $mesonSetupArgs += @("--cross-file", $crossFile)
 }
 
 if (-not (Test-Path (Join-Path $buildTree "build.ninja"))) {
@@ -221,9 +335,11 @@ if ($ConfigureOnly) {
 # --------------------------------------------------------------------------
 $mesonTargets = @(
     "WinMaliGL",
-    "d3d10_rk3588",
-    "WinMaliVk"
+    "WinMaliUmd"
 )
+if (-not $SkipVulkan) {
+    $mesonTargets += "vulkan_panfrost"
+}
 
 Write-Host "meson compile ($($mesonTargets -join ', '))" -ForegroundColor Cyan
 & $WinMaliMeson "compile" "-C" $buildTree @mesonTargets

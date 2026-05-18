@@ -35,14 +35,15 @@
     <ProjectGuid>{B1B2C3D4-0003-4E5F-9A0B-001122334455}</ProjectGuid>
     <RootNamespace>WinMaliMesa</RootNamespace>
     <ProjectName>WinMaliMesa</ProjectName>
-    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+    <SpectreMitigation>false</SpectreMitigation>
+    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
 
   <PropertyGroup Label="Configuration">
     <ConfigurationType>Utility</ConfigurationType>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>v141</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
 

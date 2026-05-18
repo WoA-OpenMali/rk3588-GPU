@@ -32,7 +32,13 @@
     <Platform Condition="'$(Platform)' == ''">ARM64</Platform>
     <RootNamespace>WinMaliKmd</RootNamespace>
     <ProjectName>WinMaliKmd</ProjectName>
-    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+    <!-- See sibling UMD/Mesa projects: kill the Spectre default here in
+         Globals before VS 2017's WDK platform.props can latch it. -->
+    <SpectreMitigation>false</SpectreMitigation>
+    <!-- Pinned to 1809 SDK (matches VS 2017 v141 toolchain on this box).
+         WindowsKernelModeDriver10.0 picks up displib.lib via
+         $(DDK_LIB_PATH) which resolves against this version. -->
+    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -118,7 +124,7 @@
   <ItemGroup>
     <ClInclude Include="WinMaliKmd.h" />
     <ClInclude Include="WinMaliDxgkInitFill.h" />
-    <ClInclude Include="..\Shared\WinMaliCommon.h" />
+    <ClInclude Include="..\Shared\WinMaliEscape.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="WinMaliDriver.c" />

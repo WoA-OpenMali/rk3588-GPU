@@ -24,7 +24,7 @@ Abstract:
 #include <dispmprt.h>
 #include <ntstrsafe.h>
 
-#include "..\Shared\WinMaliCommon.h"
+#include "..\Shared\WinMaliEscape.h"
 
 /*
  * Per-adapter context. dxgk hands MiniportDeviceContext back to us on

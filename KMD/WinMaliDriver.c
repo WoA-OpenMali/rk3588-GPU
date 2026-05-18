@@ -1,32 +1,7 @@
-/*++
-
-Module Name:
-
-    WinMaliDriver.c
-
-Abstract:
-
-    WDDM 2.0 miniport skeleton for the Mali-G610 GPU on RK3588.
-
-    Wires DriverEntry -> DxgkInitialize, allocates a per-adapter
-    context in AddDevice, captures the DXGKRNL_INTERFACE in
-    StartDevice. Nothing else does real work yet. Every other DDI is
-    a STATUS_NOT_SUPPORTED stub.
-
-    This file deliberately holds zero hardware logic. When you start
-    bringing up the Mali block, add a hw\ subdirectory and call into
-    it from StartDevice; don't grow this file unboundedly.
-
---*/
 
 #include "WinMaliKmd.h"
 #include "WinMaliDxgkInitFill.h"
 
-/*
- * Singleton adapter. RK3588 has exactly one Mali-G610; if that ever
- * changes (multi-SoC system), swap this for a list keyed on
- * PhysicalDeviceObject.
- */
 static PWINMALI_ADAPTER g_WinMaliAdapter = NULL;
 
 PWINMALI_ADAPTER
@@ -106,14 +81,12 @@ WinMaliKmdAddDevice(
         return STATUS_INVALID_PARAMETER;
     }
 
-    adapter = (PWINMALI_ADAPTER)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, sizeof(*adapter), WINMALI_POOL_TAG);
+    adapter = (PWINMALI_ADAPTER)ExAllocatePoolWithTag(
+        NonPagedPoolNx, sizeof(*adapter), WINMALI_POOL_TAG);
     if (adapter == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    /* ExAllocatePool2 zeroes by default, but be explicit so a future
-       switch back to ExAllocatePoolWithTag doesn't silently leak state. */
     RtlZeroMemory(adapter, sizeof(*adapter));
     adapter->Magic                = WINMALI_ADAPTER_MAGIC;
     adapter->PhysicalDeviceObject = PhysicalDeviceObject;

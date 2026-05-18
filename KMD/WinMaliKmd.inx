@@ -4,18 +4,21 @@
 ; Installs the WinMali render-only WDDM 2.0 miniport for the Mali-G610
 ; GPU on RK3588 (ACPI HID ARMH5655, as exported by edk2-rk3588's gpu.asl).
 ;
-; Four binaries ship in this package:
+; Files in this package (ARM64 deployment target):
 ;
-;   * WinMaliKmd.sys  - kernel miniport (this driver)
-;   * WinMaliUmd.dll  - mesa-built D3D10/11 UMD (gallium d3d10umd frontend,
-;                       d3d10rk3588 target, panfrost backend); the hand-
-;                       written UMD remains in-tree as a fallback until
-;                       the mesa path is proven.
-;   * WinMaliGL.dll   - mesa-built OpenGL ICD (wgl target, panfrost backend)
-;   * WinMaliVk.dll   - mesa-built Vulkan ICD placeholder (returns
-;                       INCOMPATIBLE_DRIVER until panvk grows v10/CSF +
-;                       Windows support; see Shared\WinMaliEscape.h and
-;                       docs\MESA_INTEGRATION.md)
+;   * WinMaliKmd.sys   - kernel miniport (ARM64, native; KM does not emulate)
+;   * WinMaliUmd.dll   - mesa-built D3D10/11 UMD, ARM64. Loaded by dxgkrnl
+;                        into native ARM64 D3D11 processes.
+;   * WinMaliUmd64.dll - mesa-built D3D10/11 UMD, x64. Loaded by dxgkrnl
+;                        into x64 processes running under Prism emulation
+;                        on Windows 11 ARM64 (UserModeDriverNameWoW slot).
+;   * WinMaliGL.dll    / WinMaliGL64.dll  - OpenGL ICD pair (ARM64 + x64).
+;   * WinMaliVk.dll    / WinMaliVk64.dll  - Vulkan ICD placeholder pair.
+;
+; The hand-written UMD stub under UMD\ has been retired from the build;
+; mesa's d3d10rk3588 target is now the only D3D11 UMD we ship. The
+; sources stay in-tree for historical reference but the .vcxproj is no
+; longer in the .sln and is not built.
 ;
 ; Display ownership is intentionally NOT in this driver. VOP2 lives in a
 ; separate display package.
@@ -38,10 +41,13 @@ WinMaliKmd.Drivers   = 13
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-WinMaliKmd.sys = 1
-WinMaliUmd.dll = 1
-WinMaliGL.dll  = 1
-WinMaliVk.dll  = 1
+WinMaliKmd.sys   = 1
+WinMaliUmd.dll   = 1
+WinMaliUmd64.dll = 1
+WinMaliGL.dll    = 1
+WinMaliGL64.dll  = 1
+WinMaliVk.dll    = 1
+WinMaliVk64.dll  = 1
 
 [Manufacturer]
 %ProviderName% = WinMali, NTARM64
@@ -91,46 +97,67 @@ HKR,, TypesSupported,   %REG_DWORD%,     7
 [WinMaliKmd.Drivers]
 WinMaliKmd.sys
 WinMaliUmd.dll
+WinMaliUmd64.dll
 WinMaliGL.dll
+WinMaliGL64.dll
 WinMaliVk.dll
+WinMaliVk64.dll
 
 ;
 ; HKR (per-device) software settings.
 ;
-; UserModeDriverName is repeated four times because dxgk indexes the
-; multi-sz by D3D feature level [0..3]. Pointing all four at the same
-; UMD is the standard render-only / OpenGL-via-ICD pattern; we narrow
-; it later when we ship per-FL UMDs.
+; D3D11 UMD slots:
+;   - UserModeDriverName    -> loaded by dxgkrnl into native-arch processes
+;                              (ARM64 on an ARM64 OS, x64 on an x64 OS).
+;                              The REG_MULTI_SZ is indexed [0..3] by D3D
+;                              feature level slot.
+;   - UserModeDriverNameWoW -> loaded into "Wow" (non-native) processes.
+;                              Historically x86 on an x64 OS; on Win11
+;                              ARM64 this is the x64 binary that dxgkrnl
+;                              loads into x64 processes running under
+;                              Prism emulation.
+; Paths use the %13%\ (driver store) convention required by PnpLockdown=1
+; modern (DCH) drivers - same pattern NVIDIA's nvldumdx / nvldumd uses.
 ;
 ; WDDMVersion must match the DXGKDDI_INTERFACE_VERSION pinned in
 ; WinMaliDxgkInitFill.c. Bump the two together. 0x2000 = WDDM 2.0.
 ;
 [WinMaliKmd.SoftwareSettings]
-HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll"
-HKR,, UserModeDriverNameWOW, %REG_MULTI_SZ%, "WinMaliUmd.dll"
+HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "%13%\WinMaliUmd.dll","%13%\WinMaliUmd.dll","%13%\WinMaliUmd.dll","%13%\WinMaliUmd.dll"
+HKR,, UserModeDriverNameWoW, %REG_MULTI_SZ%, "%13%\WinMaliUmd64.dll","%13%\WinMaliUmd64.dll","%13%\WinMaliUmd64.dll","%13%\WinMaliUmd64.dll"
 HKR,, VgaCompatible,         %REG_DWORD%,    0
 HKR,, WDDMVersion,           %REG_DWORD%,    0x2000   ; WDDM 2.0
 
 ;
 ; OpenGL ICD registration. opengl32.dll (the OS loader) looks at
 ; HKR\OpenGLDrivers\<name> on the active adapter and dispatches into
-; the Dll value. Version 2 == ICD.
+; the Dll value. Version 2 == ICD. The OpenGLDriversWoW subkey is the
+; sibling lookup for processes running under emulation - it's the same
+; mechanism the D3D UMD uses but split across two registry roots.
 ;
 HKR, "OpenGLDrivers\WinMaliGL",, %REG_NONE%, ""
-HKR, "OpenGLDrivers\WinMaliGL", Dll,           %REG_SZ%,    "WinMaliGL.dll"
+HKR, "OpenGLDrivers\WinMaliGL", Dll,           %REG_SZ%,    "%13%\WinMaliGL.dll"
 HKR, "OpenGLDrivers\WinMaliGL", DriverVersion, %REG_DWORD%, 0x00000002
 HKR, "OpenGLDrivers\WinMaliGL", Flags,         %REG_DWORD%, 0x00000001
 HKR, "OpenGLDrivers\WinMaliGL", Version,       %REG_DWORD%, 0x00000002
+
+HKR, "OpenGLDriversWoW\WinMaliGL",, %REG_NONE%, ""
+HKR, "OpenGLDriversWoW\WinMaliGL", Dll,           %REG_SZ%,    "%13%\WinMaliGL64.dll"
+HKR, "OpenGLDriversWoW\WinMaliGL", DriverVersion, %REG_DWORD%, 0x00000002
+HKR, "OpenGLDriversWoW\WinMaliGL", Flags,         %REG_DWORD%, 0x00000001
+HKR, "OpenGLDriversWoW\WinMaliGL", Version,       %REG_DWORD%, 0x00000002
 
 ;
 ; Vulkan ICD registration. The Vulkan-Loader enumerates per-adapter ICDs
 ; by reading these REG_MULTI_SZ values from each WDDM adapter's HKR;
 ; the loader matches by adapter LUID and calls into
-; vk_icdNegotiateLoaderICDInterfaceVersion in the named DLL. See:
+; vk_icdNegotiateLoaderICDInterfaceVersion in the named DLL.
+; VulkanDriverNameWoW is the documented Wow slot - same role as
+; UserModeDriverNameWoW above. See:
 ;   https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md
 ;
-HKR,, VulkanDriverName,    %REG_MULTI_SZ%, "WinMaliVk.dll"
-HKR,, VulkanDriverNameWoW, %REG_MULTI_SZ%, "WinMaliVk.dll"
+HKR,, VulkanDriverName,    %REG_MULTI_SZ%, "%13%\WinMaliVk.dll"
+HKR,, VulkanDriverNameWoW, %REG_MULTI_SZ%, "%13%\WinMaliVk64.dll"
 
 ;
 ; HKLM (machine-wide) graphics knobs. Keeping dxgmms2's scheduler /

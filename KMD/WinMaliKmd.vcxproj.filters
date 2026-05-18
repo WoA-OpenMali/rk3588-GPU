@@ -29,7 +29,7 @@
     <ClInclude Include="WinMaliDxgkInitFill.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\Shared\WinMaliCommon.h">
+    <ClInclude Include="..\Shared\WinMaliEscape.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

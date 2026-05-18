@@ -1,0 +1,152 @@
+;
+; WinMaliKmd.inx
+;
+; Installs the WinMali render-only WDDM 2.0 miniport for the Mali-G610
+; GPU on RK3588 (ACPI HID ARMH5655, as exported by edk2-rk3588's gpu.asl).
+;
+; Four binaries ship in this package:
+;
+;   * WinMaliKmd.sys  - kernel miniport (this driver)
+;   * WinMaliUmd.dll  - mesa-built D3D10/11 UMD (gallium d3d10umd frontend,
+;                       d3d10rk3588 target, panfrost backend); the hand-
+;                       written UMD remains in-tree as a fallback until
+;                       the mesa path is proven.
+;   * WinMaliGL.dll   - mesa-built OpenGL ICD (wgl target, panfrost backend)
+;   * WinMaliVk.dll   - mesa-built Vulkan ICD placeholder (returns
+;                       INCOMPATIBLE_DRIVER until panvk grows v10/CSF +
+;                       Windows support; see Shared\WinMaliEscape.h and
+;                       docs\MESA_INTEGRATION.md)
+;
+; Display ownership is intentionally NOT in this driver. VOP2 lives in a
+; separate display package.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Display
+ClassGUID   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 05/17/2026,0.0.1.0
+CatalogFile = WinMaliKmd.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir       = 13
+WinMaliKmd.Drivers   = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+WinMaliKmd.sys = 1
+WinMaliUmd.dll = 1
+WinMaliGL.dll  = 1
+WinMaliVk.dll  = 1
+
+[Manufacturer]
+%ProviderName% = WinMali, NTARM64
+
+[ControlFlags]
+; ARMH5655 is an ACPI-only enumerator; never offer it in any
+; "select a device" UI.
+ExcludeFromSelect = *
+
+[WinMali.NTARM64]
+%WinMaliKmd.DeviceDesc% = WinMaliKmd_Install, ACPI\ARMH5655
+
+;
+; The Install section uses the modern WDF/WDDM-style chain of
+;   Install -> Services -> SoftwareSettings -> Files.
+;
+[WinMaliKmd_Install]
+FeatureScore = FE
+CopyFiles    = WinMaliKmd.Drivers
+AddReg       = WinMaliKmd.SoftwareSettings
+AddReg       = WinMaliKmd.GraphicsDrivers.AddReg
+
+[WinMaliKmd_Install.Services]
+AddService = WinMaliKmd, 0x00000002, WinMaliKmd.Service, WinMaliKmd.EventLog
+
+;
+; LoadOrderGroup = Video is mandatory for WDDM miniports: dxgkrnl /
+; dxgmms2 build their per-adapter registry path during the Video phase,
+; and a driver that starts earlier will get its first DxgkCb* call before
+; that path exists. We learnt this the hard way in the prior driver
+; (bugcheck in DpiGetPnpRegistryKeyName).
+;
+[WinMaliKmd.Service]
+ServiceType    = 1            ; SERVICE_KERNEL_DRIVER
+StartType      = 3            ; SERVICE_DEMAND_START
+ErrorControl   = 0            ; SERVICE_ERROR_IGNORE
+LoadOrderGroup = Video
+ServiceBinary  = %13%\WinMaliKmd.sys
+
+[WinMaliKmd.EventLog]
+AddReg = WinMaliKmd.EventLog.AddReg
+
+[WinMaliKmd.EventLog.AddReg]
+HKR,, EventMessageFile, %REG_EXPAND_SZ%, "%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,, TypesSupported,   %REG_DWORD%,     7
+
+[WinMaliKmd.Drivers]
+WinMaliKmd.sys
+WinMaliUmd.dll
+WinMaliGL.dll
+WinMaliVk.dll
+
+;
+; HKR (per-device) software settings.
+;
+; UserModeDriverName is repeated four times because dxgk indexes the
+; multi-sz by D3D feature level [0..3]. Pointing all four at the same
+; UMD is the standard render-only / OpenGL-via-ICD pattern; we narrow
+; it later when we ship per-FL UMDs.
+;
+; WDDMVersion must match the DXGKDDI_INTERFACE_VERSION pinned in
+; WinMaliDxgkInitFill.c. Bump the two together. 0x2000 = WDDM 2.0.
+;
+[WinMaliKmd.SoftwareSettings]
+HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll", "WinMaliUmd.dll"
+HKR,, UserModeDriverNameWOW, %REG_MULTI_SZ%, "WinMaliUmd.dll"
+HKR,, VgaCompatible,         %REG_DWORD%,    0
+HKR,, WDDMVersion,           %REG_DWORD%,    0x2000   ; WDDM 2.0
+
+;
+; OpenGL ICD registration. opengl32.dll (the OS loader) looks at
+; HKR\OpenGLDrivers\<name> on the active adapter and dispatches into
+; the Dll value. Version 2 == ICD.
+;
+HKR, "OpenGLDrivers\WinMaliGL",, %REG_NONE%, ""
+HKR, "OpenGLDrivers\WinMaliGL", Dll,           %REG_SZ%,    "WinMaliGL.dll"
+HKR, "OpenGLDrivers\WinMaliGL", DriverVersion, %REG_DWORD%, 0x00000002
+HKR, "OpenGLDrivers\WinMaliGL", Flags,         %REG_DWORD%, 0x00000001
+HKR, "OpenGLDrivers\WinMaliGL", Version,       %REG_DWORD%, 0x00000002
+
+;
+; Vulkan ICD registration. The Vulkan-Loader enumerates per-adapter ICDs
+; by reading these REG_MULTI_SZ values from each WDDM adapter's HKR;
+; the loader matches by adapter LUID and calls into
+; vk_icdNegotiateLoaderICDInterfaceVersion in the named DLL. See:
+;   https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md
+;
+HKR,, VulkanDriverName,    %REG_MULTI_SZ%, "WinMaliVk.dll"
+HKR,, VulkanDriverNameWoW, %REG_MULTI_SZ%, "WinMaliVk.dll"
+
+;
+; HKLM (machine-wide) graphics knobs. Keeping dxgmms2's scheduler /
+; TDR machinery on known-quiet defaults during bring-up.
+;
+[WinMaliKmd.GraphicsDrivers.AddReg]
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",     EnablePreemption,            %REG_DWORD%, 0
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers",               TdrDebugMode,                %REG_DWORD%, 0
+HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager", DirectFlipMemoryRequirement, %REG_DWORD%, 0
+
+[Strings]
+ProviderName          = "WinMali Project"
+DiskName              = "WinMali Driver Disk"
+WinMaliKmd.DeviceDesc = "Mali-G610 GPU (WinMali, render-only)"
+REG_MULTI_SZ          = 0x00010000
+REG_EXPAND_SZ         = 0x00020000
+REG_DWORD             = 0x00010001
+REG_NONE              = 0x00000000
+REG_SZ                = 0x00000000

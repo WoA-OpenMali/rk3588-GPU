@@ -1,0 +1,3 @@
+LIBRARY     WinMaliUmd
+EXPORTS
+    OpenAdapter10_2

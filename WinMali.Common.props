@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Shared MSBuild property sheet for every WinMali project.
+
+  Single point of truth for:
+    * The repo-root build/ output directory ($(WinMaliBuildRoot)).
+    * OutDir / IntDir layout (no per-project .vs / Debug / x64 littering).
+    * Default WDK-friendly switches (SignMode, ApiValidator, Inf2Cat) that
+      are flipped ON only when the user explicitly asks for them on the
+      MSBuild command line.
+
+  Imported by every .vcxproj after Microsoft.Cpp.props and right before
+  ItemDefinitionGroup. Keep this file alphabetised within each group and
+  free of project-specific properties.
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup Label="WinMaliPaths">
+    <!--
+      build/ sits at the repo root (one level above this .props file).
+      Using $(MSBuildThisFileDirectory) instead of $(SolutionDir): when
+      MSBuild is invoked directly on a .vcxproj (not the .sln),
+      $(SolutionDir) silently defaults to the project's own folder and
+      "..\build" lands at <project>\..\build instead of <repo>\build.
+      $(MSBuildThisFileDirectory) always resolves to *this* file's
+      directory, so the calculation works either way.
+
+      The trailing slash is mandatory: MSBuild concatenates these as
+      strings, so a missing slash drops files directly in the parent.
+    -->
+    <WinMaliBuildRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\build'))\</WinMaliBuildRoot>
+    <OutDir>$(WinMaliBuildRoot)bin\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(WinMaliBuildRoot)obj\$(Configuration)\$(Platform)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+
+  <PropertyGroup Label="WinMaliWdkDefaults">
+    <!--
+      InfVerif.dll / ApiExtractor.exe / Inf2Cat.exe ship with the *full*
+      WDK workload but not the desktop-only SDK install. Default them off
+      so a stock Visual Studio + SDK box can compile the tree end-to-end;
+      pass /p:SkipPackageVerification=false (etc.) from build.ps1 when
+      preparing a release artifact.
+    -->
+    <SkipPackageVerification Condition="'$(SkipPackageVerification)' == ''">true</SkipPackageVerification>
+    <ApiValidator_Enable     Condition="'$(ApiValidator_Enable)'     == ''">false</ApiValidator_Enable>
+    <EnableInf2cat           Condition="'$(EnableInf2cat)'           == ''">false</EnableInf2cat>
+    <SignMode                Condition="'$(SignMode)'                == ''">Off</SignMode>
+  </PropertyGroup>
+
+  <PropertyGroup Label="WinMaliMisc">
+    <!-- Spectre-mitigated CRT libs ship in the VS "Spectre" individual
+         component, which isn't installed by default. Opt out unless the
+         user has explicitly added them. -->
+    <SpectreMitigation>false</SpectreMitigation>
+    <UseSpectreMitigatedLibraries>false</UseSpectreMitigatedLibraries>
+  </PropertyGroup>
+
+  <!-- Make $(WinMaliBuildRoot) visible to child .props/.targets that
+       Import this file. -->
+  <PropertyGroup>
+    <WinMaliBuildRoot>$(WinMaliBuildRoot)</WinMaliBuildRoot>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WinMaliMesa.vcxproj
+
+  Utility project that drives the Mesa build (meson + ninja) from inside
+  the WinMali-rk3588 solution. Mesa cannot be built with MSBuild; we
+  shell out to Tools\build-mesa.ps1 from custom Build / Clean targets.
+
+  The project produces WinMaliGL.dll in the shared build\ folder (renamed
+  from Mesa's libgl-gdi opengl32.dll output, so it doesn't shadow the
+  system loader DLL).
+-->
+<Project DefaultTargets="Build" ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B1B2C3D4-0003-4E5F-9A0B-001122334455}</ProjectGuid>
+    <RootNamespace>WinMaliMesa</RootNamespace>
+    <ProjectName>WinMaliMesa</ProjectName>
+    <WindowsTargetPlatformVersion>$(LatestTargetPlatformVersion)</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Utility</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+    <Import Project="..\WinMali.Common.props" />
+  </ImportGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <!--
+    Build target: invoke build-mesa.ps1 with the matching configuration.
+    -SkipIfPresent makes incremental MSBuild runs cheap: the script
+    exits 0 immediately if WinMaliGL.dll already exists for the current
+    configuration. Force a full reconfigure by Cleaning first or with
+    /t:Rebuild.
+  -->
+  <Target Name="Build">
+    <Message Text="WinMaliMesa: configure + compile (configuration=$(Configuration))" Importance="high" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)..\Tools\build-mesa.ps1&quot; -Configuration $(Configuration) -SkipIfPresent" />
+  </Target>
+
+  <Target Name="Rebuild">
+    <Message Text="WinMaliMesa: rebuild (configuration=$(Configuration))" Importance="high" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)..\Tools\build-mesa.ps1&quot; -Configuration $(Configuration) -Reconfigure" />
+  </Target>
+
+  <Target Name="Clean">
+    <Message Text="WinMaliMesa: cleaning mesa build tree" Importance="high" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(ProjectDir)..\Tools\build-mesa.ps1&quot; -Configuration $(Configuration) -Clean" />
+  </Target>
+
+</Project>

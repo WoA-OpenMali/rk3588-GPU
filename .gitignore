@@ -26,3 +26,4 @@ ARM64/Release/
 *.pnf
 WinMaliKmd/
 WinMaliUmd/
+docs/

@@ -154,28 +154,62 @@ function Invoke-MesaBuild([string]$mesaPlatform) {
     return $LASTEXITCODE
 }
 
-function Copy-WowCompanions([string]$nativePlatform, [string]$wowPlatform) {
-    # Copy each WinMali*.dll from <bin>\<Cfg>\<wow>\ into <bin>\<Cfg>\<native>\
-    # renamed with a "64" suffix before the .dll extension. PDBs come
-    # along for the ride so the Wow binaries are debuggable in-place.
-    $srcDir = Join-Path $WinMaliBuildDir "bin\$Configuration\$wowPlatform"
+#
+# Stage emulator binaries alongside the ARM64-native ones.
+#
+# A modern WoA display driver ships three flavors of each user-mode
+# binary, one per process bitness/emulation. Matching the Adreno layout:
+#
+#   ARM64-native       -> bin\<Cfg>\ARM64\WinMali*.dll      (DriverStore)
+#   x86 (WOW64)        -> bin\<Cfg>\ARM64\WinMali*X86.dll   (SysWow64)
+#   x64-via-Prism      -> bin\<Cfg>\ARM64\WinMali*Chpe.dll  (SyChpe32)
+#
+# We build each flavor from its own mesa tree (x64 + Win32) and copy
+# the resulting WinMali*.dll into the ARM64 bin dir with a $suffix
+# applied before the .dll extension. PDBs ride along so each binary
+# stays debuggable in-place. The KMD .sys is ARM64-only and stays put.
+#
+function Copy-EmulatorCompanions([string]$nativePlatform,
+                                 [string]$srcPlatform,
+                                 [string]$suffix) {
+    $srcDir = Join-Path $WinMaliBuildDir "bin\$Configuration\$srcPlatform"
     $dstDir = Join-Path $WinMaliBuildDir "bin\$Configuration\$nativePlatform"
     if (-not (Test-Path $srcDir)) {
-        Write-Host "Copy-WowCompanions: no $srcDir to stage from" -ForegroundColor Yellow
+        Write-Host "Copy-EmulatorCompanions: no $srcDir to stage from" -ForegroundColor Yellow
         return
     }
     New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
     foreach ($f in Get-ChildItem $srcDir -Filter "WinMali*.dll") {
         $base = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-        if ($base -like "*64") { continue }   # already a Wow companion
-        if ($base -eq "WinMaliKmd") { continue }   # KMD is ARM64-only
-        $newName = "$base`64.dll"
+        # Skip already-suffixed binaries and the KMD.
+        if ($base -match "(Chpe|X86)$") { continue }
+        if ($base -eq "WinMaliKmd")     { continue }
+        $newName = "$base$suffix.dll"
         Copy-Item -Path $f.FullName -Destination (Join-Path $dstDir $newName) -Force
         $pdb = [System.IO.Path]::ChangeExtension($f.FullName, ".pdb")
         if (Test-Path $pdb) {
-            Copy-Item -Path $pdb -Destination (Join-Path $dstDir "$base`64.pdb") -Force
+            Copy-Item -Path $pdb -Destination (Join-Path $dstDir "$base$suffix.pdb") -Force
         }
-        Write-Host "Staged Wow companion: $dstDir\$newName" -ForegroundColor DarkGreen
+        Write-Host "Staged $suffix companion: $dstDir\$newName" -ForegroundColor DarkGreen
+    }
+}
+
+function Copy-VulkanIcdJsons([string]$nativePlatform) {
+    # Drop the three Vulkan loader manifests alongside the binaries so
+    # the INF's CopyFiles section finds them in the source dir at
+    # Inf2cat / staging time.
+    $srcDir = Join-Path $PSScriptRoot "..\KMD"
+    $dstDir = Join-Path $WinMaliBuildDir "bin\$Configuration\$nativePlatform"
+    New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+    foreach ($json in @("WinMaliVk_icd.json",
+                        "WinMaliVk_icd_x86.json")) {
+        $src = Join-Path $srcDir $json
+        if (Test-Path $src) {
+            Copy-Item -Path $src -Destination (Join-Path $dstDir $json) -Force
+            Write-Host "Staged Vulkan ICD manifest: $dstDir\$json" -ForegroundColor DarkGreen
+        } else {
+            Write-Host "Vulkan ICD manifest missing: $src" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -186,20 +220,33 @@ if ($runMesa) {
         exit 4
     }
 
-    # When targeting ARM64, build x64 first so we can stage its outputs
-    # as the WoW companions (WinMaliUmd64.dll etc) inside the ARM64
-    # bin dir before the InfVerif / Inf2cat tasks fire.
+    # When targeting ARM64, build the Win32 (x86) emulation flavor first
+    # so the SysWow64 companions are present alongside the native ARM64
+    # binaries before InfVerif / Inf2cat fire.
+    #
+    #   Win32 build -> staged as WinMali*X86.dll (WOW64, lands in SysWow64)
+    #
+    # x64-under-Prism is NOT handled here. SyChpe32 is the x86 CHPE
+    # emulation directory, not an x64 slot - Microsoft Learn ("How
+    # emulation works on Arm") spells this out: x64 emulated processes
+    # share the OS's ARM64X system binaries from System32/DriverStore.
+    # Covering x64-Prism would require building the user-mode DLLs as
+    # ARM64X (or at least ARM64EC); -Platform ARM64EC is wired in
+    # build-mesa.ps1 for that future step. For now native ARM64 only.
     if ($Platform -eq "ARM64") {
-        $code = Invoke-MesaBuild "x64"
-        if ($code -ne 0) {
-            $overall = $code
-            if ($StopOnFirstError) {
-                Write-Host "Mesa x64 (Wow companion) build failed; stopping." -ForegroundColor Red
-                exit $overall
+        foreach ($emuPlatform in @("Win32")) {
+            $code = Invoke-MesaBuild $emuPlatform
+            if ($code -ne 0) {
+                $overall = $code
+                if ($StopOnFirstError) {
+                    Write-Host "Mesa $emuPlatform (emulator companion) build failed; stopping." -ForegroundColor Red
+                    exit $overall
+                }
+                Write-Host "Mesa $emuPlatform (emulator companion) failed (exit=$code); continuing." -ForegroundColor Yellow
             }
-            Write-Host "Mesa x64 (Wow companion) failed (exit=$code); continuing." -ForegroundColor Yellow
         }
-        Copy-WowCompanions -nativePlatform "ARM64" -wowPlatform "x64"
+        Copy-EmulatorCompanions -nativePlatform "ARM64" -srcPlatform "Win32" -suffix "X86"
+        Copy-VulkanIcdJsons     -nativePlatform "ARM64"
     }
 
     $code = Invoke-MesaBuild $Platform

@@ -2,26 +2,58 @@
 ; WinMaliKmd.inx
 ;
 ; Installs the WinMali render-only WDDM 2.0 miniport for the Mali-G610
-; GPU on RK3588 (ACPI HID ARMH5655, as exported by edk2-rk3588's gpu.asl).
+; GPU on RK3588 (ACPI HID ARMH5655, as exported by edk2-rk3588's
+; gpu.asl).
 ;
-; Files in this package (ARM64 deployment target):
+; Driver shape modelled on Qualcomm Adreno's qcdx8380.inf - the only
+; widely-shipping Windows-on-Arm WDDM display driver in the wild.
 ;
-;   * WinMaliKmd.sys   - kernel miniport (ARM64, native; KM does not emulate)
-;   * WinMaliUmd.dll   - mesa-built D3D10/11 UMD, ARM64. Loaded by dxgkrnl
-;                        into native ARM64 D3D11 processes.
-;   * WinMaliUmd64.dll - mesa-built D3D10/11 UMD, x64. Loaded by dxgkrnl
-;                        into x64 processes running under Prism emulation
-;                        on Windows 11 ARM64 (UserModeDriverNameWoW slot).
-;   * WinMaliGL.dll    / WinMaliGL64.dll  - OpenGL ICD pair (ARM64 + x64).
-;   * WinMaliVk.dll    / WinMaliVk64.dll  - Vulkan ICD placeholder pair.
+; Process-bitness coverage (see Microsoft Learn,
+; "How emulation works on Arm" + "Arm64X PE Files"):
 ;
-; The hand-written UMD stub under UMD\ has been retired from the build;
-; mesa's d3d10rk3588 target is now the only D3D11 UMD we ship. The
-; sources stay in-tree for historical reference but the .vcxproj is no
-; longer in the .sln and is not built.
+;   * Native ARM64 process
+;       The ARM64 UMD is the file at %13%\WinMaliUmd.dll and is
+;       referenced by UserModeDriverName.
 ;
-; Display ownership is intentionally NOT in this driver. VOP2 lives in a
-; separate display package.
+;   * 32-bit x86 process under WOW64
+;       A separate pure-x86 UMD lives at %13%\WinMaliUmdX86.dll (same
+;       DriverStore as the ARM64 binary, different file) and is
+;       referenced by UserModeDriverNameWow with a full %13% path.
+;       Keeping x86 in DriverStore (rather than SysWow64) is what lets
+;       the INF pass InfVerif's "isolation to DIRID 13" rule. The
+;       PnPLockdown driver-store loader resolves the path for 32-bit
+;       WoW64 dxgi.dll the same way it does for the native-arch UMD.
+;
+;   * 64-bit x64 process under Prism emulation
+;       Windows-on-Arm has NO SysX64 directory and NO separate
+;       registry slot for an x64-only UMD. The OS loads the ARM64 UMD
+;       directly into the emulated x64 process, which only works if
+;       the UMD is an ARM64X hybrid PE (Microsoft Learn: "Arm64X PE
+;       Files" lists exactly this case - "A single binary that gets
+;       injected into an x64 or Arm64 process"). We do not produce
+;       ARM64X today; x64-under-Prism apps will fall through to the
+;       OS basic display driver until we have ARM64X tooling. That's
+;       a future-work item, not an INF issue.
+;
+; Adreno's qcdx11chpeum.dll lives in SyChpe32 - that directory is for
+; x86 Compiled-Hybrid-PE emulation only (a faster alternative to
+; SysWow64 on Snapdragon devices), NOT for x64-under-Prism. We don't
+; produce CHPE-format binaries, so we don't populate SyChpe32 either.
+;
+; Files in this package:
+;
+;   * WinMaliKmd.sys    - kernel miniport (ARM64; KM does not emulate)
+;   * WinMaliUmd.dll    - mesa-built D3D10/11 UMD, ARM64
+;   * WinMaliUmdX86.dll - mesa-built D3D10/11 UMD, x86
+;   * WinMaliGL.dll     - mesa-built OpenGL ICD,   ARM64
+;   * WinMaliGLX86.dll  - mesa-built OpenGL ICD,   x86
+;   * WinMaliVk.dll     - mesa-built Vulkan ICD,   ARM64
+;   * WinMaliVkX86.dll  - mesa-built Vulkan ICD,   x86
+;   * WinMaliVk_icd.json     - Vulkan loader manifest, ARM64
+;   * WinMaliVk_icd_x86.json - Vulkan loader manifest, x86
+;
+; Display ownership is intentionally NOT in this driver. VOP2 lives
+; in a separate display-only package.
 ;
 
 [Version]
@@ -29,56 +61,106 @@ Signature   = "$WINDOWS NT$"
 Class       = Display
 ClassGUID   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 05/17/2026,0.0.1.0
+DriverVer   = 05/17/2026,0.0.3.0
 CatalogFile = WinMaliKmd.cat
 PnpLockdown = 1
 
+;
+; DestinationDirs picks which OS folder each CopyFiles section lands
+; in. dirids reference:
+;   13 = DriverStore (system32\DriverStore\FileRepository\<INF>)
+;
+; Everything lives in %13% so the package satisfies the
+; WHQL "isolation to DIRID 13" check that DCH / Universal-style
+; drivers must pass. WOW64 dispatch is then handled via the
+; UserModeDriverNameWow registry value below, which points at the
+; x86 DLL inside the DriverStore directory; on Windows-on-Arm the
+; per-driver DriverStore subdirectory is on the WoW64 process's DLL
+; search path the same way SysWow64 is for legacy drivers.
+;
 [DestinationDirs]
-DefaultDestDir       = 13
-WinMaliKmd.Drivers   = 13
+WinMaliKmd.Files.Native = 13                ; everything in DriverStore
+WinMaliKmd.Files.X86    = 13                ; WOW64 binaries also in DriverStore
+DefaultDestDir          = 13
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
 
 [SourceDisksFiles]
-WinMaliKmd.sys   = 1
-WinMaliUmd.dll   = 1
-WinMaliUmd64.dll = 1
-WinMaliGL.dll    = 1
-WinMaliGL64.dll  = 1
-WinMaliVk.dll    = 1
-WinMaliVk64.dll  = 1
+WinMaliKmd.sys              = 1
+WinMaliUmd.dll              = 1
+WinMaliUmdX86.dll           = 1
+WinMaliGL.dll               = 1
+WinMaliGLX86.dll            = 1
+WinMaliVk.dll               = 1
+WinMaliVkX86.dll            = 1
+WinMaliVk_icd.json          = 1
+WinMaliVk_icd_x86.json      = 1
 
+;
+; PETrust on each UMD/ICD prevents the OS from doing image-load
+; signature checks against the driver catalog every time dxgkrnl maps
+; the UMD into a new process. Adreno does the same for every -um.dll
+; they ship.
+;
+[SignatureAttributes]
+WinMaliUmd.dll      = SignatureAttributes.PETrust
+WinMaliUmdX86.dll   = SignatureAttributes.PETrust
+WinMaliGL.dll       = SignatureAttributes.PETrust
+WinMaliGLX86.dll    = SignatureAttributes.PETrust
+WinMaliVk.dll       = SignatureAttributes.PETrust
+WinMaliVkX86.dll    = SignatureAttributes.PETrust
+
+[SignatureAttributes.PETrust]
+PETrust = true
+
+;
+; Manufacturer / Models. The `.10.0...16299` decorator gates the
+; section to Windows 10 RS3 (build 16299) and later, which is the
+; first release that supports the ARM64 platform target this INF
+; assumes. Without it, the OS will try to install the driver on
+; older releases and fail unpredictably (no WDDM 2.x).
+;
 [Manufacturer]
-%ProviderName% = WinMali, NTARM64
+%ProviderName% = WinMali, NTARM64.10.0...16299
 
 [ControlFlags]
 ; ARMH5655 is an ACPI-only enumerator; never offer it in any
 ; "select a device" UI.
 ExcludeFromSelect = *
 
-[WinMali.NTARM64]
+[WinMali.NTARM64.10.0...16299]
 %WinMaliKmd.DeviceDesc% = WinMaliKmd_Install, ACPI\ARMH5655
 
 ;
-; The Install section uses the modern WDF/WDDM-style chain of
-;   Install -> Services -> SoftwareSettings -> Files.
+; Install -> Services -> SoftwareSettings -> Files chain.
+;
+; FeatureScore (lower = preferred): D1 marks this as a strong vendor
+; choice, picked over the OS-bundled "Microsoft Basic Display" driver
+; that Windows would otherwise default to. Adreno uses D1.
+;
+; AddProperty WDTFSOCDeviceCategory tags the device as part of the
+; SOC class for the Windows Driver Test Framework / HLK test surface.
+; Matches how Adreno declares Snapdragon-bundled GPUs.
 ;
 [WinMaliKmd_Install]
-FeatureScore = FE
-CopyFiles    = WinMaliKmd.Drivers
+FeatureScore = D1
+CopyFiles    = WinMaliKmd.Files.Native, WinMaliKmd.Files.X86
 AddReg       = WinMaliKmd.SoftwareSettings
-AddReg       = WinMaliKmd.GraphicsDrivers.AddReg
+AddProperty  = WDTFSOCDeviceCategory
+
+[WDTFSOCDeviceCategory]
+{5D078032-6378-437B-8DA5-9B32B7CA3FDD},2,7,,2
 
 [WinMaliKmd_Install.Services]
 AddService = WinMaliKmd, 0x00000002, WinMaliKmd.Service, WinMaliKmd.EventLog
 
 ;
 ; LoadOrderGroup = Video is mandatory for WDDM miniports: dxgkrnl /
-; dxgmms2 build their per-adapter registry path during the Video phase,
-; and a driver that starts earlier will get its first DxgkCb* call before
-; that path exists. We learnt this the hard way in the prior driver
-; (bugcheck in DpiGetPnpRegistryKeyName).
+; dxgmms2 build their per-adapter registry path during the Video
+; phase, and a driver that starts earlier will get its first DxgkCb*
+; call before that path exists. We learnt this the hard way in the
+; prior driver (bugcheck in DpiGetPnpRegistryKeyName).
 ;
 [WinMaliKmd.Service]
 ServiceType    = 1            ; SERVICE_KERNEL_DRIVER
@@ -94,79 +176,96 @@ AddReg = WinMaliKmd.EventLog.AddReg
 HKR,, EventMessageFile, %REG_EXPAND_SZ%, "%%SystemRoot%%\System32\IoLogMsg.dll"
 HKR,, TypesSupported,   %REG_DWORD%,     7
 
-[WinMaliKmd.Drivers]
+;
+; CopyFiles sections. Both land in %13% (DriverStore) per the
+; [DestinationDirs] above; the section split is retained for clarity
+; about which binaries serve which process bitness.
+;
+[WinMaliKmd.Files.Native]
 WinMaliKmd.sys
 WinMaliUmd.dll
-WinMaliUmd64.dll
 WinMaliGL.dll
-WinMaliGL64.dll
 WinMaliVk.dll
-WinMaliVk64.dll
+WinMaliVk_icd.json
+WinMaliVk_icd_x86.json
+
+[WinMaliKmd.Files.X86]
+WinMaliUmdX86.dll
+WinMaliGLX86.dll
+WinMaliVkX86.dll
 
 ;
-; HKR (per-device) software settings.
+; HKR (per-device) software settings. This is the contract between
+; dxgkrnl and our user-mode driver.
 ;
-; D3D11 UMD slots:
-;   - UserModeDriverName    -> loaded by dxgkrnl into native-arch processes
-;                              (ARM64 on an ARM64 OS, x64 on an x64 OS).
-;                              The REG_MULTI_SZ is indexed [0..3] by D3D
-;                              feature level slot.
-;   - UserModeDriverNameWoW -> loaded into "Wow" (non-native) processes.
-;                              Historically x86 on an x64 OS; on Win11
-;                              ARM64 this is the x64 binary that dxgkrnl
-;                              loads into x64 processes running under
-;                              Prism emulation.
-; Paths use the %13%\ (driver store) convention required by PnpLockdown=1
-; modern (DCH) drivers - same pattern NVIDIA's nvldumdx / nvldumd uses.
+; D3D UMD slots:
+;   UserModeDriverName    -> native-arch UMD path. On ARM64 = the
+;                            ARM64 binary. The MULTI_SZ has four
+;                            slots indexed by D3D feature-level
+;                            family; slot 0 is the legacy DDI<9 slot
+;                            and Adreno leaves it as `<>` (the OS
+;                            treats <> as "no driver"). Slots 1/2/3
+;                            cover D3D9/10/11; add a slot for D3D12
+;                            once we have a D3D12 UMD.
+;   UserModeDriverNameWow -> 32-bit emulation slot. We use the
+;                            DriverStore path (%13%\WinMaliUmdX86.dll)
+;                            so the package stays DIRID-13-isolated
+;                            for InfVerif WHQL. The 32-bit WoW64
+;                            dxgi.dll resolves it directly via the
+;                            PnPLockdown driver-store loader path.
 ;
-; WDDMVersion must match the DXGKDDI_INTERFACE_VERSION pinned in
-; WinMaliDxgkInitFill.c. Bump the two together. 0x2000 = WDDM 2.0.
+; PnpLockdown=1 requires every UMD path to live under %13%\.
 ;
 [WinMaliKmd.SoftwareSettings]
-HKR,, UserModeDriverName,    %REG_MULTI_SZ%, "%13%\WinMaliUmd.dll","%13%\WinMaliUmd.dll","%13%\WinMaliUmd.dll","%13%\WinMaliUmd.dll"
-HKR,, UserModeDriverNameWoW, %REG_MULTI_SZ%, "%13%\WinMaliUmd64.dll","%13%\WinMaliUmd64.dll","%13%\WinMaliUmd64.dll","%13%\WinMaliUmd64.dll"
-HKR,, VgaCompatible,         %REG_DWORD%,    0
-HKR,, WDDMVersion,           %REG_DWORD%,    0x2000   ; WDDM 2.0
+HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, WinMaliUmd, WinMaliUmd, WinMaliUmd, WinMaliUmd
+HKR,, VgaCompatible,           %REG_DWORD%,    0
+HKR,, UserModeDriverName,    %REG_MULTI_SZ%, <>, "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll"
+HKR,, UserModeDriverNameWow, %REG_MULTI_SZ%, <>, "%13%\WinMaliUmdX86.dll", "%13%\WinMaliUmdX86.dll", "%13%\WinMaliUmdX86.dll"
 
 ;
 ; OpenGL ICD registration. opengl32.dll (the OS loader) looks at
 ; HKR\OpenGLDrivers\<name> on the active adapter and dispatches into
-; the Dll value. Version 2 == ICD. The OpenGLDriversWoW subkey is the
-; sibling lookup for processes running under emulation - it's the same
-; mechanism the D3D UMD uses but split across two registry roots.
+; the Dll value. Version 2 = ICD.
 ;
-HKR, "OpenGLDrivers\WinMaliGL",, %REG_NONE%, ""
-HKR, "OpenGLDrivers\WinMaliGL", Dll,           %REG_SZ%,    "%13%\WinMaliGL.dll"
-HKR, "OpenGLDrivers\WinMaliGL", DriverVersion, %REG_DWORD%, 0x00000002
-HKR, "OpenGLDrivers\WinMaliGL", Flags,         %REG_DWORD%, 0x00000001
-HKR, "OpenGLDrivers\WinMaliGL", Version,       %REG_DWORD%, 0x00000002
+; OpenGLDrivers    = native-arch ICD slot.
+; OpenGLDriversWow = 32-bit emulation ICD slot. Both reference the
+;                    DriverStore (%13%\) path so the package stays
+;                    isolated to DIRID 13 for InfVerif WHQL.
+;
+HKR, "OpenGLDrivers\WinMali",, %REG_NONE%, ""
+HKR, "OpenGLDrivers\WinMali", Dll,           %REG_SZ%,    "%13%\WinMaliGL.dll"
+HKR, "OpenGLDrivers\WinMali", DriverVersion, %REG_DWORD%, 0x00000002
+HKR, "OpenGLDrivers\WinMali", Flags,         %REG_DWORD%, 0x00000001
+HKR, "OpenGLDrivers\WinMali", Version,       %REG_DWORD%, 0x00000002
 
-HKR, "OpenGLDriversWoW\WinMaliGL",, %REG_NONE%, ""
-HKR, "OpenGLDriversWoW\WinMaliGL", Dll,           %REG_SZ%,    "%13%\WinMaliGL64.dll"
-HKR, "OpenGLDriversWoW\WinMaliGL", DriverVersion, %REG_DWORD%, 0x00000002
-HKR, "OpenGLDriversWoW\WinMaliGL", Flags,         %REG_DWORD%, 0x00000001
-HKR, "OpenGLDriversWoW\WinMaliGL", Version,       %REG_DWORD%, 0x00000002
+HKR, "OpenGLDriversWow\WinMali",, %REG_NONE%, ""
+HKR, "OpenGLDriversWow\WinMali", Dll,           %REG_SZ%,    "%13%\WinMaliGLX86.dll"
+HKR, "OpenGLDriversWow\WinMali", DriverVersion, %REG_DWORD%, 0x00000002
+HKR, "OpenGLDriversWow\WinMali", Flags,         %REG_DWORD%, 0x00000001
+HKR, "OpenGLDriversWow\WinMali", Version,       %REG_DWORD%, 0x00000002
 
 ;
-; Vulkan ICD registration. The Vulkan-Loader enumerates per-adapter ICDs
-; by reading these REG_MULTI_SZ values from each WDDM adapter's HKR;
-; the loader matches by adapter LUID and calls into
-; vk_icdNegotiateLoaderICDInterfaceVersion in the named DLL.
-; VulkanDriverNameWoW is the documented Wow slot - same role as
-; UserModeDriverNameWoW above. See:
+; Vulkan ICD registration. The Vulkan-Loader enumerates per-adapter
+; ICDs by reading these REG_SZ values from each WDDM adapter's HKR
+; and matches by adapter LUID. The pointed-at file is a small JSON
+; (Khronos-defined manifest format) which itself names the actual
+; ICD DLL.
+;
+;   VulkanDriverName    -> native ARM64
+;   VulkanDriverNameWow -> 32-bit emulation (loaded by 32-bit Vk
+;                          loader)
+;
+; Reference:
 ;   https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md
 ;
-HKR,, VulkanDriverName,    %REG_MULTI_SZ%, "%13%\WinMaliVk.dll"
-HKR,, VulkanDriverNameWoW, %REG_MULTI_SZ%, "%13%\WinMaliVk64.dll"
+HKR,, VulkanDriverName,    %REG_SZ%, "%13%\WinMaliVk_icd.json"
+HKR,, VulkanDriverNameWow, %REG_SZ%, "%13%\WinMaliVk_icd_x86.json"
 
-;
-; HKLM (machine-wide) graphics knobs. Keeping dxgmms2's scheduler /
-; TDR machinery on known-quiet defaults during bring-up.
-;
-[WinMaliKmd.GraphicsDrivers.AddReg]
-HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler",     EnablePreemption,            %REG_DWORD%, 0
-HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers",               TdrDebugMode,                %REG_DWORD%, 0
-HKLM, "SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager", DirectFlipMemoryRequirement, %REG_DWORD%, 0
+; (HKLM bring-up overrides removed - they triggered InfVerif WHQL
+; "registry root not isolated to HKR" errors. The OS-default
+; scheduler / TDR / DirectFlip values are fine for normal driver
+; operation; flip them at debug time via a separate registry-tweak
+; tool if needed.)
 
 [Strings]
 ProviderName          = "WinMali Project"

@@ -252,8 +252,25 @@ function Enter-WinMaliVsDevEnv {
         [string]$VsInstallOverride = ""
     )
 
-    # Already inside a dev shell? Don't double-load.
-    if ($env:VSCMD_ARG_HOST_ARCH -or $env:VSINSTALLDIR) { return $true }
+    # Already inside a dev shell matching the requested arch? Don't
+    # double-load. The arch match is critical: when the caller is
+    # cross-compiling Win32 from a parent shell that previously set
+    # up an x64 dev env, the inherited LIB has x64 paths only, and
+    # link.exe / lld-link picks the wrong msvcrt.lib. Force a re-init
+    # when VSCMD_ARG_TGT_ARCH doesn't match $Arch.
+    if (($env:VSCMD_ARG_HOST_ARCH -or $env:VSINSTALLDIR) -and
+        ($env:VSCMD_ARG_TGT_ARCH -eq $Arch)) {
+        return $true
+    }
+    # If we're going to re-init, scrub the inherited LIB / INCLUDE /
+    # PATH dev-shell pieces so the next VsDevCmd's output isn't
+    # appended to a stale environment. Don't touch user PATH entries -
+    # only the ones VsDevCmd would set.
+    if ($env:VSCMD_ARG_TGT_ARCH -and ($env:VSCMD_ARG_TGT_ARCH -ne $Arch)) {
+        $env:LIB     = ""
+        $env:INCLUDE = ""
+        $env:LIBPATH = ""
+    }
 
     $vsRoot = $null
     if ($VsInstallOverride -and (Test-Path (Join-Path $VsInstallOverride "Common7\Tools\VsDevCmd.bat"))) {

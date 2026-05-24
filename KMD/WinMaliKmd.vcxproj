@@ -124,14 +124,55 @@
   <ItemGroup>
     <ClInclude Include="WinMaliKmd.h" />
     <ClInclude Include="WinMaliDxgkInitFill.h" />
+    <ClInclude Include="WinMaliDxgkStubs.h" />
+    <ClInclude Include="WinMaliDxgkStubsWire.h" />
+    <ClInclude Include="WinMaliAlloc.h" />
+    <ClInclude Include="WinMaliMmu.h" />
+    <ClInclude Include="winmali_shader_programs.h" />
+    <ClInclude Include="hw\WinMaliHw.h" />
     <ClInclude Include="..\Shared\WinMaliEscape.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="WinMaliAlloc.c" />
+    <ClCompile Include="WinMaliBo.c" />
+    <ClCompile Include="WinMaliBringup.c" />
+    <ClCompile Include="WinMaliDdi.c" />
     <ClCompile Include="WinMaliDriver.c" />
     <ClCompile Include="WinMaliDxgkInitFill.c" />
+    <ClCompile Include="WinMaliDxgkStubs.c" />
+    <ClCompile Include="WinMaliEscape.c" />
+    <ClCompile Include="WinMaliFw.c" />
+    <ClCompile Include="WinMaliGroup.c" />
+    <ClCompile Include="WinMaliKillSwitch.c" />
+    <ClCompile Include="WinMaliMmu.c" />
+    <ClCompile Include="WinMaliPaging.c" />
+    <ClCompile Include="WinMaliQai.c" />
+    <ClCompile Include="WinMaliSync.c" />
+    <ClCompile Include="WinMaliVidmm.c" />
+    <ClCompile Include="WinMaliVm.c" />
+    <ClCompile Include="hw\WinMaliHw.c" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="WinMaliKmd.inx" />
+  </ItemGroup>
+  <!--
+    Vulkan loader manifest JSONs - one per process bitness/emulator.
+    These travel into the driver package via the INF's CopyFiles
+    section but they're authored as source-tree files; declaring them
+    here makes the KMD project track them so VS rebuilds the package
+    when the manifests change. CopyToOutputDirectory lands them next
+    to WinMaliKmd.sys / .inf at link time, which is where InfVerif and
+    Inf2cat look.
+  -->
+  <ItemGroup>
+    <None Include="WinMaliVk_icd.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <DeploymentContent>true</DeploymentContent>
+    </None>
+    <None Include="WinMaliVk_icd_x86.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <DeploymentContent>true</DeploymentContent>
+    </None>
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

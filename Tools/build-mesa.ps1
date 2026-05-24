@@ -56,7 +56,12 @@ param(
     # while panvk Windows porting catches up.
     [switch]$SkipVulkan,
 
-    [ValidateSet("ARM64","x64","Win32")]
+    # ARM64EC: ARM64 code with x64-compatible ABI. Loadable into both
+    # ARM64-native and Prism-emulated x64 processes (Microsoft's
+    # recommended cover for both in one binary on Windows-on-Arm 11).
+    # Used for user-mode driver components; the kernel miniport stays
+    # pure ARM64.
+    [ValidateSet("ARM64","ARM64EC","x64","Win32")]
     [string]$Platform = "x64"
 )
 
@@ -84,7 +89,13 @@ if (-not $WinMaliPython) {
 }
 
 # Per-platform build trees so x64 and ARM64 cross-builds don't fight.
-$buildTree = Join-Path $WinMaliBuildDir ("mesa\" + $Configuration.ToLower() + "-" + $Platform.ToLower())
+# $env:WINMALI_BUILD_TAG appends to the tree name, useful when the
+# previous tree is locked by Windows Defender or stale Explorer windows
+# and we need to start fresh without deleting.
+$buildTag  = $env:WINMALI_BUILD_TAG
+$treeName  = "mesa\" + $Configuration.ToLower() + "-" + $Platform.ToLower() +
+             $(if ($buildTag) { "-$buildTag" } else { "" })
+$buildTree = Join-Path $WinMaliBuildDir $treeName
 $binDir    = Join-Path $WinMaliBuildDir ("bin\$Configuration\$Platform")
 
 # clang-cl --target value per requested platform. For ARM64 we cross-
@@ -95,10 +106,11 @@ $binDir    = Join-Path $WinMaliBuildDir ("bin\$Configuration\$Platform")
 # meson thinks we're still targeting x86_64 and emits /MACHINE:X64
 # link flags, which break the ARM64 link step.
 $clangTarget = switch ($Platform) {
-    "ARM64" { "aarch64-pc-windows-msvc" }
-    "x64"   { "x86_64-pc-windows-msvc" }
-    "Win32" { "i686-pc-windows-msvc" }
-    default { $null }
+    "ARM64"   { "aarch64-pc-windows-msvc" }
+    "ARM64EC" { "arm64ec-pc-windows-msvc" }
+    "x64"     { "x86_64-pc-windows-msvc" }
+    "Win32"   { "i686-pc-windows-msvc" }
+    default   { $null }
 }
 
 # The shared_library() name set by meson via gallium-{wgl,d3d10}-dll-name
@@ -184,15 +196,32 @@ $mesonSetupArgs = @(
     "-Dvideo-codecs="
 )
 
-# LLVM and libclc deps in C:\mesa-deps are x64 binaries. For an ARM64
-# cross-build we can't link them, and panfrost / panvk-v10 don't need
-# the LLVM-backed code paths (LLVMpipe, draw module's llvm fallback,
-# rusticl). Disable both. Microsoft-clc would also need LLVM so it's
-# already off above.
-if ($Platform -eq "ARM64") {
+# Cross-build LLVM tooling is awkward: the libs in C:\mesa-deps are x64
+# binaries and can't link into an ARM64 or x86 DLL. Panfrost / panvk-v10
+# don't need LLVM at runtime, but the build step compiles precomp CL
+# shaders into header constants, which requires mesa-clc + LLVM at
+# build time only. For non-x64 targets we reuse the x64 mesa-clc /
+# vtn_bindgen2 host tools (-Dmesa-clc=system) and disable LLVM entirely
+# - no LLVM gets linked into the ARM64 / x86 DLLs (the panfrost /
+# panvk targets simply don't pull it in).
+if ($Platform -ne "x64") {
+    # Reuse build-time host tools from the x64 build tree so the cross
+    # build doesn't have to bring along its own LLVM.
+    $hostTools = @(
+        @{ Dir = "src\compiler\clc";       Tool = "mesa_clc.exe" },
+        @{ Dir = "src\compiler\spirv";     Tool = "vtn_bindgen2.exe" },
+        @{ Dir = "src\panfrost\clc";       Tool = "panfrost_compile.exe" }
+    )
+    foreach ($t in $hostTools) {
+        $d = Join-Path $WinMaliBuildDir "mesa\debug-x64\$($t.Dir)"
+        if ((Test-Path (Join-Path $d $t.Tool)) -and ($env:PATH -notlike "*$d*")) {
+            $env:PATH = "$d;$env:PATH"
+        }
+    }
     $mesonSetupArgs += @(
+        "-Dmesa-clc=system",
+        "-Dprecomp-compiler=system",
         "-Dllvm=disabled",
-        "-Dstatic-libclc=",
         "-Dshader-cache=disabled"
     )
 }
@@ -205,11 +234,160 @@ if ($Platform -eq "ARM64") {
 # the STL we compile against ABI-matches the LLVM 18.1.8 we built into
 # C:\mesa-deps with VS 2022. The driver (KMD/UMD) build still uses
 # VS 2017 + 1809 WDK via the default vswhere lookup.
-$devArch = if ($Platform -eq "ARM64") { "arm64" } else { "x64" }
+$devArch = switch ($Platform) {
+    "ARM64"   { "arm64" }
+    "ARM64EC" { "arm64" }   # VsDevCmd has no arm64ec arch; the EC bits
+                            # ship inside the arm64 install and we pull
+                            # them onto LIB ourselves below.
+    "Win32"   { "x86" }     # native x86 cross from an x64 host
+    default   { "x64" }
+}
 $vsOverride = if (Test-Path "C:\BuildTools\Common7\Tools\VsDevCmd.bat") { "C:\BuildTools" } else { "" }
 if (-not (Enter-WinMaliVsDevEnv -Arch $devArch -HostArch x64 -VsInstallOverride $vsOverride)) {
     Write-Host "Failed to enter VS Dev environment ($devArch)." -ForegroundColor Red
     exit 1
+}
+
+# ARM64 cross-build needs both Windows SDK ARM64 libs AND the MSVC
+# ARM64 C runtime (msvcrt.lib / libcmt.lib / vcruntime.lib).
+#
+#   SDK side  -> Windows Kits\10\Lib\<ver>\um\arm64 + ucrt\arm64
+#                (ships with any Win 10 SDK >= 17763)
+#   MSVC side -> VC\Tools\MSVC\<ver>\lib\arm64\msvcrt.lib etc.
+#                (separate VS BT component: "MSVC v143 - VS 2022 C++
+#                 ARM64/ARM64EC build tools" - not on a default install)
+#
+# If the MSVC ARM64 libs aren't installed, lld-link fails with a
+# cryptic "could not open msvcrt.lib" error. Bail out with a clear
+# message so the user knows which install step they're missing.
+if ($Platform -eq "ARM64" -or $Platform -eq "ARM64EC") {
+    # MSVC v143 (14.4x) emits __guard_eh_cont_table / _count references
+    # in its CFG load-config object (loadcfg.obj inside msvcrt.lib).
+    # The link fails with LNK2001 on those symbols unless the linker
+    # knows to synthesize them. Two parts to fix this:
+    #
+    #   1. Force clang-cl to use lld-link. The default linker
+    #      (link.exe) on PATH is the VS 2017 14.16 build, which
+    #      doesn't even recognize /guard:ehcont (LNK1117 "syntax
+    #      error in option 'guard:ehcont'"). lld-link 18 always
+    #      knows the option.
+    #   2. Pass /guard:ehcont so lld-link emits the synthesized
+    #      symbols. Matches what link.exe 14.4x does implicitly.
+    $env:CFLAGS   = "$env:CFLAGS -fuse-ld=lld"
+    $env:CXXFLAGS = "$env:CXXFLAGS -fuse-ld=lld"
+    $env:LDFLAGS  = "$env:LDFLAGS /guard:ehcont"
+
+    # alloca() is declared in <malloc.h> on Windows. clang-cl's x64
+    # target pulls it in via transitive includes; the arm64/arm64ec
+    # targets do not. Force-include malloc.h into every TU so the
+    # dozens of mesa source files that call alloca() without explicit
+    # include keep working. /FI is the MSVC-shaped force-include flag.
+    $env:CFLAGS   = "$env:CFLAGS /FImalloc.h"
+    $env:CXXFLAGS = "$env:CXXFLAGS /FImalloc.h"
+
+    # Pick the newest SDK the host has installed that ships ARM64 libs.
+    # ARM64EC uses the same ARM64 import libs (kernel32.lib, ws2_32.lib
+    # etc. on modern WoA SDKs are themselves ARM64X hybrids that export
+    # both ARM64 and ARM64EC variants).
+    $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+    $candidateSdks = Get-ChildItem (Join-Path $sdkRoot 'Lib') -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^10\.0\.\d+' -and (Test-Path (Join-Path $_.FullName 'ucrt\arm64')) } |
+        Sort-Object Name -Descending
+    if (-not $candidateSdks) {
+        Write-Host "No Windows SDK with ARM64 libs found under $sdkRoot\Lib" -ForegroundColor Red
+        exit 1
+    }
+    $sdkVer = $candidateSdks[0].Name
+    Write-Host "$Platform SDK pick: $sdkVer" -ForegroundColor DarkCyan
+
+    foreach ($p in @("$sdkRoot\Lib\$sdkVer\um\arm64",
+                     "$sdkRoot\Lib\$sdkVer\ucrt\arm64")) {
+        if ((Test-Path $p) -and ($env:LIB -notlike "*$p*")) {
+            $env:LIB = "$p;$env:LIB"
+        }
+    }
+
+    # MSVC C runtime. Order matters for the linker's first-match lookup:
+    #
+    #   ARM64EC   -> lib\arm64ec  must come before lib\arm64. The
+    #                arm64ec dir only has startup objects (chkstk_arm64ec
+    #                etc.); the rest of msvcrt.lib lives in lib\arm64,
+    #                which is now an ARM64X hybrid library that exports
+    #                both ARM64 and ARM64EC variants.
+    #   ARM64     -> just lib\arm64.
+    $vcArm64 = $null
+    foreach ($vcVer in @(Get-ChildItem "C:\BuildTools\VC\Tools\MSVC" -ErrorAction SilentlyContinue)) {
+        $candidate = Join-Path $vcVer.FullName "lib\arm64\msvcrt.lib"
+        if (Test-Path $candidate) {
+            $vcArm64 = Join-Path $vcVer.FullName "lib\arm64"
+            $vcArm64ec = Join-Path $vcVer.FullName "lib\arm64ec"
+            break
+        }
+    }
+    if ($vcArm64 -and ($env:LIB -notlike "*$vcArm64*")) {
+        $env:LIB = "$vcArm64;$env:LIB"
+    }
+    if ($Platform -eq "ARM64EC" -and $vcArm64ec -and (Test-Path $vcArm64ec) -and ($env:LIB -notlike "*$vcArm64ec*")) {
+        $env:LIB = "$vcArm64ec;$env:LIB"
+    }
+
+    # ARM64EC needs an ARM64EC-format msvcrt.lib that MSVC 14.44 doesn't
+    # ship by default. The lib\arm64ec directory only has startup objs
+    # (chkstk_arm64ec.obj etc.); the runtime libs in lib\arm64 are
+    # pure ARM64, not ARM64X, so lld-link rejects them with
+    # "machine type arm64 conflicts with arm64ec". Detect the gap and
+    # bail with a clear message so the user knows what install they
+    # need before they go chasing the link error.
+    if ($Platform -eq "ARM64EC") {
+        $hasEcMsvcrt = $vcArm64ec -and (Test-Path (Join-Path $vcArm64ec 'msvcrt.lib'))
+        if (-not $hasEcMsvcrt) {
+            Write-Host @"
+ARM64EC runtime libs missing.
+
+MSVC ships ARM64EC startup objects (lib\arm64ec\chkstk_arm64ec.obj, ...)
+but not msvcrt.lib / libucrt.lib for ARM64EC in this toolset version
+($((Get-ChildItem 'C:\BuildTools\VC\Tools\MSVC' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', ')).
+lld-link fails on the link probe with:
+  lld-link: error: msvcrt.lib(exe_main.obj): machine type arm64 conflicts with arm64ec
+
+To unblock, install one of:
+  - Visual Studio Build Tools 2022, "Individual components":
+      * MSVC v143 - VS 2022 C++ ARM64EC Spectre-mitigated libs (Latest)
+      * Windows 11 SDK (10.0.26100.0) - ARM64EC component (if available)
+  - Visual Studio 2022 17.14 Preview or later, which ships full
+    ARM64EC runtime libs.
+
+After install, the path C:\BuildTools\VC\Tools\MSVC\<ver>\lib\arm64ec\msvcrt.lib
+should exist.
+
+For now, -Platform ARM64 + -Platform Win32 (the current shipping
+combination) covers native ARM64 + WOW64-x86 callers. ARM64EC
+unlocks x64-under-Prism — see docs/NEXT_STEPS.md.
+"@ -ForegroundColor Yellow
+            exit 1
+        }
+    }
+    if (-not $vcArm64) {
+        Write-Host @"
+ARM64 MSVC runtime not found. The Windows SDK ARM64 libs are present
+but the matching MSVC ARM64 C runtime (msvcrt.lib / vcruntime.lib /
+libcmt.lib) is missing.
+
+Install:
+  1. Run the Visual Studio Installer for "Visual Studio Build Tools 2022"
+     (or Visual Studio 2022 / Professional if you have it).
+  2. Open "Individual components" tab.
+  3. Tick:
+       - MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools (latest)
+       - MSVC v143 - VS 2022 C++ ARM64 Spectre-mitigated libs (optional)
+       - Windows 11 SDK (10.0.22621.0) ARM64 component, if not already.
+  4. Click Modify and let it install.
+
+After it's done, re-run this script.
+"@ -ForegroundColor Yellow
+        exit 1
+    }
+    Write-Host "ARM64 LIB head: $($env:LIB.Substring(0, [Math]::Min($env:LIB.Length, 240)))..." -ForegroundColor DarkCyan
 }
 
 # VsDevCmd resets PATH. Reinstate ninja + win_flex_bison + python +

@@ -1,0 +1,22 @@
+# Copy this to target.psd1 and fill in the values.
+# This box debugs kernel over COM. No kdnet.
+@{
+    # SSH endpoint (target IP + user)
+    HostIp = '192.168.1.42'
+    User   = 'winmali'
+
+    # COM debug transport - DEV BOX side. This is the COM port on YOUR
+    # machine where the USB-to-serial cable from the RK3588 shows up.
+    ComPort = 'COM3'
+    ComBaud = 115200
+
+    # Local kd.exe + cdb.exe (from WDK / Debugging Tools)
+    KdExe  = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe'
+    CdbExe = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+
+    # Microsoft public symbols
+    SymbolPath = 'srv*C:\symbols*https://msdl.microsoft.com/download/symbols'
+
+    # Localhost TCP port the wrapper listens on for command injection
+    KdCmdPort = 5556
+}

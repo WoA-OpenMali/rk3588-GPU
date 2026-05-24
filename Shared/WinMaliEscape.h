@@ -79,12 +79,10 @@ extern "C" {
 
 /* Bumped when an opcode is renumbered, a struct repacked, or a field         */
 /* removed. KMD rejects mismatches at OpenDevice handshake.                   */
-#define WINMALI_ABI_MAJOR       2
+#define WINMALI_ABI_MAJOR       1
 
 /* Bumped for additive changes. KMD returns -EOPNOTSUPP for unknown ops.       */
-/*                                                                              */
-/*  v2.1 - Added BoDestroy, GetFlushId, timeline sync objects.                 */
-#define WINMALI_ABI_MINOR       1
+#define WINMALI_ABI_MINOR       0
 
 /* KMD pool tag. Appears as "WinM" in !pooltrack / Driver Verifier output.    */
 #define WINMALI_POOL_TAG        'MniW'
@@ -136,6 +134,12 @@ typedef enum _WINMALI_ESCAPE_OP {
     /* panthor exposes its latest-flush-id register via a 4-byte page the */
     /* user-space mmaps. On Windows we surface it through a tiny escape.  */
     WinMaliEscapeOp_GetFlushId          = 0x85,
+    /* mmap()-equivalent: ask the KMD to expose a BO's pages in the     */
+    /* calling process's user-mode address space and return the         */
+    /* resulting pointer. The standard pan_kmod_bo_mmap path calls      */
+    /* mmap(fd, offset) which can't work on Windows (the "fd" is our    */
+    /* sentinel value); this is the WinMali replacement.                */
+    WinMaliEscapeOp_BoMapCpu            = 0x86,
     WinMaliEscapeOp_PresentToHdc        = 0x90,
 } WINMALI_ESCAPE_OP;
 
@@ -283,7 +287,7 @@ typedef struct _WINMALI_GROUP_PRIORITIES_INFO {
 /* -------------------------------------------------------------------------- */
 
 typedef struct _WINMALI_VM_CREATE {
-    uint32_t Flags;         /* MBZ in v2.0 */
+    uint32_t Flags;         /* MBZ in v1.0 */
     uint32_t Id;            /* out */
     uint64_t UserVaRange;   /* in: requested; out: granted. 0 = KMD picks. */
 } WINMALI_VM_CREATE;
@@ -590,6 +594,31 @@ typedef struct _WINMALI_SYNC_OBJ_WAIT {
     uint32_t PointsOffset;
     int64_t  TimeoutNs;     /* 0 = poll, <0 = wait forever */
 } WINMALI_SYNC_OBJ_WAIT;
+
+/* -------------------------------------------------------------------------- */
+/*  Op 0x86 - BoMapCpu                                                         */
+/*                                                                             */
+/*  Returns a UM virtual address pointing at the BO's pages, mapped into the  */
+/*  calling process by the KMD. Caller is responsible for tracking lifetime;  */
+/*  the mapping persists until BoDestroy. Implementation suggestion: KMD uses  */
+/*  MmMapLockedPagesSpecifyCache(UserMode, ...) on the BO's MDL inside the    */
+/*  calling process's context (Dxgk callbacks run in the requesting process). */
+/*                                                                             */
+/*  Used by:                                                                   */
+/*    * panvk + wsi_common_win32 sw_device=true path: WSI allocates a         */
+/*      HOST_VISIBLE VkBuffer for swap-chain staging; user-mode reads it for  */
+/*      SetDIBitsToDevice.                                                     */
+/*    * Any host-visible Vulkan memory allocation in general - vk_kmod         */
+/*      callers eventually want a CPU pointer.                                 */
+/*    * Future Vulkan host-image-copy when we wire it.                         */
+/* -------------------------------------------------------------------------- */
+
+typedef struct _WINMALI_BO_MAP_CPU {
+    uint32_t Handle;        /* in: BO from BoCreate / BoFromAllocation */
+    uint32_t Prot;          /* in: 1=PROT_READ, 2=PROT_WRITE, 3=PROT_RW */
+    /* out */
+    uint64_t CpuAddr;       /* UM virtual address of the mapping */
+} WINMALI_BO_MAP_CPU;
 
 /* -------------------------------------------------------------------------- */
 /*  Op 0x85 - GetFlushId                                                       */

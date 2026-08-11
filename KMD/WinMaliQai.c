@@ -4,7 +4,11 @@
  * Real cap-walk implementation. With MMU + the 256 MiB sysmem segment
  * allocated at StartDevice, we now publish numbers dxgk can act on:
  *
- *   DRIVERCAPS                 -> render-only WDDM 2 + GpuMmu + VA
+ *   DRIVERCAPS                 -> render-only WDDM 3.2 + GpuMmu + VA
+ *   WDDMDEVICECAPS             -> WDDMv3_2 echo (pre-StartDevice)
+ *   PHYSICAL_MEMORY_CAPS       -> 2^PA_bits-1 from MMU_FEATURES (pre-Start)
+ *   IOMMU_CAPS                 -> none (GPU has its own MMU, no SMMU)
+ *   HARDWARERESERVEDRANGES(2)  -> zero ranges
  *   PHYSICALADAPTERCAPS        -> our DxgkHandle + GpuMmu, no paging node
  *   GPUMMUCAPS                 -> 30-bit VA, 2-level page table, NX/RO
  *   PAGETABLELEVELDESC         -> 9 idx bits per level, segment id 1
@@ -13,7 +17,7 @@
  *   HISTORYBUFFERPRECISION     -> 64-bit
  *
  * Bounded copy-out (RtlZeroMemory dest first, copy min(outSz, sizeof)) is
- * used everywhere so kernels with smaller struct views than our 1809 WDK
+ * used everywhere so kernels with smaller struct views than our 26100 WDK
  * can't smash stack/heap by writing past their buffer.
  *
  * Anything we haven't implemented yet falls through to STATUS_NOT_IMPLEMENTED
@@ -33,20 +37,42 @@ WinMaliKmdQueryAdapterInfo(
         return STATUS_INVALID_PARAMETER;
     }
 
-    DbgPrint("[WinMali]    QAI[%u] enter outsz=%u\n",
-             (unsigned)pQueryAdapterInfo->Type,
-             (unsigned)pQueryAdapterInfo->OutputDataSize);
+    /* NODEPERFDATA/ADAPTERPERFDATA are polled ~once per second per node
+       for as long as the adapter is up. With the serial mirror active,
+       printing the entry line for them means dxgkrnl's telemetry worker
+       synchronously drains a UART line at 115200 baud every poll -
+       forever - which reads as periodic whole-system stalls. The case
+       handlers below are already silent for these; the entry print must
+       be too. */
+    if (pQueryAdapterInfo->Type != DXGKQAITYPE_NODEPERFDATA &&
+        pQueryAdapterInfo->Type != DXGKQAITYPE_ADAPTERPERFDATA) {
+        DbgPrint("[WinMali]    QAI[%u] enter outsz=%u\n",
+                 (unsigned)pQueryAdapterInfo->Type,
+                 (unsigned)pQueryAdapterInfo->OutputDataSize);
+    }
 
     switch (pQueryAdapterInfo->Type) {
 
+    case DXGKQAITYPE_UMDRIVERPRIVATE: {
+        /* The D3D runtime forwards KMTQAITYPE_UMDRIVERPRIVATE here while
+           creating a device on the adapter, with a runtime-chosen buffer
+           size. Our mesa d3d10umd-based UMD never reads this blob (the
+           KMD<->UMD contract is the escape ABI, negotiated via
+           WinMaliEscapeOp_OpenDevice) - but the QUERY must succeed for
+           any size or device creation dies before the UMD even loads.
+           Zero-filled = "no private data". */
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        RtlZeroMemory(pQueryAdapterInfo->pOutputData,
+                      pQueryAdapterInfo->OutputDataSize);
+        DbgPrint("[WinMali]    QAI[UMDRIVERPRIVATE] OK size=%u (zero blob)\n",
+                 (unsigned)pQueryAdapterInfo->OutputDataSize);
+        return STATUS_SUCCESS;
+    }
+
     case DXGKQAITYPE_DRIVERCAPS: {
-        /* Minimal honest DRIVERCAPS - only the caps we can actually back with
-           working DDIs. Round 2's superset (matching NVIDIA) caused dxgk to
-           bail at this stage: cap bits like NonCpuVisiblePrimary, NoDmaPatching,
-           LowIrqlPreemptCommand assert capabilities that require working
-           Patch/PreemptCommand/CPU-invisible-segment infrastructure that our
-           render-only KMD doesn't yet have. dxgk verifies the claim and
-           tears the adapter down when it doesn't pan out. */
         DXGK_DRIVERCAPS* caps  = (DXGK_DRIVERCAPS*)pQueryAdapterInfo->pOutputData;
         SIZE_T           outSz = pQueryAdapterInfo->OutputDataSize;
         SIZE_T           lim   = (outSz < sizeof(*caps)) ? outSz : sizeof(*caps);
@@ -63,14 +89,17 @@ WinMaliKmdQueryAdapterInfo(
             }                                                                    \
         } while (0)
 
-        WM_SET(WDDMVersion, DXGKDDI_WDDMv2_5);
+        /* Win11 24H2 dxgkrnl refuses to register a new third-party
+           adapter declaring WDDM 2.5 (event 549, AddAdapterFailed,
+           STATUS_REVISION_MISMATCH). Must match init.Version in
+           WinMaliDxgkInitFill.c (WDDM 3.2 on the 26100 WDK) and the
+           WDDMDEVICECAPS echo below. */
+        WM_SET(WDDMVersion, DXGKDDI_WDDMv3_2);
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, HighestAcceptableAddress) +
             sizeof(caps->HighestAcceptableAddress) <= lim) {
             caps->HighestAcceptableAddress.QuadPart = (ULONG64)-1;
         }
         WM_SET(MaxAllocationListSlotId, 7);
-        /* NVIDIA returns 0 from its base getOverrideSystemMemoryCommitLimit()
-           (memoryCfgMgr.cpp:308) - matching them, not speculating. */
         WM_SET(ApertureSegmentCommitLimit, 0);
         WM_SET(SupportNonVGA, TRUE);
         WM_SET(SupportSmoothRotation, TRUE);
@@ -87,13 +116,23 @@ WinMaliKmdQueryAdapterInfo(
         }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, FlipCaps) +
             sizeof(caps->FlipCaps) <= lim) {
-            caps->FlipCaps.FlipOnVSyncMmIo = TRUE;
+            /* Render-only adapter has no scanout/vsync, so it must not claim a
+               flip capability (FlipOnVSyncMmIo is a display-DDI path via
+               SetVidPnSourceAddress, which is NULL here). RosKmd only sets
+               FlipCaps for display adapters. Leave it zero. */
+            caps->FlipCaps.Value = 0;
         }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, SchedulingCaps) +
             sizeof(caps->SchedulingCaps) <= lim) {
-            /* Match NVIDIA's nvlQuery.cpp:1808-1815, 2033 pattern - all
-               unconditionally set on WDDM 2.0+. NVIDIA never sets
-               HwQueuePacketCap, so we leave it 0. */
+            /* WDDM 3.2 / GpuMmu REQUIRES these scheduling caps - dxgkrnl
+               rejects the adapter at start (queries DRIVERCAPS then tears the
+               device down) if they're cleared. They are NOT optional, so we
+               must actually IMPLEMENT the DDIs behind them: DxgkDdiPreempt
+               Command + DXGK_INTERRUPT_DMA_PREEMPTED (async submit scheduler,
+               WinMaliDdi.c) and DxgkDdiCancelCommand. Advertising them while
+               stubbing the DDIs is what bugchecked dxgmms2 (0xD1 in the
+               preemption path); the fix is the real implementation, not
+               clearing the caps. */
             caps->SchedulingCaps.MultiEngineAware       = 1;
             caps->SchedulingCaps.VSyncPowerSaveAware    = 1;
             caps->SchedulingCaps.PreemptionAware        = 1;   /* WDDM 1.2+ */
@@ -104,42 +143,55 @@ WinMaliKmdQueryAdapterInfo(
         }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, MemoryManagementCaps) +
             sizeof(caps->MemoryManagementCaps) <= lim) {
-            /* nvlQuery.cpp:1818-1833, 1941, 2120-2129 */
             caps->MemoryManagementCaps.CrossAdapterResource       = 1;
+            caps->MemoryManagementCaps.CrossAdapterResourceTexture = 1;
+            caps->MemoryManagementCaps.CrossAdapterResourceScanout = 1;
             caps->MemoryManagementCaps.SectionBackedPrimary       = 0;
             caps->MemoryManagementCaps.VirtualAddressingSupported = 1;
             caps->MemoryManagementCaps.GpuMmuSupported            = 1;
             caps->MemoryManagementCaps.OutOfOrderLock             = 1;
-            caps->MemoryManagementCaps.NonCpuVisiblePrimary       = 1;  /* NVIDIA sets for Win10 >=10523; we're 26100 */
-            caps->MemoryManagementCaps.PagingNode                 = 0;
+            caps->MemoryManagementCaps.NonCpuVisiblePrimary       = 1; 
+            caps->MemoryManagementCaps.PagingNode                 = 1;  /* copy node 1 (matches PHYSICALADAPTERCAPS.PagingNodeIndex) */
             caps->MemoryManagementCaps.IoMmuSupported             = 0;
         }
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, PreemptionCaps) +
             sizeof(caps->PreemptionCaps) <= lim) {
+            /* DMA-BUFFER-boundary only: we cannot preempt mid-buffer (no
+               hardware for primitive/dispatch-boundary save-restore). We run
+               each DMA buffer to completion and honor a preempt request by
+               reporting DMA_PREEMPTED at the next buffer boundary (see the
+               async submit worker + DxgkDdiPreemptCommand). Claiming the finer
+               PRIMITIVE/DISPATCH granularity here made the scheduler set up
+               mid-buffer preemption state we never satisfied -> 0xD1 in
+               dxgmms2's preemption path. This is the honest, implementable
+               level. */
             caps->PreemptionCaps.GraphicsPreemptionGranularity =
-                D3DKMDT_GRAPHICS_PREEMPTION_PRIMITIVE_BOUNDARY;
+                D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
             caps->PreemptionCaps.ComputePreemptionGranularity  =
-                D3DKMDT_COMPUTE_PREEMPTION_DISPATCH_BOUNDARY;
+                D3DKMDT_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
         }
 
         /* GPU VA span. Must enclose the per-process VA we accept in
            SetRootPageTable. Aligned with GPUMMUCAPS.VirtualAddressBitCount
-           and PAGETABLELEVELDESC (2 levels x 9 idx bits + 12 page = 30 bits). */
+           and PAGETABLELEVELDESC (4 levels x 9 idx bits + 12 page = 48 bits) -
+           the native Mali LPAE 48-bit space. panfrost/mesa address the full
+           range (tiler at 0x40000000, per-context BOs top-down near 2^48), so
+           a smaller span makes MapGpuVirtualAddress reject every real VA. */
         WM_SET(InternalGpuVirtualAddressRangeStart,
                (D3DGPU_VIRTUAL_ADDRESS)0x0000000000010000ULL);
         WM_SET(InternalGpuVirtualAddressRangeEnd,
-               (D3DGPU_VIRTUAL_ADDRESS)0x000000003FFFFFFFULL);
+               (D3DGPU_VIRTUAL_ADDRESS)0x0000FFFFFFFFFFFFULL);
 
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, GpuEngineTopology) +
             sizeof(caps->GpuEngineTopology) <= lim) {
-            caps->GpuEngineTopology.NbAsymetricProcessingNodes = 1;
+            /* Two nodes (3D + COPY/paging), matching PHYSICALADAPTERCAPS
+               NumExecutionNodes=2 and GetNodeMetadata. Reporting 1 here hid the
+               copy node dxgk uses for cross-adapter present copies. */
+            caps->GpuEngineTopology.NbAsymetricProcessingNodes = 2;
         }
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_4)
         if (FIELD_OFFSET(DXGK_DRIVERCAPS, MiscCaps) +
             sizeof(caps->MiscCaps) <= lim) {
-            /* WDDM 2.4+ misc-caps bits. SupportContextlessPresent is set by
-               NVIDIA for build >=16355 (we're on 26100); it indicates the
-               driver can run presents without a per-context HW state. */
             caps->MiscCaps.SupportContextlessPresent = 1;
             caps->MiscCaps.Detachable                = 0;  /* not eGPU */
         }
@@ -172,24 +224,129 @@ WinMaliKmdQueryAdapterInfo(
         }
 
         RtlZeroMemory(&phys, sizeof(phys));
-        phys.NumExecutionNodes         = 1;
-        /* PagingNodeIndex == NumExecutionNodes is the documented sentinel
-           for "no dedicated paging node" - appropriate when we have one node
-           (3D) and CPU_VIRTUAL page-table updates. Setting it to 0 (the only
-           real ordinal we have) makes dxgkrnl bail right after this DDI on
-           Win11 ARM64 since node 0 is the 3D engine, not a copy/DMA engine. */
-        phys.PagingNodeIndex           = phys.NumExecutionNodes;
+        /* Two nodes: 0 = 3D render engine, 1 = COPY/paging engine.
+           dxgkrnl requires PagingNodeIndex to name a copy/DMA engine (not the
+           3D node - =0 bails at StartDevice on Win11 ARM64) AND a node that
+           actually exists (=NumExecutionNodes, out of range, materialises a
+           PHANTOM paging node whose per-process scheduler state is left NULL
+           -> 0xD1 in VidSchiProfilePerformanceTick when it is first
+           scheduled). So node 1 is a real declared copy engine; GetNodeMetadata
+           reports it, CreateContext accepts it, and its paging buffers are
+           serviced CPU-side (BuildPagingBuffer). */
+        phys.NumExecutionNodes         = 2;
+        phys.PagingNodeIndex           = 1;   /* the real copy node */
         phys.DxgkPhysicalAdapterHandle = adapter->DxgkHandle;
         phys.Flags.Value               = 0;
         phys.Flags.GpuMmuSupported     = 1;
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_1)
-        phys.VPRPagingNode             = phys.NumExecutionNodes;  /* no VPR */
+        phys.VPRPagingNode             = 1;   /* no VPR; keep off the phantom */
 #endif
 
         RtlZeroMemory(pQueryAdapterInfo->pOutputData, outSz);
         copyLen = (outSz < sizeof(phys)) ? outSz : sizeof(phys);
         RtlCopyMemory(pQueryAdapterInfo->pOutputData, &phys, copyLen);
         WM_QAI_OK("PHYSICALADAPTERCAPS");
+        return STATUS_SUCCESS;
+    }
+
+    /* ------------------------------------------------------------------
+       Pre-StartDevice caps. dxgkrnl 26100 issues WDDMDEVICECAPS(29),
+       PHYSICAL_MEMORY_CAPS(34), IOMMU_CAPS(35) and
+       HARDWARERESERVEDRANGES2(36) between AddDevice and StartDevice.
+       PHYSICAL_MEMORY_CAPS is load-bearing: the WDDM 3.x System Memory
+       Manager (dxgkrnl!DpiFdoCreateSysMmAdapter) gates adapter creation
+       on it, and a zero HighestVisibleAddress means "no addressable
+       memory" - dxgk then calls RemoveDevice WITHOUT EVER CALLING
+       StartDevice (no 549 event; a related 549 shows {Not Enough
+       Quota}). So these cannot ride the zero-fill default at the
+       bottom of this switch.
+       ------------------------------------------------------------------ */
+
+    case DXGKQAITYPE_WDDMDEVICECAPS: {
+        /* Must echo DRIVERCAPS.WDDMVersion exactly (header contract). */
+        DXGK_WDDMDEVICECAPS* dc    = (DXGK_WDDMDEVICECAPS*)pQueryAdapterInfo->pOutputData;
+        SIZE_T               outSz = pQueryAdapterInfo->OutputDataSize;
+
+        if (dc == NULL || outSz < sizeof(*dc)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        RtlZeroMemory(dc, outSz);
+        dc->WDDMVersion = DXGKDDI_WDDMv3_2;
+        WM_QAI_OK("WDDMDEVICECAPS=WDDMv3_2");
+        return STATUS_SUCCESS;
+    }
+
+    case DXGKQAITYPE_PHYSICAL_MEMORY_CAPS: {
+        /* Honest PA reach: HighestVisibleAddress = 2^PA_bits - 1, PA
+           width from MMU_FEATURES[15:8]. This query lands before
+           StartDevice maps MMIO, so the register snapshot may not
+           exist yet - fall back to the Mali-G610 architectural value
+           (PA = 40 bits) in that case. */
+        DXGK_PHYSICAL_MEMORY_CAPS pmc;
+        PWINMALI_ADAPTER          adapter;
+        ULONG                     paBits = 0;
+        SIZE_T                    outSz  = pQueryAdapterInfo->OutputDataSize;
+        SIZE_T                    copyLen;
+
+        if (pQueryAdapterInfo->pOutputData == NULL || outSz == 0) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        adapter = WinMaliAdapterFromDxgkHandle((PVOID)hAdapter);
+        if (adapter != NULL) {
+            paBits = WINMALI_MMU_FEATURES_PA_BITS(adapter->Hw.MmuFeatures);
+        }
+        if (paBits == 0 || paBits > 48) {
+            paBits = 40;    /* Mali-G610 MMU_FEATURES value; pre-MMIO fallback */
+        }
+
+        RtlZeroMemory(&pmc, sizeof(pmc));
+        pmc.HighestVisibleAddress.QuadPart = (LONGLONG)((1ULL << paBits) - 1u);
+
+        RtlZeroMemory(pQueryAdapterInfo->pOutputData, outSz);
+        copyLen = (outSz < sizeof(pmc)) ? outSz : sizeof(pmc);
+        RtlCopyMemory(pQueryAdapterInfo->pOutputData, &pmc, copyLen);
+        DbgPrint("[WinMali]    QAI[PHYSICAL_MEMORY_CAPS] OK pa_bits=%lu highest=0x%llx\n",
+                 paBits, (unsigned long long)pmc.HighestVisibleAddress.QuadPart);
+        return STATUS_SUCCESS;
+    }
+
+    case DXGKQAITYPE_IOMMU_CAPS: {
+        /* All-zero is the honest answer: the RK3588's Mali sits on the
+           SoC interconnect with its own GPU MMU; there is no Windows-
+           managed IOMMU/SMMU in front of it (and we set
+           MemoryManagementCaps.IoMmuSupported = 0 to match). */
+        DXGK_IOMMU_CAPS iommu;
+        SIZE_T          outSz = pQueryAdapterInfo->OutputDataSize;
+        SIZE_T          copyLen;
+
+        if (pQueryAdapterInfo->pOutputData == NULL || outSz == 0) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        RtlZeroMemory(&iommu, sizeof(iommu));
+
+        RtlZeroMemory(pQueryAdapterInfo->pOutputData, outSz);
+        copyLen = (outSz < sizeof(iommu)) ? outSz : sizeof(iommu);
+        RtlCopyMemory(pQueryAdapterInfo->pOutputData, &iommu, copyLen);
+        WM_QAI_OK("IOMMU_CAPS=none");
+        return STATUS_SUCCESS;
+    }
+
+    case DXGKQAITYPE_HARDWARERESERVEDRANGES:
+    case DXGKQAITYPE_HARDWARERESERVEDRANGES2: {
+        /* No hardware-reserved system RAM: firmware carve-outs on
+           RK3588 are handled by UEFI/ACPI before Windows boots, and
+           our segment is plain contiguous sysmem we allocate
+           ourselves. NumRanges = 0; dxgk ignores pPhysicalRanges when
+           the count is zero (don't zero the pointer - dxgk owns it). */
+        DXGK_HARDWARERESERVEDRANGES* hrr =
+            (DXGK_HARDWARERESERVEDRANGES*)pQueryAdapterInfo->pOutputData;
+
+        if (hrr == NULL ||
+            pQueryAdapterInfo->OutputDataSize < sizeof(*hrr)) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        hrr->NumRanges = 0;
+        WM_QAI_OK("HARDWARERESERVEDRANGES(2)=0");
         return STATUS_SUCCESS;
     }
 
@@ -211,21 +368,14 @@ WinMaliKmdQueryAdapterInfo(
             return STATUS_BUFFER_TOO_SMALL;
         }
 
-        /* Faithful port of NVIDIA's gpuMmuCaps (nvlQuery.cpp:1376-1443).
-           Mali G610 has a full GPU-side MMU with LPAE-style page tables;
-           the GpuMmu model maps cleanly. Adjusted for Mali specifics:
-           - 30-bit GPU VA span (2 levels x 9 idx + 12 page = 30)
-           - 2-level page tables (no PTE_V2)
-           - No 64K page support (LPAE 4K leaves only)
-           - No DualPte (Mali doesn't have NVIDIA's dual-PT layout)
-           - Mali supports RO + NX in LPAE PTEs */
         RtlZeroMemory(&caps, sizeof(caps));
-        caps.PageTableUpdateMode                       = DXGK_PAGETABLEUPDATE_GPU_PHYSICAL;
+
+        caps.PageTableUpdateMode                       = DXGK_PAGETABLEUPDATE_CPU_VIRTUAL;
         caps.ReadOnlyMemorySupported                   = 1;
         caps.NoExecuteMemorySupported                  = 1;
         caps.ZeroInPteSupported                        = 1;
-        caps.VirtualAddressBitCount                    = 30;
-        caps.PageTableLevelCount                       = 2;
+        caps.VirtualAddressBitCount                    = 48;
+        caps.PageTableLevelCount                       = 4;
         caps.ExplicitPageTableInvalidation             = 1;   /* we drive MMU AS_TLB invalidate registers */
         caps.CacheCoherentMemorySupported              = 1;
         caps.PageTableUpdateRequireAddressSpaceIdle    = 0;   /* live PT updates OK */
@@ -244,7 +394,7 @@ WinMaliKmdQueryAdapterInfo(
         DXGK_PAGE_TABLE_LEVEL_DESC            desc;
         SIZE_T                                outSz = pQueryAdapterInfo->OutputDataSize;
         SIZE_T                                copyLen;
-        const UINT                            kLevels  = 2;
+        const UINT                            kLevels  = 4;
         const UINT                            kIdxBits = 9;
 
         if (pQueryAdapterInfo->pInputData == NULL ||
@@ -302,19 +452,13 @@ WinMaliKmdQueryAdapterInfo(
 
         qo = (DXGK_QUERYSEGMENTOUT3*)pQueryAdapterInfo->pOutputData;
         qo->NbSegment                   = kNumSegs;
-        /* PagingBufferSegmentId must point at an Aperture-flagged segment
-           (NVIDIA's nvlddmkm uses an Aperture+CacheCoherent sysmem segment for
-           this purpose - see memoryCfgMgrWoI.cpp:1644-1655). Setting it to 0,
-           or pointing at a non-Aperture Memory segment, makes dxgkrnl unload
-           the adapter immediately after the system-context probe. */
+
         qo->PagingBufferSegmentId       = WINMALI_SEGMENT_ID_SYSMEM;
         qo->PagingBufferSize            = 64 * 1024;
         qo->PagingBufferPrivateDataSize = 0;
 
         segs = qo->pSegmentDescriptor;
         if (segs != NULL) {
-            /* Aperture segment backed by our pre-allocated contig sysmem.
-               Mirrors NVIDIA's cached-system-memory segment flags. */
             RtlZeroMemory(segs, sizeof(DXGK_SEGMENTDESCRIPTOR3) * kNumSegs);
             segs[0].Flags.Value                     = 0;
             segs[0].Flags.Aperture                  = 1;
@@ -365,8 +509,6 @@ WinMaliKmdQueryAdapterInfo(
 
         qo = (DXGK_QUERYSEGMENTOUT4*)pQueryAdapterInfo->pOutputData;
         qo->NbSegment                   = kNumSegs;
-        /* See QUERYSEGMENT3 above. PagingBufferSegmentId must reference an
-           Aperture-flagged segment (NVIDIA pattern). */
         qo->PagingBufferSegmentId       = WINMALI_SEGMENT_ID_SYSMEM;
         qo->PagingBufferSize            = 64 * 1024;
         qo->PagingBufferPrivateDataSize = 0;
@@ -436,6 +578,23 @@ WinMaliKmdQueryAdapterInfo(
         copyLen = (outSz < sizeof(caps)) ? outSz : sizeof(caps);
         RtlCopyMemory(pQueryAdapterInfo->pOutputData, &caps, copyLen);
         WM_QAI_OK("ADAPTERPERFDATA_CAPS");
+        return STATUS_SUCCESS;
+    }
+
+    case DXGKQAITYPE_NODEPERFDATA:
+    case DXGKQAITYPE_ADAPTERPERFDATA: {
+        /* Task Manager / dxgk telemetry polls these roughly once per
+           second per node for as long as the adapter is up - seeing them
+           loop in kd means the adapter STARTED and is being monitored.
+           We don't read clocks/thermals from the Mali MMIO yet, so
+           zero-fill (renders as 0 MHz / no sensor). Deliberately silent:
+           a log line here floods the kd ring at steady state. */
+        if (pQueryAdapterInfo->pOutputData == NULL ||
+            pQueryAdapterInfo->OutputDataSize == 0) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        RtlZeroMemory(pQueryAdapterInfo->pOutputData,
+                      pQueryAdapterInfo->OutputDataSize);
         return STATUS_SUCCESS;
     }
 

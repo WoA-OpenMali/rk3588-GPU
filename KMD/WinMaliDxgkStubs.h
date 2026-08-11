@@ -72,12 +72,6 @@ NTSTATUS APIENTRY WinMaliKmdStub_PowerRuntimeControlRequest(
     OUT OPTIONAL    PSIZE_T BytesReturned
     );
 
-NTSTATUS APIENTRY WinMaliKmdStub_SetVidPnSourceAddressWithMultiPlaneOverlay(
-    IN_CONST_HANDLE hAdapter,
-    IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY
-                  pSetVidPnSourceAddressWithMultiPlaneOverlay
-    );
-
 NTSTATUS APIENTRY WinMaliKmdStub_NotifySurpriseRemoval(
     _In_ PVOID MiniportDeviceContext,
     _In_ DXGK_SURPRISE_REMOVAL_TYPE RemovalType
@@ -92,12 +86,6 @@ NTSTATUS APIENTRY WinMaliKmdStub_SetPowerPState(
 NTSTATUS APIENTRY WinMaliKmdStub_ControlInterrupt2(
     IN_CONST_HANDLE                      hAdapter,
     IN_CONST_DXGKARG_CONTROLINTERRUPT2   InterruptControl
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_CheckMultiPlaneOverlaySupport(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT
-                  pCheckMultiPlaneOverlaySupport
     );
 
 NTSTATUS APIENTRY WinMaliKmdStub_CalibrateGpuClock(
@@ -117,10 +105,6 @@ NTSTATUS APIENTRY WinMaliKmdStub_RenderGdi(
     INOUT_PDXGKARG_RENDERGDI pRenderGdi
     );
 
-NTSTATUS APIENTRY WinMaliKmdStub_SubmitCommandVirtual(
-    IN_CONST_HANDLE                         hAdapter,
-    IN_CONST_PDXGKARG_SUBMITCOMMANDVIRTUAL  pSubmitCommand
-    );
 
 NTSTATUS APIENTRY WinMaliKmdStub_MapCpuHostAperture(
     IN_CONST_HANDLE                      hAdapter,
@@ -130,18 +114,6 @@ NTSTATUS APIENTRY WinMaliKmdStub_MapCpuHostAperture(
 NTSTATUS APIENTRY WinMaliKmdStub_UnmapCpuHostAperture(
     IN_CONST_HANDLE                         hAdapter,
     IN_CONST_PDXGKARG_UNMAPCPUHOSTAPERTURE  pArgs
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_CheckMultiPlaneOverlaySupport2(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT2
-                  pCheckMultiPlaneOverlaySupport
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_SetVidPnSourceAddressWithMultiPlaneOverlay2(
-    IN_CONST_HANDLE hAdapter,
-    IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY2
-                  pSetVidPnSourceAddressWithMultiPlaneOverlay
     );
 
 NTSTATUS APIENTRY WinMaliKmdStub_PowerRuntimeSetDeviceHandle(
@@ -159,32 +131,9 @@ NTSTATUS APIENTRY WinMaliKmdStub_SetVideoProtectedRegion(
     IN_CONST_PDXGKARG_SETVIDEOPROTECTEDREGION   pArgs
     );
 
-NTSTATUS APIENTRY WinMaliKmdStub_CheckMultiPlaneOverlaySupport3(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3
-                  pCheckMultiPlaneOverlaySupport
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_SetVidPnSourceAddressWithMultiPlaneOverlay3(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3
-                  pSetVidPnSourceAddressWithMultiPlaneOverlay
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_PostMultiPlaneOverlayPresent(
-    IN_CONST_HANDLE hAdapter,
-    IN_CONST_PDXGKARG_POSTMULTIPLANEOVERLAYPRESENT
-                  pPostPresent
-    );
-
 NTSTATUS APIENTRY WinMaliKmdStub_ValidateUpdateAllocationProperty(
     IN_CONST_HANDLE hAdapter,
     IN_CONST_PDXGKARG_VALIDATEUPDATEALLOCPROPERTY pValidateUpdateAllocProperty
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_ControlModeBehavior(
-    IN_CONST_HANDLE                             hAdapter,
-    INOUT_PDXGKARG_CONTROLMODEBEHAVIOR          pControlModeBehaviorArg
     );
 
 NTSTATUS APIENTRY WinMaliKmdStub_CreateHwContext(
@@ -218,46 +167,6 @@ NTSTATUS APIENTRY WinMaliKmdStub_SwitchToHwContextList(
 NTSTATUS APIENTRY WinMaliKmdStub_ResetHwEngine(
     IN_CONST_HANDLE                 hAdapter,
     INOUT_PDXGKARG_RESETHWENGINE    pResetHwEngine
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_CreatePeriodicFrameNotification(
-    INOUT_PDXGKARG_CREATEPERIODICFRAMENOTIFICATION pCreatePeriodicFrameNotification
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_DestroyPeriodicFrameNotification(
-    IN_CONST_PDXGKARG_DESTROYPERIODICFRAMENOTIFICATION pDestroyPeriodicFrameNotification
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_SetTimingsFromVidPn(
-    IN_CONST_HANDLE                             hAdapter,
-    IN_OUT_PDXGKARG_SETTIMINGSFROMVIDPN         pSetTimings
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_SetTargetGamma(
-    IN_CONST_HANDLE                             hAdapter,
-    IN_CONST_PDXGKARG_SETTARGETGAMMA            pSetTargetGammaArg
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_SetTargetContentType(
-    IN_CONST_HANDLE                             hAdapter,
-    IN_CONST_PDXGKARG_SETTARGETCONTENTTYPE      pSetTargetContentTypeArg
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_SetTargetAnalogCopyProtection(
-    IN_CONST_HANDLE                                 hAdapter,
-    IN_CONST_PDXGKARG_SETTARGETANALOGCOPYPROTECTION pSetTargetAnalogCopyProtectionArg
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_GetMultiPlaneOverlayCaps(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_GETMULTIPLANEOVERLAYCAPS
-                  pGetMultiPlaneOverlayCaps
-    );
-
-NTSTATUS APIENTRY WinMaliKmdStub_GetPostCompositionCaps(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_GETPOSTCOMPOSITIONCAPS
-                  pGetPostCompositionCaps
     );
 
 NTSTATUS APIENTRY WinMaliKmdStub_UpdateHwContextState(
@@ -349,12 +258,177 @@ NTSTATUS APIENTRY WinMaliKmdStub_ValidateSubmitCommand(
     INOUT_PDXGKARG_VALIDATESUBMITCOMMAND pArgs
     );
 
-NTSTATUS APIENTRY WinMaliKmdStub_SetTargetAdjustedColorimetry2(
-    IN_CONST_HANDLE                                 hAdapter,
-    IN_PDXGKARG_SETTARGETADJUSTEDCOLORIMETRY2       pArgSetTargetAdjustedColorimetry
-    );
-
 NTSTATUS APIENTRY WinMaliKmdStub_SetTrackedWorkloadPowerLevel(
     IN_CONST_HANDLE                 hContext,
     INOUT_PDXGKARG_SETTRACKEDWORKLOADPOWERLEVEL   pTrackedWorkloadPowerLevel
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SaveMemoryForHotUpdate(
+    IN_CONST_HANDLE                 hContext,
+    IN_CONST_PDXGKARG_SAVEMEMORYFORHOTUPDATE pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_RestoreMemoryForHotUpdate(
+    IN_CONST_HANDLE                             hContext,
+    IN_CONST_PDXGKARG_RESTOREMEMORYFORHOTUPDATE pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_CollectDiagnosticInfo(
+    IN_CONST_PDEVICE_OBJECT PhysicalDeviceObject,
+    INOUT_PDXGKARG_COLLECTDIAGNOSTICINFO pCollectDiagnosticInfo
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_ControlInterrupt3(
+    IN_CONST_HANDLE                      hAdapter,
+    IN_CONST_PDXGKARG_CONTROLINTERRUPT3  InterruptControl
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SetAllocationBackingStore(
+    IN_CONST_HANDLE                 hAdapter,
+    IN_CONST_PDXGKARG_SETALLOCATIONBACKINGSTORE pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_CreateCpuEvent(
+    IN_CONST_HANDLE             hAdapter,
+    INOUT_PDXGKARG_CREATECPUEVENT pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_DestroyCpuEvent(
+    IN_CONST_HANDLE hAdapter,
+    IN_CONST_HANDLE hKmdCpuEvent
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_CreateNativeFence(
+    IN_CONST_HANDLE                     hAdapter,
+    INOUT_PDXGKARG_CREATENATIVEFENCE    pCreateNativeFence
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_DestroyNativeFence(
+    INOUT_PDXGKARG_DESTROYNATIVEFENCE pDestroyNativeFence
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_UpdateMonitoredValues(
+    IN_CONST_PDXGKARG_UPDATEMONITOREDVALUES pUpdateMonitoredValues
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_UpdateCurrentValuesFromCpu(
+    IN_CONST_PDXGKARG_UPDATECURRENTVALUESFROMCPU pUpdateCurrentValuesFromCpu
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_CreateDoorbell(
+    INOUT_PDXGKARG_CREATEDOORBELL pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_ConnectDoorbell(
+    INOUT_PDXGKARG_CONNECTDOORBELL pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_DisconnectDoorbell(
+    INOUT_PDXGKARG_DISCONNECTDOORBELL pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_DestroyDoorbell(
+    INOUT_PDXGKARG_DESTROYDOORBELL pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_NotifyWorkSubmission(
+    INOUT_PDXGKARG_NOTIFYWORKSUBMISSION pArgs
+    );
+
+HANDLE APIENTRY WinMaliKmdStub_CreateMemoryBasis(
+    IN_CONST_HANDLE                     hAdapter,
+    IN_CONST_PDXGKARG_CREATEMEMORYBASIS pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_DestroyMemoryBasis(
+    IN_CONST_HANDLE hAdapter,
+    IN_CONST_HANDLE hMemoryBasis
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_StartDirtyTracking(
+    IN_CONST_HANDLE  hAdapter,
+    IN_CONST_HANDLE  hMemoryBasis
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_StopDirtyTracking(
+    IN_CONST_HANDLE  hAdapter,
+    IN_CONST_HANDLE  hMemoryBasis
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_QueryDirtyBitData(
+    IN_CONST_HANDLE                     hAdapter,
+    INOUT_PDXGKARG_QUERYDIRTYBITDATA    pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_PrepareLiveMigration(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_GPUP_PREPARE_LIVE_MIGRATION   pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SaveImmutableMigrationData(
+    IN_CONST_HANDLE                                     hAdapter,
+    INOUT_PDXGKARG_GPUP_SAVE_IMMUTABLE_MIGRATION_DATA   pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SaveMutableMigrationData(
+    IN_CONST_HANDLE                                    hAdapter,
+    INOUT_PDXGKARG_GPUP_SAVE_MUTABLE_MIGRATION_DATA    pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_EndLiveMigration(
+    IN_CONST_HANDLE hAdapter,
+    UINT            vfIndex
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_RestoreImmutableMigrationData(
+    IN_CONST_HANDLE                                         hAdapter,
+    IN_CONST_PDXGKARG_GPUP_RESTORE_IMMUTABLE_MIGRATION_DATA pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_RestoreMutableMigrationData(
+    IN_CONST_HANDLE                                         hAdapter,
+    IN_CONST_PDXGKARG_GPUP_RESTORE_MUTABLE_MIGRATION_DATA   pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_WriteVirtualizedInterrupt(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_GPUP_WRITE_VIRTUALIZED_MSIX   pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SetVirtualGpuResources2(
+    IN_CONST_HANDLE                             hAdapter,
+    IN_CONST_PDXGKARG_SETVIRTUALGPURESOURCES2   pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SetVirtualFunctionPauseState(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_SETVIRTUALFUNCTIONPAUSESTATE  pArgs
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_OpenNativeFence(
+    IN_CONST_HANDLE                   hAdapter,
+    INOUT_PDXGKARG_OPENNATIVEFENCE    pOpenNativeFence
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_CloseNativeFence(
+    IN_CONST_HANDLE                   hAdapter,
+    INOUT_PDXGKARG_CLOSENATIVEFENCE   pCloseNativeFence
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_SetNativeFenceLogBuffer(
+    IN_CONST_PDXGKARG_SETNATIVEFENCELOGBUFFER pSetNativeFenceLogBuffer
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_UpdateNativeFenceLogs(
+    IN_CONST_PDXGKARG_UPDATENATIVEFENCELOGS pUpdateNativeFenceLog
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_CollectDbgInfo2(
+    IN_CONST_HANDLE                 hAdapter,
+    INOUT_PDXGKARG_COLLECTDBGINFO2  pCollectDbgInfo2
+    );
+
+NTSTATUS APIENTRY WinMaliKmdStub_NotifyContextPriorityChange(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_NOTIFYCONTEXTPRIORITYCHANGE   pNotifyContextPriorityChange
     );

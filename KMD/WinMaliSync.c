@@ -70,6 +70,7 @@ int
 WinMaliSyncObjCreate(_Inout_ PWINMALI_ADAPTER Adapter,
                      _In_ ULONG Flags,
                      _In_ ULONG InitialState,
+                     _In_opt_ PVOID OwnerDevice,
                      _Out_ ULONG* OutHandle)
 {
     PWINMALI_SYNCOBJ so;
@@ -86,6 +87,7 @@ WinMaliSyncObjCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     so->IsTimeline    = (Flags & WINMALI_SYNC_OBJ_FLAG_TIMELINE) ? TRUE : FALSE;
     so->TimelineValue = (InitialState != 0) ? 1 : 0;
     so->RefCount      = 1;
+    so->OwnerDevice   = OwnerDevice;
     KeInitializeSpinLock(&so->Lock);
     KeInitializeEvent(&so->Event, NotificationEvent,
                       (InitialState != 0) ? TRUE : FALSE);
@@ -145,6 +147,45 @@ WinMaliSyncObjGet_(_In_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
     }
     KeReleaseSpinLock(&Adapter->SyncObjTable.Lock, oldIrql);
     return found;
+}
+
+ULONG
+WinMaliSyncObjRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
+                           _In_ PVOID OwnerDevice)
+{
+    KIRQL oldIrql;
+    LIST_ENTRY freeHead;
+    PLIST_ENTRY entry, next;
+    ULONG freed = 0;
+
+    if (OwnerDevice == NULL) {
+        return 0;
+    }
+    InitializeListHead(&freeHead);
+
+    KeAcquireSpinLock(&Adapter->SyncObjTable.Lock, &oldIrql);
+    for (entry = Adapter->SyncObjTable.Head.Flink;
+         entry != &Adapter->SyncObjTable.Head;
+         entry = next) {
+        PWINMALI_SYNCOBJ so = CONTAINING_RECORD(entry, WINMALI_SYNCOBJ, Link);
+        next = entry->Flink;
+        if (so->OwnerDevice == OwnerDevice) {
+            RemoveEntryList(&so->Link);
+            Adapter->SyncObjTable.Count--;
+            InsertTailList(&freeHead, &so->Link);
+        }
+    }
+    KeReleaseSpinLock(&Adapter->SyncObjTable.Lock, oldIrql);
+
+    while (!IsListEmpty(&freeHead)) {
+        PWINMALI_SYNCOBJ so = CONTAINING_RECORD(RemoveHeadList(&freeHead),
+                                                WINMALI_SYNCOBJ, Link);
+        WINMALI_TRACE("SyncObjRundown: handle=%u (owner device died without "
+                      "SyncObjDestroy)", so->Handle);
+        WinMaliSyncObjFree_(so);
+        ++freed;
+    }
+    return freed;
 }
 
 int

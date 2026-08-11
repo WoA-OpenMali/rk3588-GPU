@@ -218,6 +218,16 @@ WinMaliMmuTeardown(_Inout_ PWINMALI_ADAPTER Adapter)
     Adapter->GpuMmuAsBound = FALSE;
     Adapter->AdapterFlags &= (ULONG)~WINMALI_ADAPTER_FLAG_MMU_READY;
 
+    if (Adapter->ApertureL3Va != NULL) {
+        MmFreeContiguousMemory(Adapter->ApertureL3Va);
+        WINMALI_TRACE("Aperture L3 block freed va=%p phys=0x%llx",
+                      Adapter->ApertureL3Va,
+                      (ULONGLONG)Adapter->ApertureL3Phys.QuadPart);
+        Adapter->ApertureL3Va     = NULL;
+        Adapter->ApertureL3Phys.QuadPart = 0;
+        Adapter->ApertureL3Bytes  = 0;
+    }
+
     if (Adapter->MmuScratchHeapVa != NULL) {
         MmFreeContiguousMemory(Adapter->MmuScratchHeapVa);
         WINMALI_TRACE("MMU scratch heap freed va=%p phys=0x%llx",
@@ -356,12 +366,31 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
     // PT/L3 region cannot be clobbered by VIDMM allocations.
     //
     {
-        PVOID dmaVa = MmAllocateContiguousMemorySpecifyCache(
-            WINMALI_DMA_SEGMENT_BYTES, low, high, low, MmCached);
+        /* Boot-time contiguous memory can be scarce (2026-07-13: the
+           full 128 MiB failed during the Video-group load on a fresh
+           16 GiB image and the whole adapter went degraded->removed).
+           Halve and retry like the VIDMM segment does; QUERYSEGMENT3/4
+           report the runtime DmaSegmentBytes, and the aperture window
+           (sized by the constant) is VA capacity only, so a smaller
+           segment is safe everywhere downstream. */
+        PVOID  dmaVa = NULL;
+        SIZE_T dmaBytes;
+        for (dmaBytes = WINMALI_DMA_SEGMENT_BYTES;
+             dmaBytes >= (16UL * 1024UL * 1024UL);
+             dmaBytes >>= 1)
+        {
+            dmaVa = MmAllocateContiguousMemorySpecifyCache(
+                dmaBytes, low, high, low, MmCached);
+            if (dmaVa != NULL) {
+                break;
+            }
+            WINMALI_WARN(
+                "DMA segment: MmAllocateContiguousMemorySpecifyCache(%lu MiB) failed, halving...",
+                (ULONG)(dmaBytes >> 20));
+        }
         if (dmaVa == NULL) {
             WINMALI_ERROR(
-                "DMA segment: MmAllocateContiguousMemorySpecifyCache(%u) failed",
-                (ULONG)WINMALI_DMA_SEGMENT_BYTES);
+                "DMA segment: no contiguous block down to 16 MiB");
             MmFreeContiguousMemory(va);
             Adapter->MmuScratchHeapVa = NULL;
             Adapter->MmuScratchHeapPhys.QuadPart = 0;
@@ -370,13 +399,52 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
         }
         Adapter->DmaSegmentVa    = dmaVa;
         Adapter->DmaSegmentPhys  = MmGetPhysicalAddress(dmaVa);
-        Adapter->DmaSegmentBytes = WINMALI_DMA_SEGMENT_BYTES;
-        RtlFillMemory(dmaVa, WINMALI_DMA_SEGMENT_BYTES, 0);
+        Adapter->DmaSegmentBytes = dmaBytes;
+        RtlFillMemory(dmaVa, dmaBytes, 0);
         WINMALI_TRACE(
             "DMA segment: va=%p phys=0x%llx bytes=%u (cached, seg id 1 backing)",
             dmaVa,
             (ULONGLONG)Adapter->DmaSegmentPhys.QuadPart,
-            (ULONG)WINMALI_DMA_SEGMENT_BYTES);
+            (ULONG)dmaBytes);
+    }
+
+    //
+    // Preallocate every L3 table backing the aperture GPU-VA window
+    // (WINMALI_SYSMEM_GPU_BASE, one table per 2 MiB). dxgmms2's
+    // MAP_APERTURE_SEGMENT paging ops land in this window and their
+    // BuildPagingBuffer handler may only fail in ways dxgmms2 whitelists
+    // (else bugcheck 0x10E_b) - so the mapping path must never need an
+    // allocation. Non-cached like every other PT page (the AS TRANSCFG
+    // programs a non-cacheable page-table walker: no cache maintenance).
+    //
+    {
+        PVOID aperVa = MmAllocateContiguousMemorySpecifyCache(
+            WINMALI_APERTURE_L3_BYTES, low, high, low, MmNonCached);
+        if (aperVa == NULL) {
+            WINMALI_ERROR(
+                "Aperture L3 block: MmAllocateContiguousMemorySpecifyCache(%u) failed",
+                (ULONG)WINMALI_APERTURE_L3_BYTES);
+            MmFreeContiguousMemory(Adapter->DmaSegmentVa);
+            Adapter->DmaSegmentVa = NULL;
+            Adapter->DmaSegmentPhys.QuadPart = 0;
+            Adapter->DmaSegmentBytes = 0;
+            MmFreeContiguousMemory(va);
+            Adapter->MmuScratchHeapVa = NULL;
+            Adapter->MmuScratchHeapPhys.QuadPart = 0;
+            Adapter->MmuScratchHeapBytes = 0;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        Adapter->ApertureL3Va    = aperVa;
+        Adapter->ApertureL3Phys  = MmGetPhysicalAddress(aperVa);
+        Adapter->ApertureL3Bytes = WINMALI_APERTURE_L3_BYTES;
+        RtlFillMemory(aperVa, WINMALI_APERTURE_L3_BYTES, 0);
+        WINMALI_TRACE(
+            "Aperture L3 block: va=%p phys=0x%llx tables=%u (window 0x%llx +%u MiB)",
+            aperVa,
+            (ULONGLONG)Adapter->ApertureL3Phys.QuadPart,
+            (ULONG)WINMALI_APERTURE_L3_COUNT,
+            (ULONGLONG)WINMALI_SYSMEM_GPU_BASE,
+            (ULONG)(WINMALI_DMA_SEGMENT_BYTES >> 20));
     }
 
     base   = (PUCHAR)va;
@@ -398,6 +466,26 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
     l2[2] = l3pa | 3ull; // VA 0x400000 → L2 index 2
     // the GPU never executes from here, so RW + NX is the right choice.
     l3[0] = WinMaliMmuMakeL3PagePte_(dataPa, WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
+
+    //
+    // Wire the preallocated aperture L3 tables into L2 up front. The
+    // window starts at WINMALI_SYSMEM_GPU_BASE (0x10000000 >> 21 = L2
+    // index 128) and stays inside L1[0]'s 1 GiB reach - asserted below.
+    //
+    {
+        UINT64 aperPa;
+        ULONG  l2idx;
+        ULONG  t;
+
+        C_ASSERT((WINMALI_SYSMEM_GPU_BASE & ((1ull << 21) - 1ull)) == 0);
+        C_ASSERT(WINMALI_SYSMEM_GPU_BASE + WINMALI_DMA_SEGMENT_BYTES <= (1ull << 30));
+
+        aperPa = (UINT64)Adapter->ApertureL3Phys.QuadPart;
+        l2idx  = (ULONG)((WINMALI_SYSMEM_GPU_BASE >> 21) & 0x1FFull);
+        for (t = 0; t < (ULONG)WINMALI_APERTURE_L3_COUNT; ++t) {
+            l2[l2idx + t] = (aperPa + ((UINT64)t << 12)) | 3ull;
+        }
+    }
 
     KeMemoryBarrier();
 
@@ -449,6 +537,82 @@ WinMaliMmuInit(_Inout_ PWINMALI_ADAPTER Adapter)
    Rebuild against the v1.0 escape opcodes in Shared/WinMaliEscape.h when
    the escape surface is wired in. */
 
+/* Resolve GpuVa to the L3 leaf slot that maps it in the bring-up AS.
+   Two windows exist, both fully backed by preallocated tables:
+     * 2 MiB CSF test window at WINMALI_MMU_TEST_GPU_VA (one static L3 in
+       the scratch heap);
+     * aperture window at WINMALI_SYSMEM_GPU_BASE (one L3 per 2 MiB in
+       Adapter->ApertureL3Va, wired into L2 at MmuInit).
+   Returns NULL for any VA outside both windows. */
+static PUINT64
+WinMaliMmuResolveL3Slot_(_In_ PWINMALI_ADAPTER Adapter, _In_ UINT64 GpuVa)
+{
+    if (GpuVa >= WINMALI_MMU_TEST_GPU_VA &&
+        GpuVa <  WINMALI_MMU_TEST_GPU_VA + (2ull << 20)) {
+        PUINT64 l3 = (PUINT64)((PUCHAR)Adapter->MmuScratchHeapVa + 12288u);
+        return &l3[(ULONG)((GpuVa - WINMALI_MMU_TEST_GPU_VA) >> 12)];
+    }
+    if (Adapter->ApertureL3Va != NULL &&
+        GpuVa >= WINMALI_SYSMEM_GPU_BASE &&
+        GpuVa <  WINMALI_SYSMEM_GPU_BASE + (UINT64)WINMALI_DMA_SEGMENT_BYTES) {
+        UINT64  off = GpuVa - WINMALI_SYSMEM_GPU_BASE;
+        PUINT64 l3  = (PUINT64)((PUCHAR)Adapter->ApertureL3Va + ((off >> 21) << 12));
+        return &l3[(ULONG)((off >> 12) & 0x1FFull)];
+    }
+    return NULL;
+}
+
+/* Shared PTE writer behind MapGpuRange / MapGpuPfnRange / UnmapGpuRange.
+   Pfns != NULL      -> scattered frames from an MDL PFN array;
+   Pfns == NULL      -> physically-contiguous run starting at FirstPagePa;
+   Attrs == 0        -> clear (unmap).
+   Ranges may span L3 tables; the resolver bounds-checks every page. All
+   PT memory is non-cached and the AS walker is programmed non-cacheable,
+   so plain stores + one barrier + one FLUSH_MEM complete the update. */
+static NTSTATUS
+WinMaliMmuSetPtes_(
+    _Inout_ PWINMALI_ADAPTER          Adapter,
+    _In_ UINT64                       GpuVaStart,
+    _In_reads_opt_(PageCount) const PFN_NUMBER* Pfns,
+    _In_ UINT64                       FirstPagePa,
+    _In_ ULONG                        PageCount,
+    _In_ UINT64                       Attrs)
+{
+    ULONG i;
+
+    if (Adapter == NULL || Adapter->MmuScratchHeapVa == NULL || !Adapter->GpuMmuAsBound) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    if (PageCount == 0u ||
+        PageCount > (ULONG)(WINMALI_DMA_SEGMENT_BYTES >> 12)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ((GpuVaStart & 0xfffull) != 0ull || (FirstPagePa & 0xfffull) != 0ull) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for (i = 0; i < PageCount; ++i) {
+        UINT64  va   = GpuVaStart + (UINT64)i * 4096ull;
+        PUINT64 slot = WinMaliMmuResolveL3Slot_(Adapter, va);
+        if (slot == NULL) {
+            WINMALI_WARN("SetPtes: gpu_va=0x%llx outside wired windows (page %lu/%lu)",
+                         (ULONGLONG)va, i, PageCount);
+            return STATUS_INVALID_PARAMETER;
+        }
+        if (Attrs == 0ull) {
+            *slot = 0ull;
+        } else if (Pfns != NULL) {
+            *slot = WinMaliMmuMakeL3PagePte_(((UINT64)Pfns[i]) << 12, Attrs);
+        } else {
+            *slot = WinMaliMmuMakeL3PagePte_(FirstPagePa + (UINT64)i * 4096ull, Attrs);
+        }
+    }
+    KeMemoryBarrier();
+
+    (VOID)WinMaliMmuAsFlushMem_(&Adapter->Hw, Adapter->GpuMmuBringupAs);
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 WinMaliMmuMapGpuRange(
     _Inout_ PWINMALI_ADAPTER Adapter,
@@ -457,40 +621,25 @@ WinMaliMmuMapGpuRange(
     _In_ ULONG              PageCount,
     _In_ UINT64             Attrs)
 {
-    PUINT64 l3;
-    ULONG   i;
-    UINT64  regionLo = WINMALI_MMU_TEST_GPU_VA;
-    UINT64  regionHi = WINMALI_MMU_TEST_GPU_VA + (2ull * 1024ull * 1024ull);
+    if (Attrs == 0ull) {
+        return STATUS_INVALID_PARAMETER;    /* 0 means "clear"; use Unmap */
+    }
+    return WinMaliMmuSetPtes_(Adapter, GpuVaStart, NULL,
+                              (UINT64)FirstPagePa.QuadPart, PageCount, Attrs);
+}
 
-    if (Adapter == NULL || Adapter->MmuScratchHeapVa == NULL || !Adapter->GpuMmuAsBound) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-    if (PageCount == 0u || PageCount > 512u) {
+NTSTATUS
+WinMaliMmuMapGpuPfnRange(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ UINT64             GpuVaStart,
+    _In_reads_(PageCount) const PFN_NUMBER* Pfns,
+    _In_ ULONG              PageCount,
+    _In_ UINT64             Attrs)
+{
+    if (Pfns == NULL || Attrs == 0ull) {
         return STATUS_INVALID_PARAMETER;
     }
-    if ((GpuVaStart & 0xfffull) != 0ull || (FirstPagePa.QuadPart & 0xfffull) != 0ull) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (GpuVaStart < regionLo || GpuVaStart >= regionHi) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (GpuVaStart + (UINT64)PageCount * 4096ull > regionHi) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    l3 = (PUINT64)((PUCHAR)Adapter->MmuScratchHeapVa + 12288u);
-    for (i = 0; i < PageCount; ++i) {
-        UINT64 va  = GpuVaStart + (UINT64)i * 4096ull;
-        UINT64 idx = (va - regionLo) >> 12;
-        if (idx >= 512ull) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        l3[(ULONG)idx] = WinMaliMmuMakeL3PagePte_(FirstPagePa.QuadPart + (UINT64)i * 4096ull, Attrs);
-        KeMemoryBarrier();
-    }
-
-    (VOID)WinMaliMmuAsFlushMem_(&Adapter->Hw, Adapter->GpuMmuBringupAs);
-    return STATUS_SUCCESS;
+    return WinMaliMmuSetPtes_(Adapter, GpuVaStart, Pfns, 0ull, PageCount, Attrs);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +780,21 @@ WinMaliMmuBindContextRootPt(_Inout_ PWINMALI_ADAPTER Adapter,
     return STATUS_SUCCESS;
 }
 
+ULONG
+WinMaliMmuGetContextAsSlot(_In_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
+{
+    KIRQL irql;
+    ULONG as;
+
+    if (Adapter == NULL || hContext == NULL) {
+        return WINMALI_AS_SLOT_MAX;
+    }
+    KeAcquireSpinLock(&Adapter->AsSlotLock, &irql);
+    as = WinMaliMmuFindAsForContext_(Adapter, hContext);
+    KeReleaseSpinLock(&Adapter->AsSlotLock, irql);
+    return as;
+}
+
 NTSTATUS
 WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter, _In_ HANDLE hContext)
 {
@@ -670,40 +834,8 @@ WinMaliMmuUnmapGpuRange(
     _In_ UINT64             GpuVaStart,
     _In_ ULONG              PageCount)
 {
-    PUINT64 l3;
-    ULONG   i;
-    UINT64  regionLo = WINMALI_MMU_TEST_GPU_VA;
-    UINT64  regionHi = WINMALI_MMU_TEST_GPU_VA + (2ull * 1024ull * 1024ull);
-
-    if (Adapter == NULL || Adapter->MmuScratchHeapVa == NULL || !Adapter->GpuMmuAsBound) {
-        return STATUS_DEVICE_NOT_READY;
-    }
-    if (PageCount == 0u || PageCount > 512u) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if ((GpuVaStart & 0xfffull) != 0ull) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (GpuVaStart < regionLo || GpuVaStart >= regionHi) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (GpuVaStart + (UINT64)PageCount * 4096ull > regionHi) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    l3 = (PUINT64)((PUCHAR)Adapter->MmuScratchHeapVa + 12288u);
-    for (i = 0; i < PageCount; ++i) {
-        UINT64 va  = GpuVaStart + (UINT64)i * 4096ull;
-        UINT64 idx = (va - regionLo) >> 12;
-        if (idx >= 512ull) {
-            return STATUS_INVALID_PARAMETER;
-        }
-        l3[(ULONG)idx] = 0;
-        KeMemoryBarrier();
-    }
-
-    (VOID)WinMaliMmuAsFlushMem_(&Adapter->Hw, Adapter->GpuMmuBringupAs);
-    return STATUS_SUCCESS;
+    /* Attrs == 0 -> clear leaf PTEs. */
+    return WinMaliMmuSetPtes_(Adapter, GpuVaStart, NULL, 0ull, PageCount, 0ull);
 }
 
 /* Snapshot user-AS slots under the lock, then flush each outside it - the

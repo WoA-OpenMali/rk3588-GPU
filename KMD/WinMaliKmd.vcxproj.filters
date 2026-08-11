@@ -26,6 +26,9 @@
     <ClInclude Include="WinMaliKmd.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="WinMaliVersion.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="WinMaliDxgkInitFill.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -37,5 +40,10 @@
     <Inf Include="WinMaliKmd.inx">
       <Filter>Driver Files</Filter>
     </Inf>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="WinMaliKmd.rc">
+      <Filter>Driver Files</Filter>
+    </ResourceCompile>
   </ItemGroup>
 </Project>

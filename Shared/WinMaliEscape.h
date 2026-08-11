@@ -47,7 +47,7 @@
  * -----------
  *
  * Compiled under both ntddk.h (kernel-mode driver) and windows.h
- * (mesa-side UMD/ICDs). The KM toolset on VS 2017 v141 has no
+ * (mesa-side UMD/ICDs). The kernel-mode driver toolset does not put
  * <stdint.h> on its include path, so we map uint*_t onto the Windows
  * UINTn / INTn types when we are in kernel mode.
  */
@@ -82,7 +82,8 @@ extern "C" {
 #define WINMALI_ABI_MAJOR       1
 
 /* Bumped for additive changes. KMD returns -EOPNOTSUPP for unknown ops.       */
-#define WINMALI_ABI_MINOR       0
+/* 1: + WinMaliEscapeOp_DebugLog (UMD -> UART log mirroring)                    */
+#define WINMALI_ABI_MINOR       1
 
 /* KMD pool tag. Appears as "WinM" in !pooltrack / Driver Verifier output.    */
 #define WINMALI_POOL_TAG        'MniW'
@@ -140,7 +141,21 @@ typedef enum _WINMALI_ESCAPE_OP {
     /* mmap(fd, offset) which can't work on Windows (the "fd" is our    */
     /* sentinel value); this is the WinMali replacement.                */
     WinMaliEscapeOp_BoMapCpu            = 0x86,
+    /* UMD -> UART logging: the UMD hands a text line to the KMD, which
+     * mirrors it onto the same serial log as the [WinMali] kernel
+     * prints, prefixed "[WinMali-UMD pid=N]". Debug aid only - the UMD
+     * runs headless on the DUT and user-mode output is otherwise
+     * invisible. Additive (ABI minor 1); older KMDs return -EOPNOTSUPP
+     * and the UMD silently stops mirroring.                            */
+    WinMaliEscapeOp_DebugLog            = 0x8F,
     WinMaliEscapeOp_PresentToHdc        = 0x90,
+    /* Signal a syncobj to a value (binary: any Point>0 => signalled;
+     * timeline: raise to Point). Backs libdrm drmSyncobjSignal and the
+     * synchronous drmSyncobjTransfer used by panvk (Vulkan) to signal an
+     * app VkFence/semaphore after GROUP_SUBMIT - our submits are already
+     * GPU-complete on return, so signalling the destination is correct.
+     * Additive (ABI minor 1); older KMDs return -EOPNOTSUPP.            */
+    WinMaliEscapeOp_SyncObjSignal       = 0x91,
 } WINMALI_ESCAPE_OP;
 
 /* -------------------------------------------------------------------------- */
@@ -261,12 +276,20 @@ typedef struct _WINMALI_GPU_INFO {
 } WINMALI_GPU_INFO;
 
 /* Layout-compatible with drm_panthor_csif_info. */
+/* Layout MUST match drm_panthor_csif_info exactly - the mesa pan_kmod
+ * backend casts this struct straight to drm_panthor_csif_info
+ * (panthor_kmod_get_csif_props). Field order is load-bearing: getting
+ * cs_reg_count wrong yields a broken CS register file and the Valhall
+ * cs_builder indexes out of bounds (crashed csf_oom_handler_init,
+ * 2026-07-12). Order: csg_slot, cs_slot, cs_reg, scoreboard, unpreserved,
+ * pad. */
 typedef struct _WINMALI_CSIF_INFO {
-    uint32_t CsGroupCount;
-    uint32_t CsCount;
-    uint32_t ScoreboardSlotCount;
-    uint32_t SyncWaitSlotCount;
-    uint32_t CsRegCount;
+    uint32_t CsGroupCount;          /* csg_slot_count */
+    uint32_t CsCount;               /* cs_slot_count */
+    uint32_t CsRegCount;            /* cs_reg_count */
+    uint32_t ScoreboardSlotCount;   /* scoreboard_slot_count */
+    uint32_t CsUnpreservedRegCount; /* unpreserved_cs_reg_count */
+    uint32_t Pad;
 } WINMALI_CSIF_INFO;
 
 /* Layout-compatible with drm_panthor_timestamp_info. */
@@ -543,7 +566,11 @@ typedef struct _WINMALI_TILER_HEAP_CREATE {
     uint32_t TargetInFlightChunks;
     /* out */
     uint32_t HeapHandle;
-    uint64_t FirstChunkGpuVa;   /* in the VM */
+    uint64_t FirstChunkGpuVa;   /* first (newest) chunk's GPU VA in the VM */
+    uint64_t TilerHeapCtxGpuVa; /* 32-byte heap context descriptor's GPU VA;
+                                   what the CS HEAP_SET points at. Distinct
+                                   from FirstChunkGpuVa. 0 if KMD ran the
+                                   metadata-only fallback (UMD then aliases). */
 } WINMALI_TILER_HEAP_CREATE;
 
 typedef struct _WINMALI_TILER_HEAP_DESTROY {
@@ -577,6 +604,12 @@ typedef struct _WINMALI_SYNC_OBJ_DESTROY {
     uint32_t Handle;
     uint32_t Pad;
 } WINMALI_SYNC_OBJ_DESTROY;
+
+typedef struct _WINMALI_SYNC_OBJ_SIGNAL {
+    uint32_t Handle;
+    uint32_t Pad;
+    uint64_t Point;         /* timeline value; binary treats >0 as signalled */
+} WINMALI_SYNC_OBJ_SIGNAL;
 
 /* WAIT_FLAG bits: ALL = wait for every handle to reach its point. The       */
 /* default is "any one of them suffices" (i.e. ANY). FOR_SUBMIT means        */
@@ -644,7 +677,9 @@ typedef struct _WINMALI_GET_FLUSH_ID {
 /* -------------------------------------------------------------------------- */
 
 typedef struct _WINMALI_BO_FROM_ALLOCATION {
-    uint32_t AllocationHandle;  /* D3DKMT_HANDLE */
+    uint32_t AllocationHandle;  /* D3DKMT_HANDLE. Resolves natively because this
+                                   escape is routed through the runtime device's
+                                   pfnEscapeCb (same device that created it). */
     uint32_t Flags;             /* WINMALI_BO_FLAG_* (subset valid here) */
     uint32_t VmId;              /* 0 = create unmapped */
     uint32_t Pad;
@@ -672,6 +707,43 @@ typedef struct _WINMALI_ALLOCATION_PRIVATE {
     uint32_t Format;            /* DXGI_FORMAT, informational */
     uint32_t Stride;            /* bytes/row, informational */
 } WINMALI_ALLOCATION_PRIVATE;
+
+/* CS submit descriptor (Phase 3). The UMD tags a dxgk DMA buffer's private
+   data with this so DxgkDdiSubmitCommandVirtual RUNS the command stream on the
+   CSG instead of just NOP-fencing. Carries the UMD's escape VM id (KMD resolves
+   to the Mali AS slot) + the CS stream GPU VA/size in that VM - the same inputs
+   the escape GroupSubmit path consumes. Shared so UMD + KMD agree. */
+#define WINMALI_CS_SUBMIT_DESC_MAGIC  0x53434257u  /* 'WBCS' */
+
+/* Flags bits. DXGK_ADDR: the UMD mapped this CS's allocations through dxgk
+   GpuMmu (pfnMapGpuVirtualAddressCb, Phase 2), so the stream references VAs
+   that live in the dxgk render CONTEXT's page table - the KMD must run it
+   against that context's Mali AS (bound via SetRootPageTable), NOT the escape
+   VM's AS. Unset = escape VmBind addressing (baseline): use VmId's AS. */
+#define WINMALI_CS_SUBMIT_FLAG_DXGK_ADDR  0x00000001u
+
+typedef struct _WINMALI_CS_SUBMIT_DESC {
+    uint32_t Magic;        /* WINMALI_CS_SUBMIT_DESC_MAGIC */
+    uint32_t VmId;         /* UMD escape VM id -> KMD resolves to AS slot */
+    uint64_t StreamGpuVa;  /* CS stream GPU VA valid in that VM's AS */
+    uint32_t StreamSize;   /* bytes */
+    uint32_t Flags;        /* WINMALI_CS_SUBMIT_FLAG_* */
+} WINMALI_CS_SUBMIT_DESC, *PWINMALI_CS_SUBMIT_DESC;
+
+/* -------------------------------------------------------------------------- */
+/*  Op 0x8F - DebugLog                                                         */
+/*                                                                             */
+/*  Text follows at TextOffset (bytes from start of pPrivateDriverData).       */
+/*  Not required to be NUL-terminated; KMD caps at WINMALI_DEBUG_LOG_MAX and   */
+/*  sanitizes non-printable bytes before mirroring to the serial log.          */
+/* -------------------------------------------------------------------------- */
+
+#define WINMALI_DEBUG_LOG_MAX   480
+
+typedef struct _WINMALI_DEBUG_LOG {
+    uint32_t TextLen;
+    uint32_t TextOffset;    /* byte offset within escape buffer */
+} WINMALI_DEBUG_LOG;
 
 /* -------------------------------------------------------------------------- */
 /*  Op 0x90 - PresentToHdc                                                     */

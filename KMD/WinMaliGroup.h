@@ -5,14 +5,11 @@
  * queues that share scheduling parameters and a VM. Mirrors panthor's
  * drm_panthor_group_create. Exposed to the UMD via WinMaliEscape ops 7..10.
  *
- * Current state: metadata-only. GroupCreate/Destroy/GetState track the
- * group handle + queue parameters; GroupSubmit waits for real VmBind to
- * land (the submitted CS stream lives in a BO that's only GPU-addressable
- * once VmBind installs the LPAE PTEs into the VM's AS).
- *
- * Once VmBind is wired, GroupSubmit will pull WINMALI_QUEUE_SUBMIT entries,
- * look up their CS stream GPU VAs, and hand each off to WinMaliCsfSubmitStreamCall_
- * for the actual CSF kernel-queue ring write.
+ * GroupCreate/Destroy/GetState track the group handle + queue parameters.
+ * GroupSubmit is fully wired (WinMaliEscapeGroupSubmit_): it pulls the
+ * WINMALI_QUEUE_SUBMIT entries, rebinds the CSG to the group's VM AS, and
+ * CALLs each queue's CS stream GPU VA via WinMaliCsfSubmitGroupStream. VmBind
+ * installs the LPAE PTEs into the VM's AS that those GPU VAs resolve against.
  */
 
 #pragma once
@@ -44,6 +41,9 @@ typedef struct _WINMALI_GROUP {
     ULONG                   StateFlags;     /* WINMALI_GROUP_STATE_* */
     ULONG                   FatalQueueMask;
     LONG                    RefCount;
+    /* dxgk device (WINMALI_KMD_DEVICE*) whose escape created this group;
+       freed by DestroyDevice rundown if the UMD never destroys it. */
+    PVOID                   OwnerDevice;
 } WINMALI_GROUP, *PWINMALI_GROUP;
 
 typedef struct _WINMALI_GROUP_TABLE {
@@ -62,12 +62,28 @@ int WinMaliGroupCreate(_Inout_ PWINMALI_ADAPTER Adapter,
                        _In_ const WINMALI_GROUP_CREATE* Args,
                        _In_reads_(QueueCount) const WINMALI_QUEUE_CREATE* Queues,
                        _In_ ULONG QueueCount,
+                       _In_opt_ PVOID OwnerDevice,
                        _Out_ ULONG* OutHandle);
 
 int WinMaliGroupDestroy(_Inout_ PWINMALI_ADAPTER Adapter,
                         _In_ ULONG Handle);
 
+/* Destroy every group owned by OwnerDevice (device rundown). Returns the
+   number destroyed. */
+ULONG WinMaliGroupRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
+                               _In_ PVOID OwnerDevice);
+
 int WinMaliGroupGetState(_In_ PWINMALI_ADAPTER Adapter,
                          _In_ ULONG Handle,
                          _Out_ ULONG* OutStateFlags,
                          _Out_ ULONG* OutFatalQueueMask);
+
+int WinMaliGroupMarkFatalQueue(_In_ PWINMALI_ADAPTER Adapter,
+                               _In_ ULONG Handle,
+                               _In_ ULONG QueueIndex);
+
+/* Return the VM id a group is bound to (for resolving the CSG's target AS
+   on submit). Returns 0/-errno. */
+int WinMaliGroupGetVmId(_In_ PWINMALI_ADAPTER Adapter,
+                        _In_ ULONG Handle,
+                        _Out_ ULONG* OutVmId);

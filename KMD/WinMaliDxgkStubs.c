@@ -39,11 +39,17 @@ WinMaliKmdStub_Patch(
     IN_CONST_PDXGKARG_PATCH     pPatch
     )
 {
-    DbgPrint("[WinMali] >> Patch\n");
+    /* dxgk calls Patch to resolve allocation references in a DMA buffer before
+       it is submitted - notably the present DMA buffer built by DxgkDdiPresent
+       (src/dst allocations). Returning NOT_SUPPORTED here fails the whole
+       submit right after our synchronous present copy, so present never
+       completes. This driver does NOT need real address patching: the present
+       blt is done on the CPU in DxgkDdiPresent, and render submits use GPU VAs
+       through SubmitCommandVirtual (no patch locations to resolve). So this is
+       a valid no-op - acknowledge success and let the pipeline proceed. */
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pPatch);
-    DbgPrint("[WinMali] << Patch STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_PREEMPTCOMMAND)
@@ -131,11 +137,14 @@ WinMaliKmdStub_QueryDependentEngineGroup(
     INOUT_DXGKARG_QUERYDEPENDENTENGINEGROUP     pQueryDependentEngineGroup
     )
 {
-    DbgPrint("[WinMali] >> QueryDependentEngineGroup\n");
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pQueryDependentEngineGroup);
-    DbgPrint("[WinMali] << QueryDependentEngineGroup STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    if (pQueryDependentEngineGroup == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* One engine per node; resetting a node affects only that node. */
+    pQueryDependentEngineGroup->DependentNodeOrdinalMask =
+        (1ULL << pQueryDependentEngineGroup->NodeOrdinal);
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_QUERYENGINESTATUS)
@@ -208,22 +217,6 @@ WinMaliKmdStub_PowerRuntimeControlRequest(
     return STATUS_NOT_SUPPORTED;
 }
 
-_Function_class_(DXGKDDI_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetVidPnSourceAddressWithMultiPlaneOverlay(
-    IN_CONST_HANDLE hAdapter,
-    IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY
-                  pSetVidPnSourceAddressWithMultiPlaneOverlay
-    )
-{
-    DbgPrint("[WinMali] >> SetVidPnSourceAddressWithMultiPlaneOverlay\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetVidPnSourceAddressWithMultiPlaneOverlay);
-    DbgPrint("[WinMali] << SetVidPnSourceAddressWithMultiPlaneOverlay STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
 _Function_class_(DXGKDDI_NOTIFY_SURPRISE_REMOVAL)
 NTSTATUS
 APIENTRY
@@ -271,22 +264,6 @@ WinMaliKmdStub_ControlInterrupt2(
     return STATUS_NOT_SUPPORTED;
 }
 
-_Function_class_(DXGKDDI_CHECKMULTIPLANEOVERLAYSUPPORT)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_CheckMultiPlaneOverlaySupport(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT
-                  pCheckMultiPlaneOverlaySupport
-    )
-{
-    DbgPrint("[WinMali] >> CheckMultiPlaneOverlaySupport\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pCheckMultiPlaneOverlaySupport);
-    DbgPrint("[WinMali] << CheckMultiPlaneOverlaySupport STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
 _Function_class_(DXGKDDI_CALIBRATEGPUCLOCK)
 NTSTATUS
 APIENTRY
@@ -297,13 +274,23 @@ WinMaliKmdStub_CalibrateGpuClock(
     OUT_PDXGKARG_CALIBRATEGPUCLOCK	            pClockCalibration
     )
 {
-    DbgPrint("[WinMali] >> CalibrateGpuClock\n");
+    LARGE_INTEGER qpc;
+    LARGE_INTEGER freq;
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(NodeOrdinal);
     UNREFERENCED_PARAMETER(EngineOrdinal);
-    UNREFERENCED_PARAMETER(pClockCalibration);
-    DbgPrint("[WinMali] << CalibrateGpuClock STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    if (pClockCalibration == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* No dedicated GPU timestamp register is wired; model GPU time as the
+       system performance counter (same clock the escape TimestampInfo uses).
+       CPU == GPU counter -> identity correlation. */
+    qpc = KeQueryPerformanceCounter(&freq);
+    RtlZeroMemory(pClockCalibration, sizeof(*pClockCalibration));
+    pClockCalibration->GpuFrequency    = (ULONGLONG)freq.QuadPart;
+    pClockCalibration->GpuClockCounter = (ULONGLONG)qpc.QuadPart;
+    pClockCalibration->CpuClockCounter = (ULONGLONG)qpc.QuadPart;
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_FORMATHISTORYBUFFER)
@@ -314,11 +301,17 @@ WinMaliKmdStub_FormatHistoryBuffer(
     IN DXGKARG_FORMATHISTORYBUFFER* pFormatData
     )
 {
-    DbgPrint("[WinMali] >> FormatHistoryBuffer\n");
     UNREFERENCED_PARAMETER(hContext);
-    UNREFERENCED_PARAMETER(pFormatData);
-    DbgPrint("[WinMali] << FormatHistoryBuffer STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    if (pFormatData == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* We advertise HistoryBufferPrecision, so dxgkrnl may ask us to format a
+       GPU-timestamp history buffer on demand. We have no GPU-written history;
+       present a well-formed empty formatted buffer. */
+    if (pFormatData->pFormattedBuffer != NULL && pFormatData->FormattedBufferSize != 0) {
+        RtlZeroMemory(pFormatData->pFormattedBuffer, pFormatData->FormattedBufferSize);
+    }
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_RENDERGDI)
@@ -336,20 +329,10 @@ WinMaliKmdStub_RenderGdi(
     return STATUS_NOT_SUPPORTED;
 }
 
-_Function_class_(DXGKDDI_SUBMITCOMMANDVIRTUAL)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SubmitCommandVirtual(
-    IN_CONST_HANDLE                         hAdapter,
-    IN_CONST_PDXGKARG_SUBMITCOMMANDVIRTUAL  pSubmitCommand
-    )
-{
-    DbgPrint("[WinMali] >> SubmitCommandVirtual\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSubmitCommand);
-    DbgPrint("[WinMali] << SubmitCommandVirtual STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
+/* NOTE: DxgkDdiSubmitCommandVirtual is implemented for real as
+   WinMaliKmdSubmitCommandVirtual (WinMaliDdi.c) and wired in
+   WinMaliDxgkStubsWire.h - a GpuMmu driver submits DMA buffers through it, so
+   a NOT_SUPPORTED stub here would bugcheck 0x119. The stub was removed. */
 
 _Function_class_(DXGKDDI_MAPCPUHOSTAPERTURE)
 NTSTATUS
@@ -378,38 +361,6 @@ WinMaliKmdStub_UnmapCpuHostAperture(
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pArgs);
     DbgPrint("[WinMali] << UnmapCpuHostAperture STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_CHECKMULTIPLANEOVERLAYSUPPORT2)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_CheckMultiPlaneOverlaySupport2(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT2
-                  pCheckMultiPlaneOverlaySupport
-    )
-{
-    DbgPrint("[WinMali] >> CheckMultiPlaneOverlaySupport2\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pCheckMultiPlaneOverlaySupport);
-    DbgPrint("[WinMali] << CheckMultiPlaneOverlaySupport2 STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY2)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetVidPnSourceAddressWithMultiPlaneOverlay2(
-    IN_CONST_HANDLE hAdapter,
-    IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY2
-                  pSetVidPnSourceAddressWithMultiPlaneOverlay
-    )
-{
-    DbgPrint("[WinMali] >> SetVidPnSourceAddressWithMultiPlaneOverlay2\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetVidPnSourceAddressWithMultiPlaneOverlay);
-    DbgPrint("[WinMali] << SetVidPnSourceAddressWithMultiPlaneOverlay2 STATUS_NOT_SUPPORTED\n");
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -457,54 +408,6 @@ WinMaliKmdStub_SetVideoProtectedRegion(
     return STATUS_NOT_SUPPORTED;
 }
 
-_Function_class_(DXGKDDI_CHECKMULTIPLANEOVERLAYSUPPORT3)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_CheckMultiPlaneOverlaySupport3(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3
-                  pCheckMultiPlaneOverlaySupport
-    )
-{
-    DbgPrint("[WinMali] >> CheckMultiPlaneOverlaySupport3\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pCheckMultiPlaneOverlaySupport);
-    DbgPrint("[WinMali] << CheckMultiPlaneOverlaySupport3 STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetVidPnSourceAddressWithMultiPlaneOverlay3(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3
-                  pSetVidPnSourceAddressWithMultiPlaneOverlay
-    )
-{
-    DbgPrint("[WinMali] >> SetVidPnSourceAddressWithMultiPlaneOverlay3\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetVidPnSourceAddressWithMultiPlaneOverlay);
-    DbgPrint("[WinMali] << SetVidPnSourceAddressWithMultiPlaneOverlay3 STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_POSTMULTIPLANEOVERLAYPRESENT)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_PostMultiPlaneOverlayPresent(
-    IN_CONST_HANDLE hAdapter,
-    IN_CONST_PDXGKARG_POSTMULTIPLANEOVERLAYPRESENT
-                  pPostPresent
-    )
-{
-    DbgPrint("[WinMali] >> PostMultiPlaneOverlayPresent\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pPostPresent);
-    DbgPrint("[WinMali] << PostMultiPlaneOverlayPresent STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
 _Function_class_(DXGKDDI_VALIDATEUPDATEALLOCATIONPROPERTY)
 NTSTATUS
 APIENTRY
@@ -517,21 +420,6 @@ WinMaliKmdStub_ValidateUpdateAllocationProperty(
     UNREFERENCED_PARAMETER(hAdapter);
     UNREFERENCED_PARAMETER(pValidateUpdateAllocProperty);
     DbgPrint("[WinMali] << ValidateUpdateAllocationProperty STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_CONTROLMODEBEHAVIOR)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_ControlModeBehavior(
-    IN_CONST_HANDLE                             hAdapter,
-    INOUT_PDXGKARG_CONTROLMODEBEHAVIOR          pControlModeBehaviorArg
-    )
-{
-    DbgPrint("[WinMali] >> ControlModeBehavior\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pControlModeBehaviorArg);
-    DbgPrint("[WinMali] << ControlModeBehavior STATUS_NOT_SUPPORTED\n");
     return STATUS_NOT_SUPPORTED;
 }
 
@@ -636,124 +524,6 @@ WinMaliKmdStub_ResetHwEngine(
     return STATUS_NOT_SUPPORTED;
 }
 
-_Function_class_(DXGKDDI_CREATEPERIODICFRAMENOTIFICATION)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_CreatePeriodicFrameNotification(
-    INOUT_PDXGKARG_CREATEPERIODICFRAMENOTIFICATION pCreatePeriodicFrameNotification
-    )
-{
-    DbgPrint("[WinMali] >> CreatePeriodicFrameNotification\n");
-    UNREFERENCED_PARAMETER(pCreatePeriodicFrameNotification);
-    DbgPrint("[WinMali] << CreatePeriodicFrameNotification STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_DESTROYPERIODICFRAMENOTIFICATION)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_DestroyPeriodicFrameNotification(
-    IN_CONST_PDXGKARG_DESTROYPERIODICFRAMENOTIFICATION pDestroyPeriodicFrameNotification
-    )
-{
-    DbgPrint("[WinMali] >> DestroyPeriodicFrameNotification\n");
-    UNREFERENCED_PARAMETER(pDestroyPeriodicFrameNotification);
-    DbgPrint("[WinMali] << DestroyPeriodicFrameNotification STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_SETTIMINGSFROMVIDPN)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetTimingsFromVidPn(
-    IN_CONST_HANDLE                             hAdapter,
-    IN_OUT_PDXGKARG_SETTIMINGSFROMVIDPN         pSetTimings
-    )
-{
-    DbgPrint("[WinMali] >> SetTimingsFromVidPn\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetTimings);
-    DbgPrint("[WinMali] << SetTimingsFromVidPn STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_SETTARGETGAMMA)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetTargetGamma(
-    IN_CONST_HANDLE                             hAdapter,
-    IN_CONST_PDXGKARG_SETTARGETGAMMA            pSetTargetGammaArg
-    )
-{
-    DbgPrint("[WinMali] >> SetTargetGamma\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetTargetGammaArg);
-    DbgPrint("[WinMali] << SetTargetGamma STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_SETTARGETCONTENTTYPE)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetTargetContentType(
-    IN_CONST_HANDLE                             hAdapter,
-    IN_CONST_PDXGKARG_SETTARGETCONTENTTYPE      pSetTargetContentTypeArg
-    )
-{
-    DbgPrint("[WinMali] >> SetTargetContentType\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetTargetContentTypeArg);
-    DbgPrint("[WinMali] << SetTargetContentType STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_SETTARGETANALOGCOPYPROTECTION)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetTargetAnalogCopyProtection(
-    IN_CONST_HANDLE                                 hAdapter,
-    IN_CONST_PDXGKARG_SETTARGETANALOGCOPYPROTECTION pSetTargetAnalogCopyProtectionArg
-    )
-{
-    DbgPrint("[WinMali] >> SetTargetAnalogCopyProtection\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetTargetAnalogCopyProtectionArg);
-    DbgPrint("[WinMali] << SetTargetAnalogCopyProtection STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_GETMULTIPLANEOVERLAYCAPS)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_GetMultiPlaneOverlayCaps(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_GETMULTIPLANEOVERLAYCAPS
-                  pGetMultiPlaneOverlayCaps
-    )
-{
-    DbgPrint("[WinMali] >> GetMultiPlaneOverlayCaps\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pGetMultiPlaneOverlayCaps);
-    DbgPrint("[WinMali] << GetMultiPlaneOverlayCaps STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
-_Function_class_(DXGKDDI_GETPOSTCOMPOSITIONCAPS)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_GetPostCompositionCaps(
-    IN_CONST_HANDLE hAdapter,
-    IN_OUT_PDXGKARG_GETPOSTCOMPOSITIONCAPS
-                  pGetPostCompositionCaps
-    )
-{
-    DbgPrint("[WinMali] >> GetPostCompositionCaps\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pGetPostCompositionCaps);
-    DbgPrint("[WinMali] << GetPostCompositionCaps STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
 _Function_class_(DXGKDDI_UPDATEHWCONTEXTSTATE)
 NTSTATUS
 APIENTRY
@@ -807,11 +577,22 @@ WinMaliKmdStub_SetSchedulingLogBuffer(
     IN_CONST_PDXGKARG_SETSCHEDULINGLOGBUFFER    pSetSchedulingLogBuffer
     )
 {
-    DbgPrint("[WinMali] >> SetSchedulingLogBuffer\n");
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetSchedulingLogBuffer);
-    DbgPrint("[WinMali] << SetSchedulingLogBuffer STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    if (pSetSchedulingLogBuffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* Accept the per-node/engine scheduling log buffer. dxgkrnl allocates it and
+       records CPU-side context-switch / profiling events there (this is exactly
+       the buffer VidSchiProfilePerformanceTick writes to). We have no GPU-side
+       markers to program (submission is escape-driven), so accepting is
+       sufficient and lets dxgkrnl finish wiring its per-engine profiling state
+       instead of leaving the per-engine log-buffer pointer NULL. */
+    DbgPrint("[WinMali] SetSchedulingLogBuffer node=%u eng=%u entries=%u cpuVa=%p ACCEPT\n",
+             pSetSchedulingLogBuffer->NodeOrdinal,
+             pSetSchedulingLogBuffer->EngineOrdinal,
+             pSetSchedulingLogBuffer->NumberOfEntries,
+             (PVOID)pSetSchedulingLogBuffer->LogBufferCpuVa);
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_SETUPPRIORITYBANDS)
@@ -822,11 +603,16 @@ WinMaliKmdStub_SetupPriorityBands(
     IN_CONST_PDXGKARG_SETUPPRIORITYBANDS    pSetupPriorityBands
     )
 {
-    DbgPrint("[WinMali] >> SetupPriorityBands\n");
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetupPriorityBands);
-    DbgPrint("[WinMali] << SetupPriorityBands STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    if (pSetupPriorityBands == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* We advertise priority scheduling in DRIVERCAPS.SchedulingCaps, so dxgkrnl
+       configures its priority bands through us at init. We schedule uniformly
+       (single CSG), so there is no hardware band state to program; accept the
+       configuration so dxgkrnl's scheduler state is consistent with the caps we
+       reported. */
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_NOTIFYFOCUSPRESENT)
@@ -836,10 +622,9 @@ WinMaliKmdStub_NotifyFocusPresent(
     IN_CONST_HANDLE                         hAdapter
     )
 {
-    DbgPrint("[WinMali] >> NotifyFocusPresent\n");
     UNREFERENCED_PARAMETER(hAdapter);
-    DbgPrint("[WinMali] << NotifyFocusPresent STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    /* Informational: the focus window presented. Nothing to do; acknowledge. */
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_SETCONTEXTSCHEDULINGPROPERTIES)
@@ -850,11 +635,14 @@ WinMaliKmdStub_SetContextSchedulingProperties(
     IN_CONST_PDXGKARG_SETCONTEXTSCHEDULINGPROPERTIES    pSetContextSchedulingProperties
     )
 {
-    DbgPrint("[WinMali] >> SetContextSchedulingProperties\n");
     UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pSetContextSchedulingProperties);
-    DbgPrint("[WinMali] << SetContextSchedulingProperties STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
+    if (pSetContextSchedulingProperties == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* Accept per-context scheduling properties (priority band / quantum /
+       grace period). Our scheduler treats contexts uniformly; record nothing
+       but succeed so dxgkrnl considers the context fully schedulable. */
+    return STATUS_SUCCESS;
 }
 
 _Function_class_(DXGKDDI_SUSPENDCONTEXT)
@@ -1022,21 +810,6 @@ WinMaliKmdStub_ValidateSubmitCommand(
     return STATUS_NOT_SUPPORTED;
 }
 
-_Function_class_(DXGKDDI_SETTARGETADJUSTEDCOLORIMETRY2)
-NTSTATUS
-APIENTRY
-WinMaliKmdStub_SetTargetAdjustedColorimetry2(
-    IN_CONST_HANDLE                                 hAdapter,
-    IN_PDXGKARG_SETTARGETADJUSTEDCOLORIMETRY2       pArgSetTargetAdjustedColorimetry
-    )
-{
-    DbgPrint("[WinMali] >> SetTargetAdjustedColorimetry2\n");
-    UNREFERENCED_PARAMETER(hAdapter);
-    UNREFERENCED_PARAMETER(pArgSetTargetAdjustedColorimetry);
-    DbgPrint("[WinMali] << SetTargetAdjustedColorimetry2 STATUS_NOT_SUPPORTED\n");
-    return STATUS_NOT_SUPPORTED;
-}
-
 _Function_class_(DXGKDDI_SETTRACKEDWORKLOADPOWERLEVEL)
 NTSTATUS
 APIENTRY
@@ -1050,4 +823,526 @@ WinMaliKmdStub_SetTrackedWorkloadPowerLevel(
     UNREFERENCED_PARAMETER(pTrackedWorkloadPowerLevel);
     DbgPrint("[WinMali] << SetTrackedWorkloadPowerLevel STATUS_NOT_SUPPORTED\n");
     return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SAVEMEMORYFORHOTUPDATE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SaveMemoryForHotUpdate(
+    IN_CONST_HANDLE                 hContext,
+    IN_CONST_PDXGKARG_SAVEMEMORYFORHOTUPDATE pArgs
+    )
+{
+    DbgPrint("[WinMali] >> SaveMemoryForHotUpdate\n");
+    UNREFERENCED_PARAMETER(hContext);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << SaveMemoryForHotUpdate STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_RESTOREMEMORYFORHOTUPDATE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_RestoreMemoryForHotUpdate(
+    IN_CONST_HANDLE                             hContext,
+    IN_CONST_PDXGKARG_RESTOREMEMORYFORHOTUPDATE pArgs
+    )
+{
+    DbgPrint("[WinMali] >> RestoreMemoryForHotUpdate\n");
+    UNREFERENCED_PARAMETER(hContext);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << RestoreMemoryForHotUpdate STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_COLLECTDIAGNOSTICINFO)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_CollectDiagnosticInfo(
+    IN_CONST_PDEVICE_OBJECT PhysicalDeviceObject,
+    INOUT_PDXGKARG_COLLECTDIAGNOSTICINFO pCollectDiagnosticInfo
+    )
+{
+    DbgPrint("[WinMali] >> CollectDiagnosticInfo\n");
+    UNREFERENCED_PARAMETER(PhysicalDeviceObject);
+    UNREFERENCED_PARAMETER(pCollectDiagnosticInfo);
+    DbgPrint("[WinMali] << CollectDiagnosticInfo STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CONTROLINTERRUPT3)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_ControlInterrupt3(
+    IN_CONST_HANDLE                      hAdapter,
+    IN_CONST_PDXGKARG_CONTROLINTERRUPT3  InterruptControl
+    )
+{
+    DbgPrint("[WinMali] >> ControlInterrupt3\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(InterruptControl);
+    DbgPrint("[WinMali] << ControlInterrupt3 STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SETALLOCATIONBACKINGSTORE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SetAllocationBackingStore(
+    IN_CONST_HANDLE                 hAdapter,
+    IN_CONST_PDXGKARG_SETALLOCATIONBACKINGSTORE pArgs
+    )
+{
+    DbgPrint("[WinMali] >> SetAllocationBackingStore\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << SetAllocationBackingStore STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CREATECPUEVENT)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_CreateCpuEvent(
+    IN_CONST_HANDLE             hAdapter,
+    INOUT_PDXGKARG_CREATECPUEVENT pArgs
+    )
+{
+    DbgPrint("[WinMali] >> CreateCpuEvent\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << CreateCpuEvent STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_DESTROYCPUEVENT)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_DestroyCpuEvent(
+    IN_CONST_HANDLE hAdapter,
+    IN_CONST_HANDLE hKmdCpuEvent
+    )
+{
+    DbgPrint("[WinMali] >> DestroyCpuEvent\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(hKmdCpuEvent);
+    DbgPrint("[WinMali] << DestroyCpuEvent STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CREATENATIVEFENCE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_CreateNativeFence(
+    IN_CONST_HANDLE                     hAdapter,
+    INOUT_PDXGKARG_CREATENATIVEFENCE    pCreateNativeFence
+    )
+{
+    DbgPrint("[WinMali] >> CreateNativeFence\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pCreateNativeFence);
+    DbgPrint("[WinMali] << CreateNativeFence STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_DESTROYNATIVEFENCE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_DestroyNativeFence(
+    INOUT_PDXGKARG_DESTROYNATIVEFENCE pDestroyNativeFence
+    )
+{
+    DbgPrint("[WinMali] >> DestroyNativeFence\n");
+    UNREFERENCED_PARAMETER(pDestroyNativeFence);
+    DbgPrint("[WinMali] << DestroyNativeFence STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_UPDATEMONITOREDVALUES)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_UpdateMonitoredValues(
+    IN_CONST_PDXGKARG_UPDATEMONITOREDVALUES pUpdateMonitoredValues
+    )
+{
+    DbgPrint("[WinMali] >> UpdateMonitoredValues\n");
+    UNREFERENCED_PARAMETER(pUpdateMonitoredValues);
+    DbgPrint("[WinMali] << UpdateMonitoredValues STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_UPDATECURRENTVALUESFROMCPU)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_UpdateCurrentValuesFromCpu(
+    IN_CONST_PDXGKARG_UPDATECURRENTVALUESFROMCPU pUpdateCurrentValuesFromCpu
+    )
+{
+    DbgPrint("[WinMali] >> UpdateCurrentValuesFromCpu\n");
+    UNREFERENCED_PARAMETER(pUpdateCurrentValuesFromCpu);
+    DbgPrint("[WinMali] << UpdateCurrentValuesFromCpu STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CREATEDOORBELL)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_CreateDoorbell(
+    INOUT_PDXGKARG_CREATEDOORBELL pArgs
+    )
+{
+    DbgPrint("[WinMali] >> CreateDoorbell\n");
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << CreateDoorbell STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CONNECTDOORBELL)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_ConnectDoorbell(
+    INOUT_PDXGKARG_CONNECTDOORBELL pArgs
+    )
+{
+    DbgPrint("[WinMali] >> ConnectDoorbell\n");
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << ConnectDoorbell STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_DISCONNECTDOORBELL)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_DisconnectDoorbell(
+    INOUT_PDXGKARG_DISCONNECTDOORBELL pArgs
+    )
+{
+    DbgPrint("[WinMali] >> DisconnectDoorbell\n");
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << DisconnectDoorbell STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_DESTROYDOORBELL)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_DestroyDoorbell(
+    INOUT_PDXGKARG_DESTROYDOORBELL pArgs
+    )
+{
+    DbgPrint("[WinMali] >> DestroyDoorbell\n");
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << DestroyDoorbell STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_NOTIFYWORKSUBMISSION)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_NotifyWorkSubmission(
+    INOUT_PDXGKARG_NOTIFYWORKSUBMISSION pArgs
+    )
+{
+    DbgPrint("[WinMali] >> NotifyWorkSubmission\n");
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << NotifyWorkSubmission STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CREATEMEMORYBASIS)
+HANDLE
+APIENTRY
+WinMaliKmdStub_CreateMemoryBasis(
+    IN_CONST_HANDLE                     hAdapter,
+    IN_CONST_PDXGKARG_CREATEMEMORYBASIS pArgs
+    )
+{
+    DbgPrint("[WinMali] >> CreateMemoryBasis\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << CreateMemoryBasis 0\n");
+    return (HANDLE)0;
+}
+
+_Function_class_(DXGKDDI_DESTROYMEMORYBASIS)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_DestroyMemoryBasis(
+    IN_CONST_HANDLE hAdapter,
+    IN_CONST_HANDLE hMemoryBasis
+    )
+{
+    DbgPrint("[WinMali] >> DestroyMemoryBasis\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(hMemoryBasis);
+    DbgPrint("[WinMali] << DestroyMemoryBasis STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_STARTDIRTYTRACKING)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_StartDirtyTracking(
+    IN_CONST_HANDLE  hAdapter,
+    IN_CONST_HANDLE  hMemoryBasis
+    )
+{
+    DbgPrint("[WinMali] >> StartDirtyTracking\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(hMemoryBasis);
+    DbgPrint("[WinMali] << StartDirtyTracking STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_STOPDIRTYTRACKING)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_StopDirtyTracking(
+    IN_CONST_HANDLE  hAdapter,
+    IN_CONST_HANDLE  hMemoryBasis
+    )
+{
+    DbgPrint("[WinMali] >> StopDirtyTracking\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(hMemoryBasis);
+    DbgPrint("[WinMali] << StopDirtyTracking STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_QUERYDIRTYBITDATA)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_QueryDirtyBitData(
+    IN_CONST_HANDLE                     hAdapter,
+    INOUT_PDXGKARG_QUERYDIRTYBITDATA    pArgs
+    )
+{
+    DbgPrint("[WinMali] >> QueryDirtyBitData\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << QueryDirtyBitData STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_PREPARELIVEMIGRATION)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_PrepareLiveMigration(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_GPUP_PREPARE_LIVE_MIGRATION   pArgs
+    )
+{
+    DbgPrint("[WinMali] >> PrepareLiveMigration\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << PrepareLiveMigration STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SAVEIMMUTABLEMIGRATIONDATA)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SaveImmutableMigrationData(
+    IN_CONST_HANDLE                                     hAdapter,
+    INOUT_PDXGKARG_GPUP_SAVE_IMMUTABLE_MIGRATION_DATA   pArgs
+    )
+{
+    DbgPrint("[WinMali] >> SaveImmutableMigrationData\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << SaveImmutableMigrationData STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SAVEMUTABLEMIGRATIONDATA)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SaveMutableMigrationData(
+    IN_CONST_HANDLE                                    hAdapter,
+    INOUT_PDXGKARG_GPUP_SAVE_MUTABLE_MIGRATION_DATA    pArgs
+    )
+{
+    DbgPrint("[WinMali] >> SaveMutableMigrationData\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << SaveMutableMigrationData STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_ENDLIVEMIGRATION)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_EndLiveMigration(
+    IN_CONST_HANDLE hAdapter,
+    UINT            vfIndex
+    )
+{
+    DbgPrint("[WinMali] >> EndLiveMigration\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(vfIndex);
+    DbgPrint("[WinMali] << EndLiveMigration STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_RESTOREIMMUTABLEMIGRATIONDATA)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_RestoreImmutableMigrationData(
+    IN_CONST_HANDLE                                         hAdapter,
+    IN_CONST_PDXGKARG_GPUP_RESTORE_IMMUTABLE_MIGRATION_DATA pArgs
+    )
+{
+    DbgPrint("[WinMali] >> RestoreImmutableMigrationData\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << RestoreImmutableMigrationData STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_RESTOREMUTABLEMIGRATIONDATA)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_RestoreMutableMigrationData(
+    IN_CONST_HANDLE                                         hAdapter,
+    IN_CONST_PDXGKARG_GPUP_RESTORE_MUTABLE_MIGRATION_DATA   pArgs
+    )
+{
+    DbgPrint("[WinMali] >> RestoreMutableMigrationData\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << RestoreMutableMigrationData STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_WRITEVIRTUALIZEDINTERRUPT)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_WriteVirtualizedInterrupt(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_GPUP_WRITE_VIRTUALIZED_MSIX   pArgs
+    )
+{
+    DbgPrint("[WinMali] >> WriteVirtualizedInterrupt\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << WriteVirtualizedInterrupt STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SETVIRTUALGPURESOURCES2)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SetVirtualGpuResources2(
+    IN_CONST_HANDLE                             hAdapter,
+    IN_CONST_PDXGKARG_SETVIRTUALGPURESOURCES2   pArgs
+    )
+{
+    DbgPrint("[WinMali] >> SetVirtualGpuResources2\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << SetVirtualGpuResources2 STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SETVIRTUALFUNCTIONPAUSESTATE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SetVirtualFunctionPauseState(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_SETVIRTUALFUNCTIONPAUSESTATE  pArgs
+    )
+{
+    DbgPrint("[WinMali] >> SetVirtualFunctionPauseState\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pArgs);
+    DbgPrint("[WinMali] << SetVirtualFunctionPauseState STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_OPENNATIVEFENCE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_OpenNativeFence(
+    IN_CONST_HANDLE                   hAdapter,
+    INOUT_PDXGKARG_OPENNATIVEFENCE    pOpenNativeFence
+    )
+{
+    DbgPrint("[WinMali] >> OpenNativeFence\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pOpenNativeFence);
+    DbgPrint("[WinMali] << OpenNativeFence STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_CLOSENATIVEFENCE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_CloseNativeFence(
+    IN_CONST_HANDLE                   hAdapter,
+    INOUT_PDXGKARG_CLOSENATIVEFENCE   pCloseNativeFence
+    )
+{
+    DbgPrint("[WinMali] >> CloseNativeFence\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pCloseNativeFence);
+    DbgPrint("[WinMali] << CloseNativeFence STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_SETNATIVEFENCELOGBUFFER)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_SetNativeFenceLogBuffer(
+    IN_CONST_PDXGKARG_SETNATIVEFENCELOGBUFFER pSetNativeFenceLogBuffer
+    )
+{
+    DbgPrint("[WinMali] >> SetNativeFenceLogBuffer\n");
+    UNREFERENCED_PARAMETER(pSetNativeFenceLogBuffer);
+    DbgPrint("[WinMali] << SetNativeFenceLogBuffer STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_UPDATENATIVEFENCELOGS)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_UpdateNativeFenceLogs(
+    IN_CONST_PDXGKARG_UPDATENATIVEFENCELOGS pUpdateNativeFenceLog
+    )
+{
+    DbgPrint("[WinMali] >> UpdateNativeFenceLogs\n");
+    UNREFERENCED_PARAMETER(pUpdateNativeFenceLog);
+    DbgPrint("[WinMali] << UpdateNativeFenceLogs STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_COLLECTDBGINFO2)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_CollectDbgInfo2(
+    IN_CONST_HANDLE                 hAdapter,
+    INOUT_PDXGKARG_COLLECTDBGINFO2  pCollectDbgInfo2
+    )
+{
+    DbgPrint("[WinMali] >> CollectDbgInfo2\n");
+    UNREFERENCED_PARAMETER(hAdapter);
+    UNREFERENCED_PARAMETER(pCollectDbgInfo2);
+    DbgPrint("[WinMali] << CollectDbgInfo2 STATUS_NOT_SUPPORTED\n");
+    return STATUS_NOT_SUPPORTED;
+}
+
+_Function_class_(DXGKDDI_NOTIFYCONTEXTPRIORITYCHANGE)
+NTSTATUS
+APIENTRY
+WinMaliKmdStub_NotifyContextPriorityChange(
+    IN_CONST_HANDLE                                 hAdapter,
+    IN_CONST_PDXGKARG_NOTIFYCONTEXTPRIORITYCHANGE   pNotifyContextPriorityChange
+    )
+{
+    UNREFERENCED_PARAMETER(hAdapter);
+    if (pNotifyContextPriorityChange == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    /* Informational: a context's priority changed. We schedule uniformly, so
+       there is nothing to reprogram; acknowledge so dxgkrnl proceeds. */
+    return STATUS_SUCCESS;
 }

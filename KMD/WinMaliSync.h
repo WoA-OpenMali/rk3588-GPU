@@ -36,6 +36,9 @@ typedef struct _WINMALI_SYNCOBJ {
     KSPIN_LOCK          Lock;           /* protects TimelineValue */
     UINT64              TimelineValue;  /* monotonic; binary uses 0/1 */
     LONG                RefCount;
+    /* dxgk device (WINMALI_KMD_DEVICE*) whose escape created this handle;
+       freed by DestroyDevice rundown if the UMD never destroys it. */
+    PVOID               OwnerDevice;
 } WINMALI_SYNCOBJ, *PWINMALI_SYNCOBJ;
 
 typedef struct _WINMALI_SYNCOBJ_TABLE {
@@ -53,10 +56,16 @@ VOID WinMaliSyncObjTableTeardown(_Inout_ PWINMALI_ADAPTER Adapter,
 int WinMaliSyncObjCreate(_Inout_ PWINMALI_ADAPTER Adapter,
                          _In_ ULONG Flags,
                          _In_ ULONG InitialState,
+                         _In_opt_ PVOID OwnerDevice,
                          _Out_ ULONG* OutHandle);
 
 int WinMaliSyncObjDestroy(_Inout_ PWINMALI_ADAPTER Adapter,
                           _In_ ULONG Handle);
+
+/* Destroy every sync obj owned by OwnerDevice (device rundown). Returns
+   the number destroyed. */
+ULONG WinMaliSyncObjRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter,
+                                 _In_ PVOID OwnerDevice);
 
 /* Signal one handle to the given timeline point. For binary handles,
    any non-zero Point is treated as "signal". Returns 0/-errno. */

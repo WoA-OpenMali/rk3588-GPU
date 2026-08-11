@@ -33,12 +33,13 @@
     <RootNamespace>WinMaliKmd</RootNamespace>
     <ProjectName>WinMaliKmd</ProjectName>
     <!-- See sibling UMD/Mesa projects: kill the Spectre default here in
-         Globals before VS 2017's WDK platform.props can latch it. -->
+         Globals before the WDK platform.props can latch it. -->
     <SpectreMitigation>false</SpectreMitigation>
-    <!-- Pinned to 1809 SDK (matches VS 2017 v141 toolchain on this box).
-         WindowsKernelModeDriver10.0 picks up displib.lib via
-         $(DDK_LIB_PATH) which resolves against this version. -->
-    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+    <!-- Pinned to the 26100 WDK (matches the VS 2022 v143 toolchain +
+         Windows 11 SDK on this box). WindowsKernelModeDriver10.0 picks up
+         displib.lib via $(DDK_LIB_PATH) which resolves against this
+         version (km\arm64\displib.lib + km\x64\displib.lib both ship). -->
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -112,17 +113,30 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
     <!--
-      NOTE: NO <Inf><TimeStamp>...</TimeStamp></Inf> here on purpose.
-      The InfStamp task PREPENDS its timestamp to the existing DriverVer
-      line; if WinMaliKmd.inx already has "DriverVer = <date>,<version>"
-      the result is a malformed double date like
-      "DriverVer = 05/17/2026,05/17/2026,0.0.1.0". Keep the date in the
-      .inx where humans can see it, leave InfStamp out of the way.
+      dxgkrnl 26100 validates that the .sys VERSIONINFO FILEVERSION
+      matches the INF DriverVer version
+      (dxgkrnl!DpiFdoValidateKmdAndPnpVersionMatch) and executes
+      brk #0xF000 on mismatch: instant bugcheck/PSCI reset on device
+      start with no trace. So the version is stamped from exactly one
+      pair that MUST stay equal forever:
+
+        * <Inf><TimeStamp> below  -> stamped DriverVer in the .inf
+        * FILEVERSION in WinMaliKmd.rc -> PE version of the .sys
+
+      Bump both together. WinMaliKmd.inx keeps an EMPTY "DriverVer ="
+      placeholder so stampinf writes "<build date>,1.0.0.0" cleanly
+      (with a pre-filled date it PREPENDS, producing a malformed
+      double-date line).
     -->
+    <Inf>
+      <TimeStamp>1.0.0.85</TimeStamp>
+    </Inf>
   </ItemDefinitionGroup>
 
   <ItemGroup>
     <ClInclude Include="WinMaliKmd.h" />
+    <ClInclude Include="WinMaliVersion.h" />
+    <ClInclude Include="WinMaliLog.h" />
     <ClInclude Include="WinMaliDxgkInitFill.h" />
     <ClInclude Include="WinMaliDxgkStubs.h" />
     <ClInclude Include="WinMaliDxgkStubsWire.h" />
@@ -147,6 +161,7 @@
     <ClCompile Include="WinMaliMmu.c" />
     <ClCompile Include="WinMaliPaging.c" />
     <ClCompile Include="WinMaliQai.c" />
+    <ClCompile Include="WinMaliSerial.c" />
     <ClCompile Include="WinMaliSync.c" />
     <ClCompile Include="WinMaliVidmm.c" />
     <ClCompile Include="WinMaliVm.c" />
@@ -154,6 +169,9 @@
   </ItemGroup>
   <ItemGroup>
     <Inf Include="WinMaliKmd.inx" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="WinMaliKmd.rc" />
   </ItemGroup>
   <!--
     Vulkan loader manifest JSONs - one per process bitness/emulator.

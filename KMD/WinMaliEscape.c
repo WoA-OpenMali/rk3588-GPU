@@ -43,6 +43,7 @@
 #define WMERR_ENODEV      -19
 #define WMERR_EBUSY       -16
 #define WMERR_EIO         -5
+#define WMERR_EAGAIN      -11
 
 /* Identity string returned in WINMALI_OPEN_DEVICE. */
 #define WINMALI_KMD_NAME    "WinMali-rk3588"
@@ -158,14 +159,37 @@ WinMaliEscapeFillGpuInfo_(_In_  PWINMALI_ADAPTER  adapter,
         shaderHi = WinMaliHwRead32(hw, WINMALI_REG_GPU_SHADER_PRESENT_HI);
         l2Lo     = WinMaliHwRead32(hw, WINMALI_REG_GPU_L2_PRESENT_LO);
         l2Hi     = WinMaliHwRead32(hw, WINMALI_REG_GPU_L2_PRESENT_HI);
+
+        /* Capability registers the UMD builds real state from. These were
+           left ZERO until v1.0.0.37 with a "UMD falls back to defaults"
+           assumption - WRONG for TilerFeatures: mesa derives the tiler
+           hierarchy mask from it, and tiler_features==0 emitted
+           hierarchy_mask=0 TILER_CONTEXT descriptors that the CS frontend
+           rejects with DATA_INVALID_FAULT (0x58). That was the sole M2
+           real-draw blocker (FAULT_INFO pointed at the tiler ctx). */
+        out->TilerFeatures          = WinMaliHwRead32(hw, WINMALI_REG_GPU_TILER_FEATURES);
+        out->MemFeatures            = WinMaliHwRead32(hw, WINMALI_REG_GPU_MEM_FEATURES);
+        out->ThreadFeatures         = WinMaliHwRead32(hw, WINMALI_REG_GPU_THREAD_FEATURES);
+        out->MaxThreads             = WinMaliHwRead32(hw, WINMALI_REG_GPU_THREAD_MAX_THREADS);
+        out->ThreadMaxWorkgroupSize = WinMaliHwRead32(hw, WINMALI_REG_GPU_THREAD_MAX_WORKGROUP_SIZE);
+        out->ThreadMaxBarrierSize   = WinMaliHwRead32(hw, WINMALI_REG_GPU_THREAD_MAX_BARRIER_SIZE);
+        out->CoherencyFeatures      = WinMaliHwRead32(hw, WINMALI_REG_GPU_COHERENCY_FEATURES);
+        out->TextureFeatures[0]     = WinMaliHwRead32(hw, WINMALI_REG_GPU_TEXTURE_FEATURES(0));
+        out->TextureFeatures[1]     = WinMaliHwRead32(hw, WINMALI_REG_GPU_TEXTURE_FEATURES(1));
+        out->TextureFeatures[2]     = WinMaliHwRead32(hw, WINMALI_REG_GPU_TEXTURE_FEATURES(2));
+        out->TextureFeatures[3]     = WinMaliHwRead32(hw, WINMALI_REG_GPU_TEXTURE_FEATURES(3));
     }
     out->ShaderPresent = ((UINT64)shaderHi << 32) | shaderLo;
     out->L2Present     = ((UINT64)l2Hi << 32)     | l2Lo;
 
-    /* TilerFeatures / MemFeatures / ThreadFeatures / TextureFeatures /
-       coherency etc. - register offsets aren't all in WinMaliHw.h yet.
-       Leave zero; UMD treats zero as "unknown" and falls back to defaults.
-       TilerPresent is 0 on G610 (no separate tiler-present register).
+    WINMALI_TRACE("GpuInfo caps: tiler=0x%08x mem=0x%08x thread=0x%08x "
+                  "max_thr=%u wg=%u barrier=%u coh=0x%08x tex0=0x%08x",
+                  out->TilerFeatures, out->MemFeatures, out->ThreadFeatures,
+                  out->MaxThreads, out->ThreadMaxWorkgroupSize,
+                  out->ThreadMaxBarrierSize, out->CoherencyFeatures,
+                  out->TextureFeatures[0]);
+
+    /* TilerPresent is 0 on G610 (no separate tiler-present register).
        CorePresent is unused on v10 (MBZ per ABI doc). */
     return WMERR_OK;
 }
@@ -233,11 +257,13 @@ WinMaliEscapeDevQuery_(
         if (dst == NULL) return WMERR_EINVAL;
 
         RtlZeroMemory(&info, sizeof(info));
-        info.CsGroupCount        = 4;   /* G610: 4 parallel CSGs */
-        info.CsCount             = 8;   /* per-group command streams */
-        info.ScoreboardSlotCount = 8;
-        info.SyncWaitSlotCount   = 8;
-        info.CsRegCount          = 96;  /* per-CS register file */
+        /* Field order matches drm_panthor_csif_info (see WinMaliEscape.h).
+           csg_slot, cs_slot, cs_reg, scoreboard, unpreserved, pad. */
+        info.CsGroupCount          = 4;   /* csg_slot_count: 4 parallel CSGs */
+        info.CsCount               = 8;   /* cs_slot_count: per-group CS */
+        info.CsRegCount            = 96;  /* cs_reg_count: per-CS register file */
+        info.ScoreboardSlotCount   = 8;   /* scoreboard_slot_count */
+        info.CsUnpreservedRegCount = 4;   /* unpreserved_cs_reg_count (kernel-reserved) */
         RtlCopyMemory(dst, &info, sizeof(info));
         args->Size = sizeof(info);
         WM_QAI_OK_TRACE("DevQuery CsifInfo");
@@ -312,12 +338,84 @@ WinMaliEscapeBoCreate_(_In_    PWINMALI_ADAPTER       adapter,
         return WMERR_EINVAL;
     }
     err = WinMaliBoCreate(adapter, (SIZE_T)args->Size, args->Flags,
-                          args->ExclusiveVmId, &handle);
+                          args->ExclusiveVmId,
+                          WinMaliDeviceOwnerToken(pEscape->hDevice), &handle);
     if (err == WMERR_OK) {
         args->Handle = handle;
         args->Pad    = 0;
     }
     return err;
+}
+
+/* Op 0x81 - wrap a resident D3DKMT allocation (DXGI swapchain backbuffer /
+   shared surface) as a panfrost BO so the UMD renders straight into the
+   DWM-visible pages. The UMD pins the allocation with LockCb before calling
+   (residency is what populates ApertureMdl via MAP_APERTURE_SEGMENT), so
+   EAGAIN here means "not resident - lock it first". */
+static int
+WinMaliEscapeBoFromAllocation_(_In_    PWINMALI_ADAPTER       adapter,
+                               _Inout_ WINMALI_ESCAPE_HEADER* hdr,
+                               _In_    const DXGKARG_ESCAPE*  pEscape)
+{
+    WINMALI_BO_FROM_ALLOCATION* args =
+        (WINMALI_BO_FROM_ALLOCATION*)WinMaliEscapeAt_(pEscape, sizeof(*hdr), sizeof(*args));
+    PWINMALI_KMD_ALLOCATION ka;
+    PPFN_NUMBER pfns;
+    ULONG handle = 0;
+    int err;
+
+    if (args == NULL || args->AllocationHandle == 0) {
+        return WMERR_EINVAL;
+    }
+    if (adapter->DxgkInterface.DxgkCbGetHandleData == NULL) {
+        return WMERR_EOPNOTSUPP;
+    }
+
+    /* Resolve the caller's D3DKMT allocation handle to our CreateAllocation
+       struct. The UMD routes THIS escape through the runtime device's
+       pfnEscapeCb, so pEscape->hDevice is the same device that created the
+       allocation and DxgkCbGetHandleData resolves the handle natively. */
+    {
+        DXGKARGCB_GETHANDLEDATA ghd;
+        RtlZeroMemory(&ghd, sizeof(ghd));
+        ghd.hObject = (D3DKMT_HANDLE)args->AllocationHandle;
+        ghd.Type    = DXGK_HANDLE_ALLOCATION;
+        ka = (PWINMALI_KMD_ALLOCATION)
+            adapter->DxgkInterface.DxgkCbGetHandleData(&ghd);
+    }
+    if (ka == NULL || ka->Magic != WINMALI_KMD_ALLOC_MAGIC) {
+        WINMALI_WARN("BoFromAllocation: hAlloc=0x%x did not resolve (ka=%p)",
+                     args->AllocationHandle, ka);
+        return WMERR_ENOENT;
+    }
+    if (ka->ApertureMdl == NULL || ka->AperturePageCount == 0) {
+        WINMALI_WARN("BoFromAllocation: hAlloc=0x%x not resident (UMD must LockCb first)",
+                     args->AllocationHandle);
+        return WMERR_EAGAIN;
+    }
+
+    pfns = MmGetMdlPfnArray(ka->ApertureMdl);
+    if (pfns == NULL) {
+        return WMERR_EINVAL;
+    }
+
+    err = WinMaliBoCreateFromPfns(adapter,
+                                  pfns + ka->ApertureMdlOffset,
+                                  ka->AperturePageCount,
+                                  args->Flags,
+                                  WinMaliDeviceOwnerToken(pEscape->hDevice),
+                                  &handle);
+    if (err != WMERR_OK) {
+        return err;
+    }
+
+    args->BoHandle = handle;
+    args->Size     = (UINT64)ka->AperturePageCount << PAGE_SHIFT;
+    args->GpuVa    = 0;   /* VmId==0: caller maps via VmBind */
+    WINMALI_TRACE("BoFromAllocation: hAlloc=0x%x -> bo=%u pages=%u (%ux%u pitch=%u)",
+                  args->AllocationHandle, handle, ka->AperturePageCount,
+                  ka->Width, ka->Height, ka->Pitch);
+    return WMERR_OK;
 }
 
 static int
@@ -392,6 +490,52 @@ WinMaliEscapeBoMapCpu_(_In_    PWINMALI_ADAPTER       adapter,
     return err;
 }
 
+/* Op 0x8F - mirror a UMD-supplied text line onto the serial log. The UMD
+   is headless on the DUT; this is its only window. Escapes arrive in the
+   calling process's context, so PsGetCurrentProcessId names the process
+   (dwm vs smoke tool) without any extra plumbing. */
+static int
+WinMaliEscapeDebugLog_(_In_    PWINMALI_ADAPTER       adapter,
+                       _Inout_ WINMALI_ESCAPE_HEADER* hdr,
+                       _In_    const DXGKARG_ESCAPE*  pEscape)
+{
+    WINMALI_DEBUG_LOG* args =
+        (WINMALI_DEBUG_LOG*)WinMaliEscapeAt_(pEscape, sizeof(*hdr), sizeof(*args));
+    const char* text;
+    char line[WINMALI_DEBUG_LOG_MAX + 1];
+    ULONG len, i;
+
+    UNREFERENCED_PARAMETER(adapter);
+
+    if (args == NULL) {
+        return WMERR_EINVAL;
+    }
+    len = args->TextLen;
+    if (len > WINMALI_DEBUG_LOG_MAX) {
+        len = WINMALI_DEBUG_LOG_MAX;
+    }
+    text = (const char*)WinMaliEscapeAt_(pEscape, args->TextOffset, len);
+    if (text == NULL && len != 0) {
+        return WMERR_EINVAL;
+    }
+
+    /* Copy + sanitize: the buffer is UMD-controlled; keep it printable
+       and NUL-terminated so it can't corrupt the serial stream. */
+    for (i = 0; i < len; ++i) {
+        char c = text[i];
+        line[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+    }
+    /* Drop trailing dots that came from a stray \n/\r. */
+    while (i > 0 && line[i - 1] == '.') {
+        --i;
+    }
+    line[i] = '\0';
+
+    WinMaliLogPrint("[WinMali-UMD pid=%u] %s\n",
+                    (ULONG)(ULONG_PTR)PsGetCurrentProcessId(), line);
+    return WMERR_OK;
+}
+
 static int
 WinMaliEscapeSyncObjCreate_(_In_    PWINMALI_ADAPTER       adapter,
                             _Inout_ WINMALI_ESCAPE_HEADER* hdr,
@@ -404,7 +548,8 @@ WinMaliEscapeSyncObjCreate_(_In_    PWINMALI_ADAPTER       adapter,
     if (args == NULL) {
         return WMERR_EINVAL;
     }
-    err = WinMaliSyncObjCreate(adapter, args->Flags, args->InitialState, &handle);
+    err = WinMaliSyncObjCreate(adapter, args->Flags, args->InitialState,
+                               WinMaliDeviceOwnerToken(pEscape->hDevice), &handle);
     if (err == WMERR_OK) {
         args->Handle = handle;
         args->Pad    = 0;
@@ -426,6 +571,19 @@ WinMaliEscapeSyncObjDestroy_(_In_    PWINMALI_ADAPTER       adapter,
 }
 
 static int
+WinMaliEscapeSyncObjSignal_(_In_    PWINMALI_ADAPTER       adapter,
+                            _Inout_ WINMALI_ESCAPE_HEADER* hdr,
+                            _In_    const DXGKARG_ESCAPE*  pEscape)
+{
+    WINMALI_SYNC_OBJ_SIGNAL* args =
+        (WINMALI_SYNC_OBJ_SIGNAL*)WinMaliEscapeAt_(pEscape, sizeof(*hdr), sizeof(*args));
+    if (args == NULL) {
+        return WMERR_EINVAL;
+    }
+    return WinMaliSyncObjSignal(adapter, args->Handle, args->Point);
+}
+
+static int
 WinMaliEscapeVmCreate_(_In_    PWINMALI_ADAPTER       adapter,
                        _Inout_ WINMALI_ESCAPE_HEADER* hdr,
                        _In_    const DXGKARG_ESCAPE*  pEscape)
@@ -438,7 +596,9 @@ WinMaliEscapeVmCreate_(_In_    PWINMALI_ADAPTER       adapter,
     if (args == NULL) {
         return WMERR_EINVAL;
     }
-    err = WinMaliVmCreate(adapter, args->Flags, args->UserVaRange, &id, &granted);
+    err = WinMaliVmCreate(adapter, args->Flags, args->UserVaRange,
+                          WinMaliDeviceOwnerToken(pEscape->hDevice),
+                          &id, &granted);
     if (err == WMERR_OK) {
         args->Id          = id;
         args->UserVaRange = granted;
@@ -617,7 +777,8 @@ WinMaliEscapeGroupCreate_(_In_    PWINMALI_ADAPTER       adapter,
     if (queues == NULL) {
         return WMERR_EINVAL;
     }
-    err = WinMaliGroupCreate(adapter, args, queues, args->QueuesCount, &handle);
+    err = WinMaliGroupCreate(adapter, args, queues, args->QueuesCount,
+                             WinMaliDeviceOwnerToken(pEscape->hDevice), &handle);
     if (err == WMERR_OK) {
         args->GroupHandle = handle;
     }
@@ -692,13 +853,180 @@ WinMaliEscapeProcessSyncOps_(_Inout_ PWINMALI_ADAPTER adapter,
     return err;
 }
 
-/* GroupSubmit: walk queue submits, process pre-submit sync waits, (defer
-   actual CSF submission), process post-submit sync signals.
-   The CSF kernel-queue path requires per-group csg slot allocation +
-   csg iface programming so the MCU switches to the group's VM AS when
-   executing the stream. That plumbing isn't in place yet; for now the
-   sync framework runs end-to-end and the stream submission itself is a
-   no-op SUCCESS with a TRACE that records what would have been submitted. */
+/* Allocate `Size` bytes of device-owned physical memory, map its pages
+   into `Vm` at `GpuVa` (data, non-executable), zero the first page, and -
+   if HasNext - stamp the u64 chunk-link at offset 0. Used to build the
+   tiler heap's context descriptor and chunk ring.
+
+   The backing store is a normal BO (OwnerDevice set), so device rundown /
+   VM teardown reclaim it exactly like any UMD allocation - no bespoke
+   free path, no leak. Returns the BO handle in *OutHandle for optional
+   explicit teardown. The GPU-side mapping lives in the VM's PT and is
+   released when the VM is torn down. */
+static NTSTATUS
+WinMaliHeapAllocMapped_(_Inout_ PWINMALI_ADAPTER adapter,
+                        _Inout_ PWINMALI_VM      vm,
+                        _In_opt_ PVOID           ownerDevice,
+                        _In_    ULONG            size,
+                        _In_    UINT64           gpuVa,
+                        _In_    BOOLEAN          hasNext,
+                        _In_    UINT64           nextValue,
+                        _Out_   ULONG*           outHandle)
+{
+    ULONG        handle = 0;
+    PWINMALI_BO  bo;
+    PPFN_NUMBER  pfns;
+    PVOID        kva;
+    ULONG        pages;
+    NTSTATUS     st;
+    int          err;
+
+    *outHandle = 0;
+
+    if ((size & (PAGE_SIZE - 1)) != 0 || size == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    err = WinMaliBoCreate(adapter, (SIZE_T)size, 0u, 0u, ownerDevice, &handle);
+    if (err != WMERR_OK) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    bo = WinMaliBoGet(adapter, handle);
+    if (bo == NULL) {
+        (void)WinMaliBoDestroy(adapter, handle);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    pages = (ULONG)(bo->Size / PAGE_SIZE);
+    pfns  = MmGetMdlPfnArray(bo->Mdl);
+    st = WinMaliMmuVmMap(adapter, &vm->Pt, gpuVa, pfns, pages,
+                         WINMALI_LPAE_L3_PAGE_ATTR_RW_NX);
+    if (!NT_SUCCESS(st)) {
+        WinMaliBoPut(bo);
+        (void)WinMaliBoDestroy(adapter, handle);
+        return st;
+    }
+
+    /* One-time init of the descriptor/header: map the backing pages into
+       system space, zero the leading page (covers the 32-byte heap context
+       and the 64-byte chunk header - MBZ fields), stamp the chunk link if
+       requested, then drop the transient kernel mapping. The GPU-visible
+       mapping in the VM PT is unaffected. */
+    kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, MmCached,
+                                       NULL, FALSE, NormalPagePriority);
+    if (kva == NULL) {
+        (void)WinMaliMmuVmUnmap(adapter, &vm->Pt, gpuVa, pages);
+        WinMaliBoPut(bo);
+        (void)WinMaliBoDestroy(adapter, handle);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(kva, PAGE_SIZE);
+    if (hasNext) {
+        *(volatile UINT64 UNALIGNED*)kva = nextValue;
+    }
+    MmUnmapLockedPages(kva, bo->Mdl);
+
+    WinMaliBoPut(bo);
+    *outHandle = handle;
+    return STATUS_SUCCESS;
+}
+
+/* TilerHeapCreate real path: allocate the 32-byte heap context descriptor
+   plus `InitialChunkCount` chunks of `ChunkSize` each, map them into the
+   group's VM, and link the chunks newest->oldest exactly as panthor does
+   (hdr->next = (prev_chunk_va & ~0xFFF) | (chunk_size >> 12); last chunk
+   next=0). `first_chunk_gpu_va` is the newest (last-allocated) chunk.
+
+   Returns STATUS_SUCCESS with *OutCtxVa / *OutFirstChunkVa filled, or a
+   failure the caller turns into an escape error (TilerHeapCreate no longer
+   hands back a placeholder heap). */
+static NTSTATUS
+WinMaliTilerHeapCreateReal_(_Inout_ PWINMALI_ADAPTER adapter,
+                            _In_    PVOID            ownerDevice,
+                            _In_    ULONG            vmId,
+                            _In_    ULONG            chunkSize,
+                            _In_    ULONG            initialChunkCount,
+                            _Out_   UINT64*          outCtxVa,
+                            _Out_   UINT64*          outFirstChunkVa)
+{
+    PWINMALI_VM vm;
+    NTSTATUS    st;
+    ULONG       ctxHandle = 0;
+    UINT64      ctxVa;
+    UINT64      firstChunkVa = 0;
+    UINT64      prevChunkVa  = 0;
+    ULONG       i;
+    ULONG       count = initialChunkCount;
+
+    *outCtxVa = 0;
+    *outFirstChunkVa = 0;
+
+    /* Sanity: chunk_size must be page-aligned and sane (panthor allows
+       256K..2M power-of-two; we only require page alignment + a cap so a
+       bogus UMD value can't exhaust memory). Cap initial chunks too. */
+    if ((chunkSize & (PAGE_SIZE - 1)) != 0 ||
+        chunkSize < 0x1000u || chunkSize > 0x200000u) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (count == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (count > 16u) {
+        count = 16u;  /* bound the up-front allocation; growth is on-demand */
+    }
+
+    vm = WinMaliVmGet(adapter, vmId);
+    if (vm == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!vm->PtInitialized) {
+        WinMaliVmPut(vm);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    /* Heap context: one page (holds the cache-line-aligned 32-byte
+       descriptor; the GPU manages the rest). */
+    ctxVa = vm->KmdVaNext;
+    st = WinMaliHeapAllocMapped_(adapter, vm, ownerDevice, PAGE_SIZE,
+                                 ctxVa, FALSE, 0, &ctxHandle);
+    if (!NT_SUCCESS(st)) {
+        WinMaliVmPut(vm);
+        return st;
+    }
+    vm->KmdVaNext += PAGE_SIZE;
+
+    /* Chunks: allocate `count`, each linked to the previous. panthor adds
+       new chunks to the front of the list, so chunk[k].next = chunk[k-1],
+       and first_chunk = the last one allocated. */
+    for (i = 0; i < count; ++i) {
+        ULONG  chunkHandle = 0;
+        UINT64 va       = vm->KmdVaNext;
+        UINT64 nextVal  = (prevChunkVa != 0)
+                          ? ((prevChunkVa & ~0xFFFull) | ((UINT64)chunkSize >> 12))
+                          : 0ull;
+        st = WinMaliHeapAllocMapped_(adapter, vm, ownerDevice, chunkSize,
+                                     va, TRUE, nextVal, &chunkHandle);
+        if (!NT_SUCCESS(st)) {
+            /* Partial failure: the context + already-mapped chunks are BOs
+               owned by the device and get reclaimed at rundown/VM teardown.
+               Report failure so the caller uses the metadata fallback. */
+            WinMaliVmPut(vm);
+            return st;
+        }
+        prevChunkVa  = va;
+        firstChunkVa = va;               /* newest = first_chunk_gpu_va */
+        vm->KmdVaNext = va + chunkSize;
+    }
+
+    WinMaliVmPut(vm);
+    *outCtxVa = ctxVa;
+    *outFirstChunkVa = firstChunkVa;
+    return STATUS_SUCCESS;
+}
+
+/* GroupSubmit: walk queue submits, process pre-submit sync waits, run the
+   UMD's real command stream in the group's VM (NOP fallback on fault),
+   process post-submit sync signals. */
 static int
 WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
                           _Inout_ WINMALI_ESCAPE_HEADER* hdr,
@@ -753,35 +1081,66 @@ WinMaliEscapeGroupSubmit_(_In_    PWINMALI_ADAPTER       adapter,
             }
         }
 
-        /* Real CSF GPU round-trip. Currently runs the *bring-up* shader
-           (WinMaliCsfSubmitNopJob) regardless of qs->StreamAddr - actual
-           UMD CS stream execution requires:
-             - per-CSG-slot AS rebind to qs's VM AS
-             - cross-mapping the kernel ring + syncobj into UMD's VM at the
-               same fixed GPU VAs (WINMALI_CSF_RING_GPU_VA / SYNC_GPU_VA)
-             - separate CSG state machine per group
-           Those are bigger lifts. The path here still exercises every
-           edge that matters to the UMD: MCU wake, CS engine run, sync
-           signal via real GPU seqno polling, sync framework around it.
-           So UMD code that depends on "submit returns after the GPU has
-           made progress" will work correctly; just the specific bytecode
-           run on the GPU isn't UMD's bytecode (yet). */
+        /* Execute the UMD's REAL command stream. Resolve the group's VM
+           address space, bind the CSG to it, and run the CS at qs->StreamAddr
+           (which, along with every buffer it references, lives in that VM).
+           On any failure - AS rebind not acked, GPU MMU fault, timeout - return
+           the error to the UMD. We deliberately do NOT fall back to a NOP self-
+           test: signalling the completion fence without doing the work lets the
+           UMD proceed on an uninitialized heap / stale GPU state and freeze
+           later. A clean failure the UMD can see beats a fake success. */
         {
-            NTSTATUS csfSt = WinMaliCsfSubmitNopJob(adapter);
-            if (!NT_SUCCESS(csfSt)) {
-                WINMALI_WARN("GroupSubmit: CSF NOP submit failed 0x%08x for group=%u queue=%u",
-                             csfSt, args->GroupHandle, qs->QueueIndex);
-                err = (csfSt == STATUS_DEVICE_NOT_READY) ? WMERR_EINVAL
-                                                         : WMERR_EIO;
-                /* Drop post-submit signals on failure - waiters would
-                   otherwise observe a "completed" submit that never ran. */
+            NTSTATUS csfSt = STATUS_INVALID_PARAMETER;
+            ULONG    asSlot = WINMALI_AS_SLOT_MAX;
+            ULONG    vmId   = 0;
+
+            if (WinMaliGroupGetVmId(adapter, args->GroupHandle, &vmId) == WMERR_OK) {
+                PWINMALI_VM vm = WinMaliVmGet(adapter, vmId);
+                if (vm != NULL) {
+                    asSlot = vm->Pt.AsSlot;
+                    WinMaliVmPut(vm);
+                }
+            }
+
+            if (asSlot >= WINMALI_AS_SLOT_MAX || qs->StreamAddr == 0 || qs->StreamSize == 0) {
+                WINMALI_WARN("GroupSubmit: group=%u queue=%u no runnable stream "
+                             "(as=%u stream_va=0x%llx size=%u)",
+                             args->GroupHandle, qs->QueueIndex, asSlot,
+                             (ULONGLONG)qs->StreamAddr, qs->StreamSize);
+                err = WMERR_EINVAL;
                 break;
             }
+
+            /* Non-coherent GPU cache maintenance (coh=0): CLEAN this VM's BOs
+               so the CPU-written CS / vertices / shaders / descriptors reach
+               DRAM before the GPU (non-cacheable) reads them. Without this the
+               GPU reads stale/zero input and the draw renders nothing (black)
+               even though it "completes" - the MMU-audit root-cause. Submit is
+               synchronous, so we invalidate after it returns (below) so a CPU
+               readback of the render target sees the GPU's output. */
+            WinMaliBoFlushVm(adapter, vmId, TRUE /* clean CPU->DRAM */);
+
+            csfSt = WinMaliCsfSubmitGroupStream(adapter, asSlot, qs->StreamAddr,
+                                                qs->StreamSize, 0u, 500u);
+            WinMaliBoFlushVm(adapter, vmId, FALSE /* invalidate DRAM->CPU */);
+            if (!NT_SUCCESS(csfSt)) {
+                WINMALI_WARN("GroupSubmit: group=%u queue=%u REAL stream failed 0x%08x "
+                             "(as=%u stream_va=0x%llx size=%u)",
+                             args->GroupHandle, qs->QueueIndex, csfSt, asSlot,
+                             (ULONGLONG)qs->StreamAddr, qs->StreamSize);
+                /* Record the faulted queue so the UMD's QueryGroupState sees a
+                   non-zero FatalQueueMask (panthor parity) and can reset the
+                   context instead of proceeding on a wedged group. */
+                (VOID)WinMaliGroupMarkFatalQueue(adapter, args->GroupHandle,
+                                                 qs->QueueIndex);
+                err = (csfSt == STATUS_DEVICE_NOT_READY) ? WMERR_EINVAL : WMERR_EIO;
+                break;
+            }
+            WINMALI_TRACE("GroupSubmit: group=%u queue=%u REAL stream ran "
+                          "(as=%u stream_va=0x%llx size=%u syncs=%u)",
+                          args->GroupHandle, qs->QueueIndex, asSlot,
+                          (ULONGLONG)qs->StreamAddr, qs->StreamSize, qs->SyncsCount);
         }
-        WINMALI_TRACE("GroupSubmit: group=%u queue=%u stream_va=0x%llx size=%u syncs=%u "
-                      "(CSF NOP placeholder ran; UMD bytecode NOT YET executed)",
-                      args->GroupHandle, qs->QueueIndex,
-                      (ULONGLONG)qs->StreamAddr, qs->StreamSize, qs->SyncsCount);
 
         if (syncs != NULL) {
             int e = WinMaliEscapeProcessSyncOps_(adapter, syncs, qs->SyncsCount, TRUE);
@@ -897,12 +1256,18 @@ WinMaliKmdEscape(
     case WinMaliEscapeOp_BoMapCpu:
         hdr->Status = WinMaliEscapeBoMapCpu_(adapter, hdr, pEscape);
         break;
+    case WinMaliEscapeOp_DebugLog:
+        hdr->Status = WinMaliEscapeDebugLog_(adapter, hdr, pEscape);
+        break;
 
     case WinMaliEscapeOp_SyncObjCreate:
         hdr->Status = WinMaliEscapeSyncObjCreate_(adapter, hdr, pEscape);
         break;
     case WinMaliEscapeOp_SyncObjDestroy:
         hdr->Status = WinMaliEscapeSyncObjDestroy_(adapter, hdr, pEscape);
+        break;
+    case WinMaliEscapeOp_SyncObjSignal:
+        hdr->Status = WinMaliEscapeSyncObjSignal_(adapter, hdr, pEscape);
         break;
     case WinMaliEscapeOp_SyncObjWait:
         hdr->Status = WinMaliEscapeSyncObjWait_(adapter, hdr, pEscape);
@@ -935,10 +1300,11 @@ WinMaliKmdEscape(
         break;
 
     case WinMaliEscapeOp_TilerHeapCreate: {
-        /* Metadata-only: validates VmId is non-zero and returns a synthetic
-           handle + a GpuVa placeholder. The real chunk allocator + Mali
-           tiler heap registration follows real VmBind. The UMD can still
-           track the handle for its own bookkeeping. */
+        /* Allocate the heap-context descriptor + initial chunk ring, map them
+           into the group's VM, and return real GPU VAs the tiler can walk.
+           On failure we return an error (not a fake unmapped placeholder VA):
+           a bogus heap would only fault later during real geometry, so the
+           UMD is better off seeing the failure. */
         WINMALI_TILER_HEAP_CREATE* args =
             (WINMALI_TILER_HEAP_CREATE*)WinMaliEscapeAt_(pEscape, sizeof(*hdr), sizeof(*args));
         if (args == NULL) {
@@ -946,16 +1312,29 @@ WinMaliKmdEscape(
         } else if (args->VmId == 0 || args->InitialChunkCount == 0) {
             hdr->Status = WMERR_EINVAL;
         } else {
-            /* Use a monotonic counter tied to the Group table for now -
-               it's a separate ID space but keeps cross-call sequencing. */
-            args->HeapHandle      = (ULONG)InterlockedIncrement(
-                                        &adapter->GroupTable.NextHandle) | 0x80000000u;
-            args->FirstChunkGpuVa = WINMALI_SYSMEM_GPU_BASE +
-                                    (UINT64)args->HeapHandle * (UINT64)args->ChunkSize;
-            WINMALI_TRACE("TilerHeapCreate: handle=0x%x vm=%u chunk=%u count=%u gpu_va=0x%llx (metadata-only)",
-                          args->HeapHandle, args->VmId, args->ChunkSize,
-                          args->InitialChunkCount, (ULONGLONG)args->FirstChunkGpuVa);
-            hdr->Status = WMERR_OK;
+            UINT64   realCtxVa = 0, realFirstVa = 0;
+            NTSTATUS heapSt = WinMaliTilerHeapCreateReal_(
+                                  adapter, WinMaliDeviceOwnerToken(pEscape->hDevice),
+                                  args->VmId, args->ChunkSize,
+                                  args->InitialChunkCount,
+                                  &realCtxVa, &realFirstVa);
+            if (NT_SUCCESS(heapSt)) {
+                args->HeapHandle = (ULONG)InterlockedIncrement(
+                                       &adapter->GroupTable.NextHandle) | 0x80000000u;
+                args->FirstChunkGpuVa   = realFirstVa;
+                args->TilerHeapCtxGpuVa = realCtxVa;
+                WINMALI_TRACE("TilerHeapCreate: handle=0x%x vm=%u chunk=%u count=%u "
+                              "ctx_va=0x%llx first_chunk_va=0x%llx",
+                              args->HeapHandle, args->VmId, args->ChunkSize,
+                              args->InitialChunkCount,
+                              (ULONGLONG)realCtxVa, (ULONGLONG)realFirstVa);
+                hdr->Status = WMERR_OK;
+            } else {
+                WINMALI_WARN("TilerHeapCreate: vm=%u real heap alloc failed 0x%08x",
+                             args->VmId, heapSt);
+                hdr->Status = (heapSt == STATUS_INSUFFICIENT_RESOURCES)
+                                  ? WMERR_ENOMEM : WMERR_EINVAL;
+            }
         }
         break;
     }
@@ -1017,12 +1396,13 @@ WinMaliKmdEscape(
         break;
     }
 
-    /* Remaining ops to follow:
-        VmCreate/Destroy/Bind/GetState, BoMmapOffset,
-                       SyncObjCreate/Destroy/Wait.
-        GroupCreate/Destroy/Submit/GetState, TilerHeapCreate/Destroy.
-        BoFromAllocation, PresentToHdc. */
     case WinMaliEscapeOp_BoFromAllocation:
+        hdr->Status = WinMaliEscapeBoFromAllocation_(adapter, hdr, pEscape);
+        break;
+
+    /* PresentToHdc stays unimplemented: a KMD cannot blit to a GDI HDC.
+       On-screen output rides the DXGI path (pfnPresentCb -> DxgkDdiPresent
+       Blt -> SubmitCommand CPU copy). */
     case WinMaliEscapeOp_PresentToHdc:
         WINMALI_TRACE("Escape op 0x%x not yet implemented", hdr->Op);
         hdr->Status = WMERR_EOPNOTSUPP;

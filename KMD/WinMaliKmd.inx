@@ -8,49 +8,33 @@
 ; Driver shape modelled on Qualcomm Adreno's qcdx8380.inf - the only
 ; widely-shipping Windows-on-Arm WDDM display driver in the wild.
 ;
-; Process-bitness coverage (see Microsoft Learn,
-; "How emulation works on Arm" + "Arm64X PE Files"):
-;
-;   * Native ARM64 process
-;       The ARM64 UMD is the file at %13%\WinMaliUmd.dll and is
-;       referenced by UserModeDriverName.
-;
-;   * 32-bit x86 process under WOW64
-;       A separate pure-x86 UMD lives at %13%\WinMaliUmdX86.dll (same
-;       DriverStore as the ARM64 binary, different file) and is
-;       referenced by UserModeDriverNameWow with a full %13% path.
-;       Keeping x86 in DriverStore (rather than SysWow64) is what lets
-;       the INF pass InfVerif's "isolation to DIRID 13" rule. The
-;       PnPLockdown driver-store loader resolves the path for 32-bit
-;       WoW64 dxgi.dll the same way it does for the native-arch UMD.
-;
-;   * 64-bit x64 process under Prism emulation
-;       Windows-on-Arm has NO SysX64 directory and NO separate
-;       registry slot for an x64-only UMD. The OS loads the ARM64 UMD
-;       directly into the emulated x64 process, which only works if
-;       the UMD is an ARM64X hybrid PE (Microsoft Learn: "Arm64X PE
-;       Files" lists exactly this case - "A single binary that gets
-;       injected into an x64 or Arm64 process"). We do not produce
-;       ARM64X today; x64-under-Prism apps will fall through to the
-;       OS basic display driver until we have ARM64X tooling. That's
-;       a future-work item, not an INF issue.
-;
-; Adreno's qcdx11chpeum.dll lives in SyChpe32 - that directory is for
-; x86 Compiled-Hybrid-PE emulation only (a faster alternative to
-; SysWow64 on Snapdragon devices), NOT for x64-under-Prism. We don't
-; produce CHPE-format binaries, so we don't populate SyChpe32 either.
+; NATIVE ARM64 ONLY (2026-07-08): the x86/WOW64 companion registrations
+; (UserModeDriverNameWow / OpenGLDriversWow / VulkanDriverNameWow and
+; the WinMali*X86.dll files) were removed to cut surface area during
+; UMD bring-up. Restore them from git history once the native path
+; works. x64-under-Prism needs ARM64X binaries we don't build yet;
+; that was never covered either way.
 ;
 ; Files in this package:
 ;
 ;   * WinMaliKmd.sys    - kernel miniport (ARM64; KM does not emulate)
 ;   * WinMaliUmd.dll    - mesa-built D3D10/11 UMD, ARM64
-;   * WinMaliUmdX86.dll - mesa-built D3D10/11 UMD, x86
 ;   * WinMaliGL.dll     - mesa-built OpenGL ICD,   ARM64
-;   * WinMaliGLX86.dll  - mesa-built OpenGL ICD,   x86
 ;   * WinMaliVk.dll     - mesa-built Vulkan ICD,   ARM64
-;   * WinMaliVkX86.dll  - mesa-built Vulkan ICD,   x86
-;   * WinMaliVk_icd.json     - Vulkan loader manifest, ARM64
-;   * WinMaliVk_icd_x86.json - Vulkan loader manifest, x86
+;   * WinMaliVk_icd.json - Vulkan loader manifest, ARM64
+;
+;   Runtime dependencies of the mesa binaries (a stock Windows image
+;   has NONE of these; without them every LoadLibrary of the UMD/ICDs
+;   fails with ERROR_MOD_NOT_FOUND and dxgi surfaces it as
+;   DXGI_ERROR_UNSUPPORTED before the KMD is ever consulted). They
+;   live in DriverStore next to the UMD - the loader resolves a
+;   DriverStore DLL's imports against its own directory (standard DCH
+;   pattern for shipping the CRT):
+;
+;   * vcruntime140.dll / msvcp140.dll  (VC++ CRT, arm64; vcruntime140_1
+;     is x64-only EH goo - the arm64 redist copy is an x64 PE - so it
+;     is deliberately not shipped)
+;   * z-1.dll                          (zlib, mesa subproject, arm64)
 ;
 ; Display ownership is intentionally NOT in this driver. VOP2 lives
 ; in a separate display-only package.
@@ -61,7 +45,12 @@ Signature   = "$WINDOWS NT$"
 Class       = Display
 ClassGUID   = {4d36e968-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
-DriverVer   = 05/17/2026,0.0.3.0
+; DriverVer is intentionally EMPTY: stampinf fills in the build date
+; and the version from <Inf><TimeStamp> in WinMaliKmd.vcxproj
+; (currently 1.0.0.0). That version MUST match FILEVERSION in
+; WinMaliKmd.rc - dxgkrnl 26100 bugchecks the device start on any
+; .sys-vs-INF version mismatch (DpiFdoValidateKmdAndPnpVersionMatch).
+DriverVer   =
 CatalogFile = WinMaliKmd.cat
 PnpLockdown = 1
 
@@ -79,9 +68,9 @@ PnpLockdown = 1
 ; search path the same way SysWow64 is for legacy drivers.
 ;
 [DestinationDirs]
-WinMaliKmd.Files.Native = 13                ; everything in DriverStore
-WinMaliKmd.Files.X86    = 13                ; WOW64 binaries also in DriverStore
-DefaultDestDir          = 13
+WinMaliKmd.Files.Native   = 13              ; everything in DriverStore
+WinMaliKmd.Files.Firmware = 12              ; system32\drivers (see below)
+DefaultDestDir            = 13
 
 [SourceDisksNames]
 1 = %DiskName%,,,""
@@ -89,13 +78,13 @@ DefaultDestDir          = 13
 [SourceDisksFiles]
 WinMaliKmd.sys              = 1
 WinMaliUmd.dll              = 1
-WinMaliUmdX86.dll           = 1
 WinMaliGL.dll               = 1
-WinMaliGLX86.dll            = 1
 WinMaliVk.dll               = 1
-WinMaliVkX86.dll            = 1
 WinMaliVk_icd.json          = 1
-WinMaliVk_icd_x86.json      = 1
+vcruntime140.dll            = 1
+msvcp140.dll                = 1
+z-1.dll                     = 1
+mali_csffw.bin              = 1
 
 ;
 ; PETrust on each UMD/ICD prevents the OS from doing image-load
@@ -105,11 +94,8 @@ WinMaliVk_icd_x86.json      = 1
 ;
 [SignatureAttributes]
 WinMaliUmd.dll      = SignatureAttributes.PETrust
-WinMaliUmdX86.dll   = SignatureAttributes.PETrust
 WinMaliGL.dll       = SignatureAttributes.PETrust
-WinMaliGLX86.dll    = SignatureAttributes.PETrust
 WinMaliVk.dll       = SignatureAttributes.PETrust
-WinMaliVkX86.dll    = SignatureAttributes.PETrust
 
 [SignatureAttributes.PETrust]
 PETrust = true
@@ -145,7 +131,7 @@ ExcludeFromSelect = *
 ;
 [WinMaliKmd_Install]
 FeatureScore = D1
-CopyFiles    = WinMaliKmd.Files.Native, WinMaliKmd.Files.X86
+CopyFiles    = WinMaliKmd.Files.Native, WinMaliKmd.Files.Firmware
 AddReg       = WinMaliKmd.SoftwareSettings
 AddProperty  = WDTFSOCDeviceCategory
 
@@ -177,9 +163,8 @@ HKR,, EventMessageFile, %REG_EXPAND_SZ%, "%%SystemRoot%%\System32\IoLogMsg.dll"
 HKR,, TypesSupported,   %REG_DWORD%,     7
 
 ;
-; CopyFiles sections. Both land in %13% (DriverStore) per the
-; [DestinationDirs] above; the section split is retained for clarity
-; about which binaries serve which process bitness.
+; CopyFiles - everything lands in %13% (DriverStore) per
+; [DestinationDirs] above. Native ARM64 binaries only.
 ;
 [WinMaliKmd.Files.Native]
 WinMaliKmd.sys
@@ -187,12 +172,21 @@ WinMaliUmd.dll
 WinMaliGL.dll
 WinMaliVk.dll
 WinMaliVk_icd.json
-WinMaliVk_icd_x86.json
+vcruntime140.dll
+msvcp140.dll
+z-1.dll
 
-[WinMaliKmd.Files.X86]
-WinMaliUmdX86.dll
-WinMaliGLX86.dll
-WinMaliVkX86.dll
+;
+; CSF MCU firmware. The KMD boots the Mali MCU from
+; \SystemRoot\System32\drivers\mali_csffw.bin (hardcoded ZwCreateFile
+; path in WinMaliFw.c), so this one file must land in dirid 12, not
+; the DriverStore. InfVerif's universal-isolation check would flag
+; this; we don't run InfVerif, and dirid 12 installs fine. Without
+; this file StartDevice logs "FW: open mali_csffw.bin -> 0xc0000034"
+; and the adapter runs MMU-only (mcu_alive=0, degraded submits).
+;
+[WinMaliKmd.Files.Firmware]
+mali_csffw.bin
 
 ;
 ; HKR (per-device) software settings. This is the contract between
@@ -207,30 +201,44 @@ WinMaliVkX86.dll
 ;                            treats <> as "no driver"). Slots 1/2/3
 ;                            cover D3D9/10/11; add a slot for D3D12
 ;                            once we have a D3D12 UMD.
-;   UserModeDriverNameWow -> 32-bit emulation slot. We use the
-;                            DriverStore path (%13%\WinMaliUmdX86.dll)
-;                            so the package stays DIRID-13-isolated
-;                            for InfVerif WHQL. The 32-bit WoW64
-;                            dxgi.dll resolves it directly via the
-;                            PnPLockdown driver-store loader path.
 ;
+; No Wow slot: native ARM64 only (see header note).
 ; PnpLockdown=1 requires every UMD path to live under %13%\.
 ;
 [WinMaliKmd.SoftwareSettings]
-HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, WinMaliUmd, WinMaliUmd, WinMaliUmd, WinMaliUmd
 HKR,, VgaCompatible,           %REG_DWORD%,    0
-HKR,, UserModeDriverName,    %REG_MULTI_SZ%, <>, "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll"
-HKR,, UserModeDriverNameWow, %REG_MULTI_SZ%, <>, "%13%\WinMaliUmdX86.dll", "%13%\WinMaliUmdX86.dll", "%13%\WinMaliUmdX86.dll"
 
 ;
-; OpenGL ICD registration. opengl32.dll (the OS loader) looks at
-; HKR\OpenGLDrivers\<name> on the active adapter and dispatches into
-; the Dll value. Version 2 = ICD.
+; D3D UMD registration. REQUIRED: without InstalledDisplayDrivers/
+; UserModeDriverName dxgkrnl fails the adapter with Code 43 (a render-only
+; WDDM adapter still needs a D3D UMD to start). So the UMD stays registered
+; even while we focus on GL/VK; the DWM present weirdness is tolerated for
+; now. GL ICD (OpenGLDriverName + global OpenGLDrivers below) and Vulkan
+; ICD (VulkanDriverName) are also active.
 ;
-; OpenGLDrivers    = native-arch ICD slot.
-; OpenGLDriversWow = 32-bit emulation ICD slot. Both reference the
-;                    DriverStore (%13%\) path so the package stays
-;                    isolated to DIRID 13 for InfVerif WHQL.
+HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, WinMaliUmd, WinMaliUmd, WinMaliUmd, WinMaliUmd
+HKR,, UserModeDriverName,    %REG_MULTI_SZ%, <>, "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll",    "%13%\WinMaliUmd.dll"
+
+;
+; OpenGL ICD registration - the MAIN (and only) user-mode driver in
+; this phase. Two mechanisms, both on the adapter HKR:
+;
+; 1. OpenGLDriverName (WDDM path, the one that actually makes
+;    WinMaliGL the system ICD): opengl32.dll asks dxgkrnl via
+;    D3DKMTQueryAdapterInfo(KMTQAITYPE_UMOPENGLINFO), and dxgkrnl
+;    fills D3DKMT_OPENGLINFO from these three adapter-HKR values.
+;    Values mirror viogpu3d.inx (the other mesa-WGL-on-WDDM driver
+;    in the wild): Flags=3, Version=4096.
+;
+HKR,, OpenGLDriverName, %REG_MULTI_SZ%, "%13%\WinMaliGL.dll"
+HKR,, OpenGLFlags,      %REG_DWORD%,    3
+HKR,, OpenGLVersion,    %REG_DWORD%,    4096
+
+;
+; 2. Legacy OpenGLDrivers\<name> subkey (Version 2 = ICD). Kept for
+;    tooling: gl-smoke -direct reads OpenGLDrivers\WinMali\Dll to
+;    LoadLibrary the ICD without opengl32 in the loop (headless box -
+;    opengl32 routes by desktop-owning adapter, which MSBDD owns).
 ;
 HKR, "OpenGLDrivers\WinMali",, %REG_NONE%, ""
 HKR, "OpenGLDrivers\WinMali", Dll,           %REG_SZ%,    "%13%\WinMaliGL.dll"
@@ -238,28 +246,27 @@ HKR, "OpenGLDrivers\WinMali", DriverVersion, %REG_DWORD%, 0x00000002
 HKR, "OpenGLDrivers\WinMali", Flags,         %REG_DWORD%, 0x00000001
 HKR, "OpenGLDrivers\WinMali", Version,       %REG_DWORD%, 0x00000002
 
-HKR, "OpenGLDriversWow\WinMali",, %REG_NONE%, ""
-HKR, "OpenGLDriversWow\WinMali", Dll,           %REG_SZ%,    "%13%\WinMaliGLX86.dll"
-HKR, "OpenGLDriversWow\WinMali", DriverVersion, %REG_DWORD%, 0x00000002
-HKR, "OpenGLDriversWow\WinMali", Flags,         %REG_DWORD%, 0x00000001
-HKR, "OpenGLDriversWow\WinMali", Version,       %REG_DWORD%, 0x00000002
+;
+; (Tried a machine-wide HKLM\...\OpenGLDrivers\WinMali legacy ICD entry to
+; force opengl32 to load our ICD regardless of the display-owning adapter -
+; it BROKE GL system-wide, incl. gl-smoke -icd: opengl32 loads the ICD into
+; every GL process at init and WinMaliGL cannot initialize outside its proper
+; WDDM adapter context. Removed. GL-as-default needs real adapter/display
+; ownership, not a global ICD shim.)
+;
 
 ;
-; Vulkan ICD registration. The Vulkan-Loader enumerates per-adapter
-; ICDs by reading these REG_SZ values from each WDDM adapter's HKR
-; and matches by adapter LUID. The pointed-at file is a small JSON
-; (Khronos-defined manifest format) which itself names the actual
-; ICD DLL.
-;
-;   VulkanDriverName    -> native ARM64
-;   VulkanDriverNameWow -> 32-bit emulation (loaded by 32-bit Vk
-;                          loader)
+; Vulkan ICD registration - RE-ENABLED (GL + VK both active on install).
+; VulkanDriverName -> the ICD manifest JSON, native ARM64 (no Wow slot;
+; native-only INF). The Vulkan loader reads this adapter-HKR value via
+; dxgkrnl and loads WinMaliVk.dll. WinMaliVk is currently a placeholder
+; (reports INCOMPATIBLE_DRIVER) so the loader enumerates + skips it
+; cleanly until panvk is wired - harmless to register now.
 ;
 ; Reference:
 ;   https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md
 ;
-HKR,, VulkanDriverName,    %REG_SZ%, "%13%\WinMaliVk_icd.json"
-HKR,, VulkanDriverNameWow, %REG_SZ%, "%13%\WinMaliVk_icd_x86.json"
+HKR,, VulkanDriverName, %REG_SZ%, "%13%\WinMaliVk_icd.json"
 
 ; (HKLM bring-up overrides removed - they triggered InfVerif WHQL
 ; "registry root not isolated to HKR" errors. The OS-default

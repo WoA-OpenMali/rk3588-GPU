@@ -15,7 +15,6 @@
 #include "WinMaliKmd.h"
 #include "WinMaliAlloc.h"
 
-#define WINMALI_KMD_ALLOC_MAGIC      'AllW'
 #define WINMALI_ALLOC_PRIV_MAGIC     'PaWM'
 #define WINMALI_ALLOC_PRIV_VERSION   1u
 
@@ -90,26 +89,56 @@ WinMaliKmdCreateAllocation(
     for (i = 0; i < pCreateAllocation->NumAllocations; ++i) {
         DXGK_ALLOCATIONINFO*    info = &pCreateAllocation->pAllocationInfo[i];
         PWINMALI_ALLOC_PRIV     priv = (PWINMALI_ALLOC_PRIV)info->pPrivateDriverData;
+        const WINMALI_ALLOCATION_PRIVATE* bbPriv = NULL;
         PWINMALI_KMD_ALLOCATION ka;
         SIZE_T                  bytes;
         UINT                    pitch;
         UINT                    bpp;
 
-        if (priv == NULL ||
+        /* DXGI backbuffer / shared-surface allocs from the D3D11 UMD carry
+           WINMALI_ALLOCATION_PRIVATE ('WMAl', Shared/WinMaliEscape.h), not
+           the 'PaWM' blob. Recognize it FIRST - it is only 32 bytes, so it
+           would otherwise fall into the size-based fallback below and read
+           priv->Size past the end of the runtime's copy of the blob. */
+        if (info->pPrivateDriverData != NULL &&
+            info->PrivateDriverDataSize >= sizeof(WINMALI_ALLOCATION_PRIVATE) &&
+            ((const WINMALI_ALLOCATION_PRIVATE*)info->pPrivateDriverData)->Magic ==
+                WINMALI_ALLOCATION_PRIVATE_MAGIC) {
+            bbPriv = (const WINMALI_ALLOCATION_PRIVATE*)info->pPrivateDriverData;
+            priv   = NULL;
+        }
+
+        if (bbPriv != NULL) {
+            bpp   = 4;   /* DXGI swapchain formats are 32bpp linear */
+            pitch = bbPriv->Stride != 0 ? bbPriv->Stride
+                                        : WinMaliAlignUp_(bbPriv->Width * bpp,
+                                                          WINMALI_PITCH_ALIGN);
+            bytes = (SIZE_T)pitch * (bbPriv->Height != 0 ? bbPriv->Height : 1);
+            if (bbPriv->Size > bytes) {
+                bytes = (SIZE_T)bbPriv->Size;
+            }
+            bytes = WinMaliAlignUpSz_(bytes, PAGE_SIZE);
+        } else if (priv == NULL ||
             info->PrivateDriverDataSize < sizeof(WINMALI_ALLOC_PRIV) ||
             priv->Magic != WINMALI_ALLOC_PRIV_MAGIC) {
-            /* No private data: treat as a raw buffer of `Alignment` bytes
-               rounded to PAGE_SIZE. UMD shouldn't normally hit this path
-               but we want to keep dxgk's own internal allocations working. */
+            /* No (usable) private data: treat as a raw buffer of `Alignment`
+               bytes rounded to PAGE_SIZE. UMD shouldn't normally hit this
+               path but we want dxgk's own internal allocations working.
+               NOTE: priv->Size may only be read when the blob is actually
+               a full WINMALI_ALLOC_PRIV - a short foreign blob would let us
+               read past the runtime's copy. */
             bpp   = 4;
             pitch = 0;
             if (info->Alignment != 0) {
                 bytes = WinMaliAlignUpSz_(info->Alignment, PAGE_SIZE);
-            } else if (priv != NULL && priv->Size != 0) {
+            } else if (priv != NULL &&
+                       info->PrivateDriverDataSize >= sizeof(WINMALI_ALLOC_PRIV) &&
+                       priv->Size != 0) {
                 bytes = WinMaliAlignUpSz_(priv->Size, PAGE_SIZE);
             } else {
                 bytes = PAGE_SIZE;
             }
+            priv = NULL;   /* magic mismatched; don't read fields below */
         } else {
             bpp   = WinMaliBppForFormat_((D3DDDIFORMAT)priv->Format);
             pitch = WinMaliAlignUp_(priv->Pitch != 0 ? priv->Pitch : priv->Width * bpp,
@@ -142,7 +171,13 @@ WinMaliKmdCreateAllocation(
         ka->hResource    = pCreateAllocation->hResource;
         ka->Size         = bytes;
         ka->Alignment    = info->Alignment != 0 ? info->Alignment : PAGE_SIZE;
-        if (priv != NULL && priv->Magic == WINMALI_ALLOC_PRIV_MAGIC) {
+        if (bbPriv != NULL) {
+            ka->Width  = bbPriv->Width;
+            ka->Height = bbPriv->Height;
+            ka->Pitch  = pitch;
+            ka->Format = bbPriv->Format;   /* DXGI_FORMAT (informational) */
+            ka->Usage  = WINMALI_ALLOC_USAGE_RENDER_TARGET;
+        } else if (priv != NULL && priv->Magic == WINMALI_ALLOC_PRIV_MAGIC) {
             ka->Width  = priv->Width;
             ka->Height = priv->Height;
             ka->Pitch  = pitch;
@@ -231,42 +266,43 @@ WinMaliKmdOpenAllocation(
     IN_CONST_HANDLE                  hDevice,
     IN_CONST_PDXGKARG_OPENALLOCATION pOpenAllocation)
 {
+    PWINMALI_ADAPTER adapter = NULL;
     UINT i;
-
-    UNREFERENCED_PARAMETER(hDevice);  /* per-device tracking deferred (system device can also open) */
 
     if (pOpenAllocation == NULL || pOpenAllocation->pOpenAllocation == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
+    adapter = WinMaliAdapterFromDeviceHandle((HANDLE)hDevice);
+
     for (i = 0; i < pOpenAllocation->NumAllocations; ++i) {
         DXGK_OPENALLOCATIONINFO* oi = &pOpenAllocation->pOpenAllocation[i];
+        PWINMALI_KMD_ALLOCATION  ka = NULL;
 
-        /* Flat model: device-specific handle is just the kmd alloc ptr we
-           returned from CreateAllocation. dxgk gave us hAllocation (its
-           D3DKMT_HANDLE), but the actual per-device cookie we hand back
-           is the WINMALI_KMD_ALLOCATION* via hDeviceSpecificAllocation. */
-        if (oi->hDeviceSpecificAllocation == NULL) {
-            /* dxgk fills hAllocation (its handle) on input; we look up
-               our struct via the private blob, which UMD attaches. If
-               UMD attached the kmd pointer in pPrivateDriverData, take
-               it; otherwise leave hDeviceSpecificAllocation = NULL and
-               dxgk will route through our hAllocation cookie. */
-            if (oi->pPrivateDriverData != NULL &&
-                oi->PrivateDriverDataSize >= sizeof(PWINMALI_KMD_ALLOCATION)) {
-                PWINMALI_KMD_ALLOCATION ka =
-                    *(PWINMALI_KMD_ALLOCATION*)oi->pPrivateDriverData;
-                if (ka != NULL && ka->Magic == WINMALI_KMD_ALLOC_MAGIC) {
-                    InterlockedIncrement(&ka->OpenCount);
-                    oi->hDeviceSpecificAllocation = (HANDLE)ka;
-                }
-            }
+        /* Flat model: the per-device cookie we hand back through
+           hDeviceSpecificAllocation is the WINMALI_KMD_ALLOCATION* from
+           CreateAllocation. Resolve dxgk's global allocation handle to it
+           via DxgkCbGetHandleData - this is what makes the allocation list
+           entries in DxgkDdiPresent point at our structs (the private blob
+           on oi is the UMD's creation blob, NOT a kernel pointer). */
+        if (adapter != NULL &&
+            adapter->DxgkInterface.DxgkCbGetHandleData != NULL &&
+            oi->hAllocation != 0) {
+            DXGKARGCB_GETHANDLEDATA ghd;
+            RtlZeroMemory(&ghd, sizeof(ghd));
+            ghd.hObject = oi->hAllocation;
+            ghd.Type    = DXGK_HANDLE_ALLOCATION;
+            ka = (PWINMALI_KMD_ALLOCATION)
+                adapter->DxgkInterface.DxgkCbGetHandleData(&ghd);
+        }
+
+        if (ka != NULL && ka->Magic == WINMALI_KMD_ALLOC_MAGIC) {
+            InterlockedIncrement(&ka->OpenCount);
+            oi->hDeviceSpecificAllocation = (HANDLE)ka;
         } else {
-            PWINMALI_KMD_ALLOCATION ka =
-                (PWINMALI_KMD_ALLOCATION)oi->hDeviceSpecificAllocation;
-            if (ka != NULL && ka->Magic == WINMALI_KMD_ALLOC_MAGIC) {
-                InterlockedIncrement(&ka->OpenCount);
-            }
+            WINMALI_WARN("OpenAllocation[%u]: hAlloc=0x%x did not resolve (ka=%p)",
+                         i, (ULONG)oi->hAllocation, ka);
+            oi->hDeviceSpecificAllocation = NULL;
         }
     }
     return STATUS_SUCCESS;
@@ -414,7 +450,14 @@ WinMaliKmdGetStandardAllocationDriverData(
     }
 
     bpp   = WinMaliBppForFormat_(fmt);
-    pitch = WinMaliAlignUp_(width * bpp, WINMALI_PITCH_ALIGN);
+    /* GDI surfaces include the cross-adapter texture types DWM uses to read
+       a render-only adapter's frames (D3DKMDT_GDISURFACE_TEXTURE_CROSSADAPTER)
+       - those require D3DKMT_CROSS_ADAPTER_RESOURCE_PITCH_ALIGNMENT (128).
+       Use 128 for all GDI surfaces; 64 stays the floor everywhere else. */
+    pitch = WinMaliAlignUp_(width * bpp,
+                            (pArgs->StandardAllocationType ==
+                             D3DKMDT_STANDARDALLOCATION_GDISURFACE)
+                                ? 128u : WINMALI_PITCH_ALIGN);
 
     /* Two-pass query pattern: dxgk first calls with pAllocationPrivateDriverData
        = NULL just to learn the size, then again with a real buffer. */

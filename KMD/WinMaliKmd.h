@@ -5,6 +5,10 @@
 #include <dispmprt.h>
 #include <ntstrsafe.h>
 
+/* Redirects DbgPrint -> WinMaliLogPrint (kd + UART2 serial mirror) for
+   every TU that includes this header. See WinMaliLog.h. */
+#include "WinMaliLog.h"
+
 #include "..\Shared\WinMaliEscape.h"   /* defines WINMALI_POOL_TAG */
 #include "hw\WinMaliHw.h"
 #include "WinMaliMmu.h"
@@ -74,6 +78,15 @@ typedef struct _WINMALI_ADAPTER {
     BOOLEAN             GpuMmuAsBound;
     ULONG               GpuMmuBringupAs;
 
+    /* Preallocated L3 tables backing the aperture GPU-VA window
+       (WINMALI_SYSMEM_GPU_BASE .. +WINMALI_DMA_SEGMENT_BYTES) in the
+       bring-up AS. One L3 per 2 MiB, wired into L2 at MmuInit so
+       MAP_APERTURE_SEGMENT can never fail with a status dxgmms2
+       bugchecks on (0x10E_b). Non-cached like the rest of the PTs. */
+    PVOID               ApertureL3Va;
+    PHYSICAL_ADDRESS    ApertureL3Phys;
+    SIZE_T              ApertureL3Bytes;
+
     /* AS-slot allocator. AS0 is the CSF MCU; AS1 is the kernel bring-up
        address space. AS2..AS(N-1) are leased per dxgk context. */
     KSPIN_LOCK          AsSlotLock;
@@ -103,6 +116,11 @@ typedef struct _WINMALI_ADAPTER {
     LONG64              GpuCompletedFence;
     LONG                NotifyDpcPending;
 
+    /* Count of SubmitCommand calls whose CSF NOP round-trip failed and
+       were completed CPU-side instead (degraded mode; see WinMaliDdi.c).
+       Diagnostic only - nonzero means the MCU wasn't alive. */
+    ULONG               CsfSubmitFailures;
+
     /* Pending fence-completion queue: produced by WinMaliKmdSubmitCommand,
        drained by WinMaliKmdDpcRoutine which calls DxgkCbNotifyInterrupt.
        Synchronous "GPU work done immediately" path for paging submits we
@@ -115,7 +133,32 @@ typedef struct _WINMALI_ADAPTER {
         UINT    SubmissionFenceId;
         UINT    NodeOrdinal;
         UINT    EngineOrdinal;
+        BOOLEAN IsPreempt;              /* TRUE => notify DMA_PREEMPTED, not COMPLETED */
+        UINT    LastCompletedFenceId;   /* preempt only: fence reached before preempt */
     } FenceQueue[WINMALI_FENCE_QUEUE_DEPTH];
+
+    /* Async submit scheduler. DxgkDdiSubmitCommand used to BLOCK the dxgk
+       scheduler worker on the CSF round-trip (and we lied about preemption
+       caps to dodge the scheduler's preempt path -> 0xD1 in dxgmms2). Now
+       SubmitCommand enqueues here and returns immediately; a dedicated KMD
+       worker thread drains the queue, runs the (proven, synchronous) CSF
+       submit off the scheduler thread, and completes the fence via the DPC.
+       PreemptCommand enqueues an in-order marker so preemption reports the
+       exact completed-fence boundary with no race. */
+#define WINMALI_SUBMIT_QUEUE_DEPTH  64u
+    KSPIN_LOCK          SubmitQueueLock;
+    ULONG               SubmitQueueHead;
+    ULONG               SubmitQueueTail;
+    struct {
+        UINT    FenceId;               /* submission fence, or preemption fence */
+        UINT    NodeOrdinal;
+        UINT    EngineOrdinal;
+        BOOLEAN IsPreempt;
+    } SubmitQueue[WINMALI_SUBMIT_QUEUE_DEPTH];
+    PVOID               SubmitWorkerThread;   /* PKTHREAD (referenced) */
+    KEVENT              SubmitWorkerWake;
+    LONG                SubmitWorkerStop;
+    LONG64              SchedLastCompletedFence;  /* worker-updated, in-order */
 
     /* Set after a successful bring-up so RemoveDevice can tell a clean
        stop/remove cycle from a never-started one. */
@@ -128,11 +171,11 @@ typedef struct _WINMALI_ADAPTER {
     /* UMD escape ABI: SyncObj handle table. See WinMaliSync.c. */
     WINMALI_SYNCOBJ_TABLE   SyncObjTable;
 
-    /* UMD escape ABI: VM handle table (metadata-only until VmBind wired). */
+    /* UMD escape ABI: VM handle table (VmBind programs per-VM LPAE PTEs). */
     WINMALI_VM_TABLE        VmTable;
 
-    /* UMD escape ABI: CSF queue Group handle table (metadata-only;
-       GroupSubmit blocked on VmBind). */
+    /* UMD escape ABI: CSF queue Group handle table (GroupSubmit runs the
+       UMD command streams on the CSG). */
     WINMALI_GROUP_TABLE     GroupTable;
 } WINMALI_ADAPTER, *PWINMALI_ADAPTER;
 
@@ -152,13 +195,26 @@ PWINMALI_ADAPTER WinMaliAdapterFromDxgkHandle(_In_opt_ const VOID* hAdapter);
 /* ---------- DDI prototypes wired into DRIVER_INITIALIZATION_DATA ------- */
 
 DRIVER_INITIALIZE                       DriverEntry;
-DRIVER_UNLOAD                           WinMaliKmdUnload;
 VOID APIENTRY                           WinMaliKmdDxgkUnload(VOID);
 
 /* Kill-switch (early in DriverEntry) - returns Disabled=FALSE on any error
    so a registry/I/O glitch never bricks the driver. */
 NTSTATUS WinMaliReadKillSwitch(_In_ PUNICODE_STRING RegistryPath,
                                _Out_ BOOLEAN* Disabled);
+
+/* Generic Services\WinMaliKmd\Parameters REG_DWORD reader; *Value keeps
+   Default on any failure. */
+NTSTATUS WinMaliReadParamsDword(_In_ PUNICODE_STRING RegistryPath,
+                                _In_ PCWSTR ValueName,
+                                _In_ ULONG Default,
+                                _Out_ ULONG* Value);
+
+/* Bring-up policy: reject dwm.exe's CreateDevice so the compositor stops
+   churning devices/VMs/AS-slots on the render-only adapter. Read from
+   Parameters\AllowDwm at DriverEntry (default 0 = blocked); set to 1 +
+   reboot to let DWM back in without a rebuild. (v28's bugcheck-with-gate
+   was the DriverUnload 0x139 bug, fixed v32 - not this.) */
+extern ULONG g_WinMaliAllowDwm;
 
 /* Auto-arm the kill-switch from inside DriverEntry. Used to prevent the
    second DriverEntry-after-teardown crash we hit on Win11 26100 dxgk - if
@@ -182,7 +238,23 @@ VOID     WinMaliFwTeardown(_Inout_ PWINMALI_ADAPTER Adapter);
 /* Submit a single no-op CSF job to the kernel queue. Used as a self-test
    after FwInit succeeds - if this returns STATUS_SUCCESS we know the MCU
    is alive, the CS iface is programmed, and the queue ring works end-to-end. */
-NTSTATUS WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter);
+NTSTATUS WinMaliCsfSubmitNopJob(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG TimeoutMs);
+
+/* Real UMD command-stream submission: bind the CSG to the group's VM AS
+   (GroupAsSlot) and execute the UMD's CS stream at StreamGpuVa. On failure
+   the caller should fall back to WinMaliCsfSubmitNopJob. */
+NTSTATUS WinMaliCsfSubmitGroupStream(_Inout_ PWINMALI_ADAPTER Adapter,
+                                     _In_ ULONG   GroupAsSlot,
+                                     _In_ UINT64  StreamGpuVa,
+                                     _In_ ULONG   StreamSizeBytes,
+                                     _In_ ULONG   LatestFlush,
+                                     _In_ ULONG   TimeoutMs);
+
+/* Cross-map the CSF ring/sync/shader pages into a UMD group's VM at the
+   fixed low GPU VAs so the CSG can execute the group's stream in its own AS.
+   Called from VmCreate; best-effort (DEVICE_NOT_READY before CSF boots). */
+NTSTATUS WinMaliCsfMapIntoVm(_Inout_ PWINMALI_ADAPTER Adapter,
+                             _Inout_ PWINMALI_VM_PT VmPt);
 
 /* 256 MiB sysmem-backed segment that VIDMM publishes as "segment 1". */
 NTSTATUS WinMaliVidmmAllocateSegment(_Inout_ PWINMALI_ADAPTER Adapter);
@@ -203,7 +275,29 @@ NTSTATUS APIENTRY WinMaliKmdRestartFromTimeout(IN_CONST_HANDLE hAdapter);
 NTSTATUS APIENTRY WinMaliKmdCollectDbgInfo(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_COLLECTDBGINFO pArgs);
 NTSTATUS APIENTRY WinMaliKmdBuildPagingBuffer(IN_CONST_HANDLE hAdapter, IN_PDXGKARG_BUILDPAGINGBUFFER pBpb);
 NTSTATUS APIENTRY WinMaliKmdSubmitCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_SUBMITCOMMAND pSubmit);
+NTSTATUS APIENTRY WinMaliKmdSubmitCommandVirtual(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_SUBMITCOMMANDVIRTUAL pSubmit);
+NTSTATUS APIENTRY WinMaliKmdPreemptCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_PREEMPTCOMMAND pPreempt);
+NTSTATUS APIENTRY WinMaliKmdCancelCommand(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_CANCELCOMMAND pCancel);
+NTSTATUS APIENTRY WinMaliKmdQueryEngineStatus(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_QUERYENGINESTATUS pArgs);
+NTSTATUS APIENTRY WinMaliKmdResetEngine(IN_CONST_HANDLE hAdapter, INOUT_PDXGKARG_RESETENGINE pReset);
 NTSTATUS APIENTRY WinMaliKmdEscape(IN_CONST_HANDLE hAdapter, IN_CONST_PDXGKARG_ESCAPE pEscape);
+
+/* WinMaliDdi.c: async submit scheduler lifecycle. Init creates the worker
+   thread (call from StartDevice after CSF is up); Teardown stops+joins it
+   (call from StopDevice before FW teardown). Safe to call Teardown if Init
+   never ran / already torn down. */
+NTSTATUS WinMaliSchedInit(_Inout_ PWINMALI_ADAPTER Adapter);
+VOID     WinMaliSchedTeardown(_Inout_ PWINMALI_ADAPTER Adapter);
+
+/* WinMaliDdi.c: validate a dxgk device handle (DXGKARG_ESCAPE.hDevice) and
+   return it as the opaque owner token stamped on escape-created resources
+   (VM/BO/SyncObj/Group) so DestroyDevice can run them down. NULL if the
+   handle is absent or foreign. */
+PVOID WinMaliDeviceOwnerToken(_In_opt_ HANDLE hDevice);
+
+/* WinMaliDdi.c: resolve a dxgk device handle to its adapter (NULL if
+   absent/foreign). For DDIs that only receive hDevice. */
+PWINMALI_ADAPTER WinMaliAdapterFromDeviceHandle(_In_opt_ HANDLE hDevice);
 
 /* Segment id constants. dxgk segment ids are 1-based; id 1 is the
    sysmem-backed segment we allocate at StartDevice. */

@@ -1,6 +1,7 @@
 
 #include "WinMaliKmd.h"
 #include "WinMaliDxgkInitFill.h"
+#include "WinMaliVersion.h"
 
 static PWINMALI_ADAPTER g_WinMaliAdapter = NULL;
 
@@ -39,6 +40,11 @@ WinMaliAdapterFromDxgkHandle(_In_opt_ const VOID* hAdapter)
 /* Entry points                                                            */
 /* ---------------------------------------------------------------------- */
 
+/* Bring-up policy toggle, see WinMaliKmd.h. Default 1 = DWM allowed
+   (re-enabled for on-screen/present bring-up; set the registry
+   Services\WinMaliKmd\Parameters\AllowDwm=0 to block dwm again). */
+ULONG g_WinMaliAllowDwm = 1;
+
 _Use_decl_annotations_
 NTSTATUS
 DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
@@ -46,13 +52,17 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DRIVER_INITIALIZATION_DATA init;
     NTSTATUS                   status;
 
-    /* Interactive iteration: break into kd immediately so the user can
-       confirm exactly which binary is loaded and step through bring-up.
-       DbgBreakPoint is a no-op when no kernel debugger is attached. */
-    DbgPrint("[WinMali] >> DriverEntry abi=%u.%u (build " __DATE__ " " __TIME__ ")\n",
-             WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
-    DbgBreakPoint();
+    /* UART2 serial log mirror FIRST so even this banner reaches the wire
+       when running with kernel debugging off (see WinMaliLog.h). */
+    (VOID)WinMaliSerialInit();
 
+    DbgPrint("[WinMali] >> DriverEntry abi=%u.%u kmd v" WINMALI_KMD_VERSION_STR "\n",
+             WINMALI_ABI_MAJOR, WINMALI_ABI_MINOR);
+
+    (VOID)WinMaliReadParamsDword(RegistryPath, L"AllowDwm", 1, &g_WinMaliAllowDwm);
+    DbgPrint("[WinMali]    AllowDwm=%lu (%s)\n", g_WinMaliAllowDwm,
+             g_WinMaliAllowDwm ? "dwm.exe may create devices"
+                               : "dwm.exe CreateDevice -> ACCESS_DENIED");
     WinMaliDxgkPatchInitializationData(&init);
 
     DbgPrint("[WinMali]    init.Version=0x%08x sizeof(init)=%lu\n",
@@ -70,28 +80,27 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return status;
     }
 
-    DriverObject->DriverUnload = WinMaliKmdUnload;
+    /* Do NOT touch DriverObject->DriverUnload here. DxgkInitialize installed
+       dxgkrnl's own unload routine, which unlinks this driver from dxgk's
+       global driver list and then calls our DxgkDdiUnload below. Overwriting
+       it (as pre-v32 code did) skips that unlink, so an uninstall+reinstall
+       on the same boot re-entered DpiInitializeEx with a freed entry still
+       on the list -> bugcheck 0x139 LIST_ENTRY corruption (seen live
+       2026-07-12, dxgkrnl!DpiInitializeEx+0x77c). */
     UNREFERENCED_PARAMETER(RegistryPath);
 
     DbgPrint("[WinMali] << DriverEntry STATUS_SUCCESS\n");
     return STATUS_SUCCESS;
 }
 
-VOID
-WinMaliKmdUnload(_In_ PDRIVER_OBJECT DriverObject)
-{
-    WM_TRACE_ENTER("DriverUnload");
-    UNREFERENCED_PARAMETER(DriverObject);
-    WM_TRACE_EXIT("DriverUnload");
-}
-
-/* Distinct from DriverObject->DriverUnload above. DXGKDDI_UNLOAD takes
-   VOID (per dispmprt.h) and is what init->DxgkDdiUnload must point at. */
+/* DXGKDDI_UNLOAD (init->DxgkDdiUnload): dxgkrnl calls this from ITS
+   DriverUnload after unhooking us. Last code of ours that runs. */
 VOID APIENTRY
 WinMaliKmdDxgkUnload(VOID)
 {
     WM_TRACE_ENTER("DxgkUnload");
     WM_TRACE_EXIT("DxgkUnload");
+    WinMaliSerialTeardown();   /* after the last print */
 }
 
 /* ---------------------------------------------------------------------- */
@@ -231,6 +240,11 @@ WinMaliKmdStartDevice(
        CSF_JOBS, and we want every subsequent boot to land in a clean idle
        state with proper IRQ delivery, not a synchronous test submission. */
 
+    /* Bring up the async submit worker (drains DxgkDdiSubmitCommand /
+       PreemptCommand off the dxgk scheduler thread). Non-fatal if it fails -
+       SubmitCommand falls back to inline completion. */
+    (VOID)WinMaliSchedInit(adapter);
+
     adapter->StartDeviceEverSucceeded = TRUE;
     WINMALI_TRACE("StartDevice OK: regs=%u mmu=%u mcu_alive=%u csf_jobs=%u",
                   adapter->GpuRegsMapped,
@@ -251,6 +265,9 @@ WinMaliKmdStopDevice(_In_ CONST PVOID MiniportDeviceContext)
         return STATUS_INVALID_PARAMETER;
     }
 
+    /* Stop the async submit worker BEFORE tearing down the FW/CSF so it can't
+       be mid-CSF-submit while the ring/MCU goes away. */
+    WinMaliSchedTeardown(adapter);
     WinMaliFwTeardown(adapter);
     WinMaliDisconnectInterrupt(adapter);
     WinMaliMmuTeardown(adapter);
@@ -335,6 +352,43 @@ WinMaliKmdInterruptRoutine(
     jobRaw = WinMaliHwRead32(&adapter->Hw, WINMALI_REG_JOB_INT_RAWSTAT);
     mmuRaw = WinMaliHwRead32(&adapter->Hw, WINMALI_REG_MMU_INT_RAWSTAT);
 
+    /* FAULT DECODE (fault-detection audit 2026-07-13). The ISR used to W1C-ack
+       every bit and read no fault-status register, so a real GPU/MMU fault was
+       acknowledged and silently discarded ("clean completion, black output").
+       Read the fault-status registers and log the FIRST REAL fault per boot.
+       CRITICAL: only a NON-ZERO fault-status register is a real fault - the
+       MMU_INT bit 17 (0x20000) is a benign per-AS command-completion notify
+       that fires every healthy boot (FAULTSTATUS reads 0). Gating the one-shot
+       on FAULTSTATUS!=0 stops that benign bit from consuming the latch and
+       hiding a later real fault. WinMaliLogPrint -> polled UART is DIRQL-safe. */
+    if ((gpuRaw & (WINMALI_GPU_IRQ_FAULT | WINMALI_GPU_IRQ_PROTM_FAULT)) || mmuRaw != 0) {
+        static LONG s_isrFaultReported = 0;
+        ULONG gpFs = (gpuRaw & (WINMALI_GPU_IRQ_FAULT | WINMALI_GPU_IRQ_PROTM_FAULT))
+                   ? WinMaliHwRead32(&adapter->Hw, WINMALI_REG_GPU_FAULT_STATUS) : 0u;
+        ULONG asHit = 0xFFu, asFs = 0u, as;
+        for (as = 0; as < 8u; ++as) {
+            if (mmuRaw & ((1u << as) | (1u << (as + 16)))) {
+                ULONG fs = WinMaliHwRead32(&adapter->Hw, WINMALI_REG_AS_FAULTSTATUS(as));
+                if (fs != 0u) { asHit = as; asFs = fs; break; }
+            }
+        }
+        if ((gpFs != 0u || asFs != 0u) &&
+            InterlockedCompareExchange(&s_isrFaultReported, 1, 0) == 0) {
+            if (gpFs != 0u) {
+                WinMaliLogPrint("[WinMali] ISR GPU FAULT: raw=0x%08x FAULT_STATUS=0x%08x ADDR=0x%08x%08x\n",
+                                gpuRaw, gpFs,
+                                WinMaliHwRead32(&adapter->Hw, WINMALI_REG_GPU_FAULT_ADDR_HI),
+                                WinMaliHwRead32(&adapter->Hw, WINMALI_REG_GPU_FAULT_ADDR_LO));
+            }
+            if (asFs != 0u) {
+                WinMaliLogPrint("[WinMali] ISR MMU FAULT AS%u: mmu_raw=0x%08x FAULTSTATUS=0x%08x ADDR=0x%08x%08x\n",
+                                asHit, mmuRaw, asFs,
+                                WinMaliHwRead32(&adapter->Hw, WINMALI_REG_AS_FAULTADDR_HI(asHit)),
+                                WinMaliHwRead32(&adapter->Hw, WINMALI_REG_AS_FAULTADDR_LO(asHit)));
+            }
+        }
+    }
+
     if (gpuRaw != 0) {
         WinMaliHwWrite32(&adapter->Hw, WINMALI_REG_GPU_IRQ_CLEAR, gpuRaw);
         handled = TRUE;
@@ -353,7 +407,23 @@ WinMaliKmdInterruptRoutine(
     } else {
         InterlockedIncrement64(&adapter->InterruptsSpurious);
     }
-    InterlockedIncrement64(&adapter->InterruptsTotal);
+
+    /* Storm telemetry. An interrupt storm is otherwise INVISIBLE on the
+       serial log (this routine deliberately never prints) while starving
+       the rest of the system - 2026-07-10 the box dropped SSH the moment
+       the adapter went live with the MCU up, with a totally silent trace.
+       Print the first interrupt ever and then every 8192nd: a healthy
+       adapter logs a handful of lines a day, a storm testifies at ~60
+       lines/s. WinMaliLogPrint -> polled UART write is IRQL-safe and
+       time-bounded, so a few ms at DIRQL per 8192 interrupts is an
+       acceptable price for the evidence. */
+    {
+        LONG64 total = InterlockedIncrement64(&adapter->InterruptsTotal);
+        if (total == 1 || (total & 0x1FFF) == 0) {
+            WinMaliLogPrint("[WinMali] ISR: total=%lld gpu=0x%08x job=0x%08x mmu=0x%08x\n",
+                            total, gpuRaw, jobRaw, mmuRaw);
+        }
+    }
 
     return handled;
 }
@@ -381,22 +451,34 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
     KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
     while (adapter->FenceQueueHead != adapter->FenceQueueTail) {
         DXGKARGCB_NOTIFY_INTERRUPT_DATA notify;
-        UINT fenceId   = adapter->FenceQueue[adapter->FenceQueueHead].SubmissionFenceId;
-        UINT nodeOrd   = adapter->FenceQueue[adapter->FenceQueueHead].NodeOrdinal;
-        UINT engineOrd = adapter->FenceQueue[adapter->FenceQueueHead].EngineOrdinal;
+        UINT    fenceId   = adapter->FenceQueue[adapter->FenceQueueHead].SubmissionFenceId;
+        UINT    nodeOrd   = adapter->FenceQueue[adapter->FenceQueueHead].NodeOrdinal;
+        UINT    engineOrd = adapter->FenceQueue[adapter->FenceQueueHead].EngineOrdinal;
+        BOOLEAN isPreempt = adapter->FenceQueue[adapter->FenceQueueHead].IsPreempt;
+        UINT    lastDone  = adapter->FenceQueue[adapter->FenceQueueHead].LastCompletedFenceId;
         adapter->FenceQueueHead = (adapter->FenceQueueHead + 1) % WINMALI_FENCE_QUEUE_DEPTH;
         KeReleaseSpinLock(&adapter->FenceQueueLock, oldIrql);
 
         RtlZeroMemory(&notify, sizeof(notify));
-        notify.InterruptType                       = DXGK_INTERRUPT_DMA_COMPLETED;
-        notify.DmaCompleted.SubmissionFenceId      = fenceId;
-        notify.DmaCompleted.NodeOrdinal            = nodeOrd;
-        notify.DmaCompleted.EngineOrdinal          = engineOrd;
-        adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
-        adapter->GpuCompletedFence = fenceId;
-
-        WINMALI_TRACE("DPC: notified DMA_COMPLETED fence=%u node=%u engine=%u",
-                      fenceId, nodeOrd, engineOrd);
+        if (isPreempt) {
+            notify.InterruptType                        = DXGK_INTERRUPT_DMA_PREEMPTED;
+            notify.DmaPreempted.PreemptionFenceId       = fenceId;
+            notify.DmaPreempted.LastCompletedFenceId    = lastDone;
+            notify.DmaPreempted.NodeOrdinal             = nodeOrd;
+            notify.DmaPreempted.EngineOrdinal           = engineOrd;
+            adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
+            WINMALI_TRACE("DPC: notified DMA_PREEMPTED preemptFence=%u lastCompleted=%u node=%u",
+                          fenceId, lastDone, nodeOrd);
+        } else {
+            notify.InterruptType                       = DXGK_INTERRUPT_DMA_COMPLETED;
+            notify.DmaCompleted.SubmissionFenceId      = fenceId;
+            notify.DmaCompleted.NodeOrdinal            = nodeOrd;
+            notify.DmaCompleted.EngineOrdinal          = engineOrd;
+            adapter->DxgkInterface.DxgkCbNotifyInterrupt(adapter->DxgkHandle, &notify);
+            adapter->GpuCompletedFence = fenceId;
+            WINMALI_TRACE("DPC: notified DMA_COMPLETED fence=%u node=%u engine=%u",
+                          fenceId, nodeOrd, engineOrd);
+        }
 
         KeAcquireSpinLock(&adapter->FenceQueueLock, &oldIrql);
     }
@@ -412,7 +494,13 @@ WinMaliKmdDpcRoutine(_In_ CONST PVOID MiniportDeviceContext)
 /* WDDM 2.2+ pre-start handshake. dxgk calls this between AddDevice and
    StartDevice to negotiate boot-display preservation (smooth transition).
    For a render-only adapter without a boot display, both output bits stay
-   zero. Returning NOT_SUPPORTED here tears the adapter down on WDDM 2.5. */
+   zero. Returning NOT_SUPPORTED here tears the adapter down on WDDM 2.5.
+
+   NOT WIRED on WDDM 3.2: this DDI is part of CreateDisplayCore's
+   display-DDI all-or-none sweep - a displayless adapter must leave it
+   NULL or AddAdapter fails with STATUS_REVISION_MISMATCH (event 549).
+   Kept compiled for the day we grow a display core; see NULL_FIELDS in
+   Tools\gen-dxgk-stubs.py. */
 NTSTATUS APIENTRY
 WinMaliKmdExchangePreStartInfo(
     _In_                              CONST PVOID            MiniportDeviceContext,

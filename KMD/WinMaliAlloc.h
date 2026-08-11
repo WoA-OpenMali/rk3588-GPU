@@ -48,6 +48,8 @@ typedef struct _WINMALI_ALLOC_PRIV {
 
 /* ---------------- WINMALI_KMD_ALLOCATION - per-alloc kernel state -------- */
 
+#define WINMALI_KMD_ALLOC_MAGIC      'AllW'
+
 typedef struct _WINMALI_KMD_ALLOCATION {
     ULONG               Magic;        /* 'AllW' */
     struct _WINMALI_ADAPTER* Adapter;
@@ -57,20 +59,52 @@ typedef struct _WINMALI_KMD_ALLOCATION {
     UINT                Width;
     UINT                Height;
     UINT                Pitch;        /* row stride in bytes */
-    UINT                Format;       /* D3DDDIFORMAT */
+    UINT                Format;       /* D3DDDIFORMAT (or DXGI_FORMAT for
+                                         UMD 'WMAl' backbuffer allocs) */
     UINT                Usage;        /* WINMALI_ALLOC_USAGE_* */
     /* Residency state (filled by BuildPagingBuffer when the alloc gets a
        GPU VA / sysmem page set). Until then both are zero. */
     UINT64              GpuVa;
     PHYSICAL_ADDRESS    PhysicalBase;
     LONG                OpenCount;    /* per-device opens outstanding */
+    /* Aperture residency, stashed by BuildPagingBuffer MAP_APERTURE_SEGMENT
+       and cleared at UNMAP. The MDL is VidMm's - it is only valid while the
+       allocation is mapped (present blts and BoFromAllocation both require
+       the allocation to be resident; the UMD pins backbuffers via LockCb). */
+    PMDL                ApertureMdl;
+    ULONG               ApertureMdlOffset;   /* pages into the MDL */
+    ULONG               AperturePageCount;
 } WINMALI_KMD_ALLOCATION, *PWINMALI_KMD_ALLOCATION;
+
+/* ---------------- Present (Blt) descriptor ------------------------------ */
+/* DxgkDdiPresent stashes this in the DMA buffer's private data; the paging
+   NOP path in SubmitCommand ignores buffers whose private data doesn't start
+   with this magic, so present can't regress memory management. Kept in
+   private data (not the DMA buffer proper) so the src/dst kernel pointers
+   survive Present -> SubmitCommand without going through dxgk patching. */
+#define WINMALI_BLT_DESC_MAGIC   0x746C4257u  /* 'WBlt' */
+
+typedef struct _WINMALI_BLT_DESC {
+    ULONG                    Magic;      /* WINMALI_BLT_DESC_MAGIC */
+    ULONG                    SubRectCnt;
+    PWINMALI_KMD_ALLOCATION  Src;        /* rendered back buffer */
+    PWINMALI_KMD_ALLOCATION  Dst;        /* primary / cross-adapter */
+    LONG                     SrcLeft, SrcTop;
+    LONG                     DstLeft, DstTop, DstRight, DstBottom;
+} WINMALI_BLT_DESC, *PWINMALI_BLT_DESC;
+
+/* WINMALI_CS_SUBMIT_DESC (Phase 3) is defined in the shared header
+   Shared/WinMaliEscape.h so the UMD and KMD agree on it. */
 
 /* ---------------- DDI prototypes ---------------------------------------- */
 
 NTSTATUS APIENTRY WinMaliKmdCreateAllocation(
     IN_CONST_HANDLE                 hAdapter,
     INOUT_PDXGKARG_CREATEALLOCATION pCreateAllocation);
+
+NTSTATUS APIENTRY WinMaliKmdPresent(
+    IN_CONST_HANDLE         hContext,
+    INOUT_PDXGKARG_PRESENT  pPresent);
 
 NTSTATUS APIENTRY WinMaliKmdDestroyAllocation(
     IN_CONST_HANDLE                     hAdapter,

@@ -1,18 +1,13 @@
 /*
  * WinMaliGroup.c - CSF queue group lifecycle.
  *
- * Metadata-only until VmBind is wired and the existing CSF kernel-queue
- * submit path (WinMaliCsfSubmitStreamCall_) can be reached from UMD-supplied
- * GPU VAs. Once VmBind lands the next step is GroupSubmit:
- *
- *   for each WINMALI_QUEUE_SUBMIT in the args' tail:
- *     WinMaliCsfSubmitStreamCall_(adapter, fw,
- *                                 submit->StreamAddr,
- *                                 submit->StreamSize,
- *                                 0u, timeoutMs);
- *
- * Sync ops attached to each queue submit will need real SyncObj integration
- * (wait pre-submission, signal post-completion). That's a follow-on step.
+ * GroupCreate/Destroy/GetState track the group handle + queue parameters.
+ * The submit path is fully wired: WinMaliEscapeGroupSubmit_ (WinMaliEscape.c)
+ * iterates the WINMALI_QUEUE_SUBMIT tail, rebinds the CSG to the group's VM AS,
+ * and CALLs each queue's UMD command stream via WinMaliCsfSubmitGroupStream,
+ * with real SyncObj integration (wait pre-submission, signal post-completion).
+ * VmBind (WinMaliEscapeVmBind_) programs the per-VM Mali LPAE page tables those
+ * GPU VAs resolve against.
  */
 
 #include "WinMaliKmd.h"
@@ -71,6 +66,7 @@ WinMaliGroupCreate(_Inout_ PWINMALI_ADAPTER Adapter,
                    _In_ const WINMALI_GROUP_CREATE* Args,
                    _In_reads_(QueueCount) const WINMALI_QUEUE_CREATE* Queues,
                    _In_ ULONG QueueCount,
+                   _In_opt_ PVOID OwnerDevice,
                    _Out_ ULONG* OutHandle)
 {
     PWINMALI_GROUP group;
@@ -107,6 +103,7 @@ WinMaliGroupCreate(_Inout_ PWINMALI_ADAPTER Adapter,
     group->QueuesCount      = QueueCount;
     RtlCopyMemory(group->Queues, Queues, QueueCount * sizeof(Queues[0]));
     group->RefCount         = 1;
+    group->OwnerDevice      = OwnerDevice;
 
     KeAcquireSpinLock(&Adapter->GroupTable.Lock, &oldIrql);
     group->Handle = (ULONG)(Adapter->GroupTable.NextHandle++);
@@ -153,6 +150,97 @@ WinMaliGroupDestroy(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG Handle)
     WINMALI_TRACE("GroupDestroy: handle=%u", group->Handle);
     WinMaliGroupFree_(group);
     return WMERR_OK;
+}
+
+ULONG
+WinMaliGroupRundownOwner(_Inout_ PWINMALI_ADAPTER Adapter, _In_ PVOID OwnerDevice)
+{
+    KIRQL oldIrql;
+    LIST_ENTRY freeHead;
+    PLIST_ENTRY entry, next;
+    ULONG freed = 0;
+
+    if (OwnerDevice == NULL) {
+        return 0;
+    }
+    InitializeListHead(&freeHead);
+
+    KeAcquireSpinLock(&Adapter->GroupTable.Lock, &oldIrql);
+    for (entry = Adapter->GroupTable.Head.Flink;
+         entry != &Adapter->GroupTable.Head;
+         entry = next) {
+        PWINMALI_GROUP g = CONTAINING_RECORD(entry, WINMALI_GROUP, Link);
+        next = entry->Flink;
+        if (g->OwnerDevice == OwnerDevice) {
+            RemoveEntryList(&g->Link);
+            Adapter->GroupTable.Count--;
+            InsertTailList(&freeHead, &g->Link);
+        }
+    }
+    KeReleaseSpinLock(&Adapter->GroupTable.Lock, oldIrql);
+
+    while (!IsListEmpty(&freeHead)) {
+        PWINMALI_GROUP g = CONTAINING_RECORD(RemoveHeadList(&freeHead),
+                                             WINMALI_GROUP, Link);
+        WINMALI_TRACE("GroupRundown: handle=%u (owner device died without "
+                      "GroupDestroy)", g->Handle);
+        WinMaliGroupFree_(g);
+        ++freed;
+    }
+    return freed;
+}
+
+int
+WinMaliGroupGetVmId(_In_ PWINMALI_ADAPTER Adapter,
+                    _In_ ULONG Handle,
+                    _Out_ ULONG* OutVmId)
+{
+    KIRQL oldIrql;
+    PLIST_ENTRY entry;
+    int err = WMERR_ENOENT;
+
+    *OutVmId = 0;
+    KeAcquireSpinLock(&Adapter->GroupTable.Lock, &oldIrql);
+    for (entry = Adapter->GroupTable.Head.Flink;
+         entry != &Adapter->GroupTable.Head;
+         entry = entry->Flink) {
+        PWINMALI_GROUP g = CONTAINING_RECORD(entry, WINMALI_GROUP, Link);
+        if (g->Handle == Handle) {
+            *OutVmId = g->VmId;
+            err = WMERR_OK;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->GroupTable.Lock, oldIrql);
+    return err;
+}
+
+/* Mark a queue of a group as fatally faulted. panthor sets group->fatal_queues
+   on CS_FATAL/CS_FAULT and surfaces it as DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+   the KMD's FatalQueueMask was declared but never set (always 0), so the UMD
+   was never told a group faulted. Called when a real stream submit fails. */
+int
+WinMaliGroupMarkFatalQueue(_In_ PWINMALI_ADAPTER Adapter,
+                           _In_ ULONG Handle,
+                           _In_ ULONG QueueIndex)
+{
+    KIRQL oldIrql;
+    PLIST_ENTRY entry;
+    int err = WMERR_ENOENT;
+
+    KeAcquireSpinLock(&Adapter->GroupTable.Lock, &oldIrql);
+    for (entry = Adapter->GroupTable.Head.Flink;
+         entry != &Adapter->GroupTable.Head;
+         entry = entry->Flink) {
+        PWINMALI_GROUP g = CONTAINING_RECORD(entry, WINMALI_GROUP, Link);
+        if (g->Handle == Handle) {
+            g->FatalQueueMask |= (1u << (QueueIndex & 0x1Fu));
+            err = WMERR_OK;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&Adapter->GroupTable.Lock, oldIrql);
+    return err;
 }
 
 int

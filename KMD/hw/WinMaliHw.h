@@ -28,14 +28,41 @@ Abstract:
 // GPU block (0x000-0x2FF). Offsets stay in sync with panthor_regs.h.
 #define WINMALI_REG_GPU_ID            0x0000
 #define WINMALI_REG_GPU_L2_FEATURES   0x0004
+#define WINMALI_REG_GPU_CORE_FEATURES 0x0008
+#define WINMALI_REG_GPU_TILER_FEATURES 0x000C
+#define WINMALI_REG_GPU_MEM_FEATURES  0x0010
 #define WINMALI_REG_GPU_CSF_ID        0x001C  // NB: panthor puts CSF_ID at 0x1C, not 0x08
 #define WINMALI_REG_GPU_MMU_FEATURES  0x0014
 #define WINMALI_REG_GPU_AS_PRESENT    0x0018
+// Thread/texture capability block (panthor_regs.h). These feed the UMD's
+// pan_kmod_dev_props - a ZERO TilerFeatures gave hierarchy_mask=0 tiler
+// descriptors, which the CS frontend rejects with DATA_INVALID_FAULT (0x58);
+// that was the M2 draw blocker (2026-07-12).
+#define WINMALI_REG_GPU_THREAD_MAX_THREADS        0x00A0
+#define WINMALI_REG_GPU_THREAD_MAX_WORKGROUP_SIZE 0x00A4
+#define WINMALI_REG_GPU_THREAD_MAX_BARRIER_SIZE   0x00A8
+#define WINMALI_REG_GPU_THREAD_FEATURES           0x00AC
+#define WINMALI_REG_GPU_TEXTURE_FEATURES(n)       (0x00B0 + ((ULONG)(n)) * 4u)
+#define WINMALI_REG_GPU_COHERENCY_FEATURES        0x0300
+/* GPU_COHERENCY_PROTOCOL (0x304): selects the bus coherency mode. Values
+   per panthor_regs.h: ACE_LITE=0, ACE=1, NONE=31. panthor writes this in
+   panthor_gpu_coherency_set BEFORE L2 power-on. */
+#define WINMALI_REG_GPU_COHERENCY_PROTOCOL        0x0304
+#define WINMALI_GPU_COHERENCY_ACE_LITE            0u
+#define WINMALI_GPU_COHERENCY_ACE                 1u
+#define WINMALI_GPU_COHERENCY_NONE                31u
 #define WINMALI_REG_GPU_IRQ_RAWSTAT   0x0020
 #define WINMALI_REG_GPU_IRQ_CLEAR     0x0024
 #define WINMALI_REG_GPU_IRQ_MASK      0x0028
 #define WINMALI_REG_GPU_IRQ_STATUS    0x002C
 #define WINMALI_REG_GPU_COMMAND       0x0030
+/* GPU_CMD: panthor GPU_CMD_DEF(type,payload)=type|(payload<<8).
+   SOFT_RESET = (1,1) = 0x101. RESET_COMPLETED IRQ = BIT(8). */
+#define WINMALI_GPU_CMD_SOFT_RESET    0x00000101u
+#define WINMALI_GPU_IRQ_RESET_COMPLETED  (1u << 8)
+/* GPU_IRQ fault bits (panthor_regs.h): FAULT=BIT0, PROTM_FAULT=BIT1. */
+#define WINMALI_GPU_IRQ_FAULT            (1u << 0)
+#define WINMALI_GPU_IRQ_PROTM_FAULT      (1u << 1)
 #define WINMALI_REG_GPU_STATUS        0x0034
 #define WINMALI_REG_GPU_FAULT_STATUS  0x003C
 #define WINMALI_REG_GPU_FAULT_ADDR_LO 0x0040
@@ -45,8 +72,18 @@ Abstract:
 // Shader / L2 presence and power (panthor_regs.h).
 #define WINMALI_REG_GPU_SHADER_PRESENT_LO  0x0100
 #define WINMALI_REG_GPU_SHADER_PRESENT_HI  0x0104
+#define WINMALI_REG_GPU_TILER_PRESENT_LO   0x0110
+#define WINMALI_REG_GPU_TILER_PRESENT_HI   0x0114
 #define WINMALI_REG_GPU_L2_PRESENT_LO      0x0120
 #define WINMALI_REG_GPU_L2_PRESENT_HI      0x0124
+/* Shader / tiler core power-state readbacks (panthor_regs.h). On CSF the MCU
+   powers these on demand; we only READ them (never write) to see whether the
+   cores actually come up during a shaded draw. */
+#define WINMALI_REG_SHADER_READY_LO        0x0140
+#define WINMALI_REG_SHADER_READY_HI        0x0144
+#define WINMALI_REG_TILER_READY_LO         0x0150
+#define WINMALI_REG_SHADER_PWRTRANS_LO     0x0200
+#define WINMALI_REG_SHADER_PWRTRANS_HI     0x0204
 #define WINMALI_REG_L2_READY_LO            0x0160
 #define WINMALI_REG_L2_READY_HI            0x0164
 #define WINMALI_REG_L2_PWRON_LO            0x01A0
@@ -99,6 +136,12 @@ Abstract:
 #define WINMALI_GPU_ID_VER_MAJOR(x)   (((x) >> 12) & 0xFu)
 #define WINMALI_GPU_ID_VER_MINOR(x)   (((x) >>  4) & 0xFFu)
 #define WINMALI_GPU_ID_VER_STATUS(x)  (((x) >>  0) & 0xFu)
+
+// MMU_FEATURES bit-field decoders (kbase/panthor gpu_mmu_features):
+// bits 7:0 = VA bits, bits 15:8 = PA bits. Mali-G610 reports VA=48,
+// PA=40. PA width feeds DXGKQAITYPE_PHYSICAL_MEMORY_CAPS.
+#define WINMALI_MMU_FEATURES_VA_BITS(x)  (((x) >> 0) & 0xFFu)
+#define WINMALI_MMU_FEATURES_PA_BITS(x)  (((x) >> 8) & 0xFFu)
 
 // (arch_major, prod_major) product codes we recognise. Matches
 // panthor_hw.c / GPU_PROD_ID_MAKE().

@@ -36,6 +36,18 @@ typedef struct _WINMALI_ADAPTER WINMALI_ADAPTER, *PWINMALI_ADAPTER;
 #error WINMALI_VIDMM_PAGING_BUFFER_BYTES must fit in WINMALI_MMU_SCRATCH_HEAP_BYTES
 #endif
 
+/**
+ * Aperture-window page-table geometry. The aperture segment we publish in
+ * QUERYSEGMENT3/4 spans WINMALI_SYSMEM_GPU_BASE .. +WINMALI_DMA_SEGMENT_BYTES
+ * of GPU VA; every L3 table covering it (one per 2 MiB) is preallocated as
+ * a single contiguous non-cached block at WinMaliMmuInit and wired into the
+ * bring-up AS L2 up front. Mapping therefore never allocates and cannot
+ * fail with a status outside dxgmms2's BuildPagingBuffer whitelist.
+ * 128 MiB -> 64 tables -> 256 KiB.
+ */
+#define WINMALI_APERTURE_L3_COUNT   (WINMALI_DMA_SEGMENT_BYTES >> 21)
+#define WINMALI_APERTURE_L3_BYTES   ((SIZE_T)WINMALI_APERTURE_L3_COUNT << 12)
+
 // AS slot 0 is reserved for CSF MCU on Linux; use AS1 for kernel bring-up.
 #define WINMALI_MMU_BRINGUP_AS      1u
 #define WINMALI_MMU_MCU_AS          0u
@@ -104,18 +116,31 @@ NTSTATUS WinMaliMmuAsEnable(_Inout_ PWINMALI_ADAPTER Adapter,
                             _In_ UINT64          MemAttr);
 NTSTATUS WinMaliMmuAsDisable(_Inout_ PWINMALI_ADAPTER Adapter, _In_ ULONG AsIndex);
 
-// Map 4 KiB bring-up AS1 page tables for GPU VA
-// inside the 2 MiB window anchored at WINMALI_MMU_TEST_GPU_VA (0x400000).
-// Used by CSF job submission (ring / sync / shader payloads).
+// Install 4 KiB PTEs into the bring-up AS. Two GPU-VA windows resolve:
+//   * the 2 MiB CSF bring-up window at WINMALI_MMU_TEST_GPU_VA (0x400000)
+//     - CSF job submission (ring / sync / shader payloads);
+//   * the aperture window at WINMALI_SYSMEM_GPU_BASE
+//     (WINMALI_DMA_SEGMENT_BYTES wide, L3s preallocated at MmuInit)
+//     - dxgk MAP_APERTURE_SEGMENT paging ops.
+// A range must lie entirely within one window.
 //
 // Attrs is one of WINMALI_LPAE_L3_PAGE_ATTR_{RW_EX, RO_EX, RW_NX, RO_NX}
 // — the caller picks based on what the GPU side will do with the buffer
 // (e.g. kernel-queue ring/syncobj/iface = RW_NX; CSF stream payload that
 // will be executed via a CALL instruction = RW_EX).
+//
+// MapGpuRange maps physically-contiguous pages starting at FirstPagePa;
+// MapGpuPfnRange maps scattered frames from a PFN array (MDL) in one pass.
 NTSTATUS WinMaliMmuMapGpuRange(
     _Inout_ PWINMALI_ADAPTER Adapter,
     _In_ UINT64             GpuVaStart,
     _In_ PHYSICAL_ADDRESS   FirstPagePa,
+    _In_ ULONG              PageCount,
+    _In_ UINT64             Attrs);
+NTSTATUS WinMaliMmuMapGpuPfnRange(
+    _Inout_ PWINMALI_ADAPTER Adapter,
+    _In_ UINT64             GpuVaStart,
+    _In_reads_(PageCount) const PFN_NUMBER* Pfns,
     _In_ ULONG              PageCount,
     _In_ UINT64             Attrs);
 NTSTATUS WinMaliMmuUnmapGpuRange(
@@ -158,6 +183,15 @@ NTSTATUS WinMaliMmuBindContextRootPt(_Inout_ PWINMALI_ADAPTER Adapter,
 //
 NTSTATUS WinMaliMmuUnbindContext(_Inout_ PWINMALI_ADAPTER Adapter,
                                  _In_ HANDLE              hContext);
+
+//
+// Return the Mali AS slot currently bound to `hContext` (via
+// SetRootPageTable / BindContextRootPt), or WINMALI_AS_SLOT_MAX if the
+// context has no dxgk-managed AS. Used by SubmitCommandVirtual to run a CS
+// against the dxgk GpuMmu page tables (Phase 2) rather than the escape VM AS.
+//
+ULONG    WinMaliMmuGetContextAsSlot(_In_ PWINMALI_ADAPTER Adapter,
+                                    _In_ HANDLE            hContext);
 
 //
 // Issue an AS_COMMAND FLUSH_MEM against every currently-bound *user*

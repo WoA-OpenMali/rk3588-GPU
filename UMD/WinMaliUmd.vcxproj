@@ -24,16 +24,16 @@
     <ProjectGuid>{B1B2C3D4-0002-4E5F-9A0B-001122334455}</ProjectGuid>
     <RootNamespace>WinMaliUmd</RootNamespace>
     <ProjectName>WinMaliUmd</ProjectName>
-    <!-- VS 2017's Platforms\<arch>\ImportBefore\Default\Microsoft.Cpp.WDK.props
+    <!-- The WDK's Platforms\<arch>\ImportBefore\Default\Microsoft.Cpp.WDK.props
          defaults SpectreMitigation to 'Spectre', which forces VC_LibraryPath_*
          to use lib\Spectre\<arch>\ (an optional component not installed on
          this box). Disable here in Globals so it wins before that import. -->
     <SpectreMitigation>false</SpectreMitigation>
-    <!-- Pinned to 1809 SDK: this dev box has VS 2017 (v141) + WDK
-         10.0.17763.0 only. $(LatestTargetPlatformVersion) on a box
-         with a stray newer SDK header set (e.g. 19041 SDK without
-         a matching WDK) silently picks the wrong include root. -->
-    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
+    <!-- Pinned to the 26100 WDK (VS 2022 v143 + Windows 11 SDK on this
+         box). $(LatestTargetPlatformVersion) on a box with a stray newer
+         SDK header set (e.g. an SDK without a matching WDK) silently picks
+         the wrong include root, so pin explicitly. -->
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -41,13 +41,13 @@
   <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v141</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
     <WholeProgramOptimization>true</WholeProgramOptimization>
   </PropertyGroup>
@@ -71,11 +71,11 @@
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
       <PreprocessorDefinitions>_WINDOWS;_USRDLL;WINMALIUMD_EXPORTS;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <!-- d3dkmthk.h ships in the WDK's km\ tree on 1809 (Microsoft moved
-           it to shared\ only in 19041+). The UMD is user-mode but
-           d3d10umddi.h pulls d3dkmthk.h in, so we add the km include
-           dir explicitly. This is a 1809 wart; remove when we ever
-           bump to a newer SDK. -->
+      <!-- On 26100, d3dkmthk.h lives in shared\ and is found by the
+           default include path, so the explicit km\ dir below is no
+           longer strictly needed (it was a 1809 wart, where the header
+           shipped only under km\). Left in place harmlessly; this project
+           is retired and not part of the solution. -->
       <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\Shared;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <CompileAs>CompileAsC</CompileAs>
       <!-- C4201 fires inside the WDK's own d3d10umddi.h (nameless union

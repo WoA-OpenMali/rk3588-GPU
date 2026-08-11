@@ -1,0 +1,46 @@
+// WinMaliKmd.rc
+//
+// VERSIONINFO resource for WinMaliKmd.sys.
+//
+// dxgkrnl 26100 refuses to start a display miniport whose PE file
+// version differs from the INF DriverVer version
+// (dxgkrnl!DpiFdoValidateKmdAndPnpVersionMatch). On mismatch it
+// executes brk #0xF000 - a clean break under a debugger, but with no
+// debugger attached it's an unhandled exception -> bugcheck -> PSCI
+// reset with no trace. A missing VERSIONINFO counts as 0.0.0.0 and
+// always mismatches.
+//
+// RULE: the version (WinMaliVersion.h) MUST stay equal to the
+// <Inf><TimeStamp> value in WinMaliKmd.vcxproj (which becomes the
+// stamped DriverVer). Bump both together, forever.
+
+#include <winver.h>
+#include "WinMaliVersion.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     WINMALI_KMD_VERSION
+PRODUCTVERSION  WINMALI_KMD_VERSION
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DRV
+FILESUBTYPE     VFT2_DRV_DISPLAY
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "WinMali Project"
+            VALUE "FileDescription",  "WinMali Mali-G610 WDDM render-only miniport (RK3588)"
+            VALUE "FileVersion",      WINMALI_KMD_VERSION_STR
+            VALUE "InternalName",     "WinMaliKmd.sys"
+            VALUE "OriginalFilename", "WinMaliKmd.sys"
+            VALUE "ProductName",      "WinMali RK3588 GPU Driver"
+            VALUE "ProductVersion",   WINMALI_KMD_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
